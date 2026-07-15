@@ -1,0 +1,46 @@
+name: deepseek-e2e
+
+run-name: DeepSeek live incident golden path
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deepseek-e2e
+  cancel-in-progress: false
+
+jobs:
+  deepseek-kind-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check DeepSeek secret
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [[ -z "${DEEPSEEK_API_KEY}" ]]; then
+            echo "Repository secret DEEPSEEK_API_KEY is not configured" >&2
+            exit 1
+          fi
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind \
+            https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+      - name: Install SentinelOps
+        run: python -m pip install -e "."
+      - name: Run live DeepSeek incident loop
+        env:
+          SENTINELOPS_MODEL_PROVIDER: openai_compatible
+          SENTINELOPS_MODEL_NAME: deepseek-chat
+          SENTINELOPS_MODEL_BASE_URL: https://api.deepseek.com
+          SENTINELOPS_MODEL_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: scripts/e2e-observability.sh
