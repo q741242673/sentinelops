@@ -4,6 +4,7 @@ import pytest
 
 from sentinelops.agent.policy import ActionPolicy
 from sentinelops.domain import RemediationAction, RiskLevel
+from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
@@ -36,3 +37,21 @@ async def test_registry_rejects_unlisted_tool() -> None:
     result = await registry.call("arbitrary_shell", {"command": "whoami"})
     assert result.success is False
     assert result.error == "Tool is not allowlisted"
+
+
+def test_rule_provider_infers_bad_rollout_from_live_cluster_evidence() -> None:
+    observations = {
+        "scenario": "live_cluster",
+        "pods": {
+            "items": [
+                {
+                    "ready": False,
+                    "restarts": 3,
+                    "waiting_reasons": ["CrashLoopBackOff"],
+                }
+            ]
+        },
+        "logs": {"lines": ["FATAL: application configuration is invalid"]},
+    }
+
+    assert RuleBasedProvider._infer_scenario(observations) == "bad_rollout"

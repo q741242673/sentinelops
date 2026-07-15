@@ -36,13 +36,33 @@ class RuleBasedProvider:
     ) -> T:
         payload = json.loads(prompt)
         observations = payload.get("observations", {})
-        scenario = observations.get("scenario", "unknown")
+        scenario = self._infer_scenario(observations)
 
         if schema is Diagnosis:
             return self._diagnose(scenario, observations)  # type: ignore[return-value]
         if schema is RemediationPlan:
             return self._plan(scenario, payload)  # type: ignore[return-value]
         raise TypeError(f"RuleBasedProvider does not support schema {schema.__name__}")
+
+    @staticmethod
+    def _infer_scenario(observations: dict[str, Any]) -> str:
+        declared = observations.get("scenario")
+        if declared in {"bad_rollout", "db_pool_exhaustion"}:
+            return declared
+
+        pods = observations.get("pods", {}).get("items", [])
+        logs = "\n".join(observations.get("logs", {}).get("lines", [])).lower()
+        has_unhealthy_rollout_pod = any(
+            (not pod.get("ready"))
+            and (
+                pod.get("restarts", 0) > 0
+                or set(pod.get("waiting_reasons", [])) & {"CrashLoopBackOff", "Error"}
+            )
+            for pod in pods
+        )
+        if has_unhealthy_rollout_pod or "fatal" in logs:
+            return "bad_rollout"
+        return "db_pool_exhaustion"
 
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
         if scenario == "bad_rollout":

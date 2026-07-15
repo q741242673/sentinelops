@@ -1,0 +1,14 @@
+spec:
+  template:
+    metadata:
+      annotations:
+        sentinelops.io/version: "1.1.0-broken"
+        sentinelops.io/fault: bad-rollout
+    spec:
+      containers:
+        - name: order-service
+          image: nginx:1.27-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - "echo 'FATAL: application configuration is invalid'; exit 1"
+
