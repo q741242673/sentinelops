@@ -33,6 +33,10 @@ async def test_api_incident_approval_flow() -> None:
         assert runtime.json()["model_provider"] == "rule_based"
         assert runtime.json()["approval_mode"] == "human_gated"
 
+        demo = await client.post("/api/v1/demo/incidents")
+        assert demo.status_code == 201
+        assert demo.json()["status"] == "awaiting_approval"
+
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
             json={"approved": True, "note": "approved in API test"},

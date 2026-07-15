@@ -4,7 +4,14 @@ import pytest
 
 from sentinelops.agent import IncidentAgent
 from sentinelops.config import Settings
-from sentinelops.domain import Alert, IncidentStatus, RiskLevel, ToolResult
+from sentinelops.domain import (
+    Alert,
+    IncidentStatus,
+    RemediationAction,
+    RemediationPlan,
+    RiskLevel,
+    ToolResult,
+)
 from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.runtime import build_agent
 from sentinelops.tools.base import CompositeBackend, ToolSpec
@@ -110,3 +117,114 @@ def test_prometheus_scalar_parsing(content, expected) -> None:
     result = ToolResult(tool_name="query_prometheus", success=True, content=content)
 
     assert IncidentAgent._prometheus_scalar(result) == expected
+
+
+def test_restart_is_rejected_when_it_preserves_a_faulty_rollout() -> None:
+    plan = RemediationPlan(
+        summary="Restart the deployment",
+        actions=[
+            RemediationAction(
+                tool_name="restart_deployment",
+                arguments={"name": "inventory-service"},
+                rationale="Recycle the pod",
+                expected_outcome="Requests recover",
+                risk=RiskLevel.MEDIUM,
+            )
+        ],
+        rollback="Stop the action",
+        verification=["Error rate is below 1%"],
+    )
+    state = {
+        "observations": {
+            "rollout": {
+                "revisions": [
+                    {
+                        "revision": 5,
+                        "replicas": 0,
+                        "change_cause": "healthy-baseline",
+                    },
+                    {
+                        "revision": 6,
+                        "replicas": 1,
+                        "change_cause": "enable-every-third-inventory-failure",
+                    },
+                ]
+            }
+        }
+    }
+
+    feedback = IncidentAgent._plan_feedback(
+        state,  # type: ignore[arg-type]
+        plan,
+        {
+            "restart_deployment": ToolSpec(
+                name="restart_deployment",
+                description="Restart a deployment",
+                risk=RiskLevel.MEDIUM,
+            )
+        },
+    )
+
+    assert feedback is not None
+    assert "rollback_deployment" in feedback
+    assert "revision 5" in feedback
+
+
+def test_unknown_rollback_revision_is_rejected_in_favor_of_exact_prior() -> None:
+    plan = RemediationPlan(
+        summary="Rollback the deployment",
+        actions=[
+            RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": "inventory-service", "revision": 1},
+                rationale="Restore the last working version",
+                expected_outcome="Requests recover",
+                risk=RiskLevel.HIGH,
+            )
+        ],
+        rollback="Roll forward",
+        verification=["Error rate is below 1%"],
+    )
+    state = {
+        "observations": {
+            "rollout": {
+                "revisions": [
+                    {"revision": 11, "replicas": 0, "change_cause": "healthy-baseline"},
+                    {"revision": 12, "replicas": 1, "change_cause": "enable-failure"},
+                ]
+            }
+        }
+    }
+
+    feedback = IncidentAgent._plan_feedback(state, plan)  # type: ignore[arg-type]
+
+    assert feedback is not None
+    assert "revision 11" in feedback
+
+
+def test_planning_diagnosis_drops_large_raw_evidence() -> None:
+    compact = IncidentAgent._compact_diagnosis(
+        {
+            "root_cause": "Faulty rollout",
+            "confidence": 0.95,
+            "evidence_summary": ["Trace failed"],
+            "hypotheses": [
+                {
+                    "statement": "Revision caused failures",
+                    "confidence": 0.95,
+                    "contradictions": [],
+                    "evidence": [
+                        {
+                            "source": "tempo",
+                            "query": "get_trace",
+                            "finding": "Trace failed",
+                            "raw": {"large": ["payload"] * 100},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    assert "raw" not in compact["hypotheses"][0]["evidence"][0]
+    assert compact["hypotheses"][0]["evidence"][0]["finding"] == "Trace failed"

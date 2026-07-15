@@ -16,16 +16,8 @@ export const api = {
   listIncidents: () => request<Incident[]>("/api/v1/incidents"),
   getRuntime: () => request<RuntimeInfo>("/api/v1/runtime"),
   createDemoIncident: () =>
-    request<Incident>("/api/v1/incidents", {
+    request<Incident>("/api/v1/demo/incidents", {
       method: "POST",
-      body: JSON.stringify({
-        name: "HighOrderServiceErrorRate",
-        namespace: "sentinelops-demo",
-        service: "order-service",
-        severity: "critical",
-        summary: "Order service error rate exceeded the 5% SLO threshold",
-        labels: { source: "local-console", scenario: "bad_rollout" },
-      }),
     }),
   decideIncident: (incidentId: string, approved: boolean) =>
     request<Incident>(`/api/v1/incidents/${incidentId}/approval`, {

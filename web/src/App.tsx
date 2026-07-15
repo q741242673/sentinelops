@@ -175,6 +175,7 @@ function App() {
   const action = selected?.plan?.actions[0] ?? null;
   const verification = selected?.timeline.find((event) => event.type === "recovery.verified");
   const requestErrorRate = verification?.data.request_error_rate;
+  const liveMode = runtime?.tool_backend === "kubernetes";
 
   async function createIncident() {
     setActionBusy(true);
@@ -247,10 +248,11 @@ function App() {
         </div>
 
         <div className="runtime-card">
-          <div className="runtime-title"><span className="live-dot" /> Local control plane</div>
+          <div className="runtime-title"><span className="live-dot" /> {liveMode ? "Live kind cluster" : "Local control plane"}</div>
           <dl>
             <div><dt>Tools</dt><dd>{runtime?.tool_backend ?? "—"}</dd></div>
-            <div><dt>Model</dt><dd>{runtime?.model_provider ?? "—"}</dd></div>
+            <div><dt>Model</dt><dd>{runtime?.model_name ?? "—"}</dd></div>
+            <div><dt>Provider</dt><dd>{runtime?.model_provider ?? "—"}</dd></div>
             <div><dt>Namespace</dt><dd>{runtime?.namespace ?? "—"}</dd></div>
           </dl>
         </div>
@@ -292,7 +294,7 @@ function App() {
                 </div>
               </div>
               <button className="secondary-button" type="button" onClick={createIncident} disabled={actionBusy}>
-                <span>+</span> Run new simulation
+                <span>+</span> {liveMode ? "Start live investigation" : "Run new simulation"}
               </button>
             </section>
 
@@ -376,7 +378,7 @@ function App() {
                       <div className="approval-warning"><span>!</span><p><strong>Operator approval required</strong>High-risk actions cannot execute autonomously.</p></div>
                       <div className="approval-actions">
                         <button type="button" className="reject-button" onClick={() => decide(false)} disabled={actionBusy}>Reject</button>
-                        <button type="button" className="approve-button" onClick={() => decide(true)} disabled={actionBusy}>{actionBusy ? "Executing…" : "Approve rollback"}</button>
+                        <button type="button" className="approve-button" onClick={() => decide(true)} disabled={actionBusy}>{actionBusy ? "Executing…" : "Approve action"}</button>
                       </div>
                     </div>
                   )}

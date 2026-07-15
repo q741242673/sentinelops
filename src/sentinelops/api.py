@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from sentinelops import __version__
 from sentinelops.agent import IncidentAgent
 from sentinelops.config import get_settings
+from sentinelops.demo import build_demo_alert
 from sentinelops.domain import Alert, IncidentRecord
 from sentinelops.runtime import build_agent
 
@@ -44,6 +45,15 @@ async def create_incident(alert: Alert) -> IncidentRecord:
     incident_agents[record.id] = incident_agent
     incident_records[record.id] = record
     return record
+
+
+@app.post("/api/v1/demo/incidents", response_model=IncidentRecord, status_code=201)
+async def create_demo_incident() -> IncidentRecord:
+    try:
+        alert = await build_demo_alert(get_settings())
+        return await create_incident(alert)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/incidents", response_model=list[IncidentRecord])

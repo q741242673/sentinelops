@@ -12,6 +12,7 @@ from langgraph.types import Command, interrupt
 from sentinelops.agent.policy import ActionPolicy
 from sentinelops.agent.state import IncidentState
 from sentinelops.domain import (
+    RISK_ORDER,
     Alert,
     ApprovalRequest,
     Diagnosis,
@@ -159,7 +160,10 @@ class IncidentAgent:
         diagnosis = await self.provider.structured(
             system=(
                 "You are an evidence-driven Kubernetes incident investigator. "
-                "Do not claim a root cause without citing observations."
+                "Do not claim a root cause without citing observations. Evaluate Kubernetes "
+                "pods, logs, and rollout history together with every configured observability "
+                "source. When rollout history contains a causal change, cite that rollout "
+                "explicitly using a distinct evidence source."
             ),
             prompt=prompt,
             schema=Diagnosis,
@@ -177,34 +181,143 @@ class IncidentAgent:
         }
 
     async def _plan(self, state: IncidentState) -> dict[str, Any]:
-        prompt = json.dumps(
-            {
-                "alert": state["alert"],
-                "observations": state["observations"],
-                "diagnosis": state["diagnosis"],
-                "available_tools": [
-                    spec.model_dump(mode="json") for spec in self.tools.list_specs()
-                ],
-            },
-            ensure_ascii=False,
+        specs = {spec.name: spec for spec in self.tools.list_specs()}
+        planning_observations = {
+            key: state["observations"][key]
+            for key in ("pods", "events", "logs", "rollout", "metrics", "scenario")
+            if key in state["observations"]
+        }
+        payload = {
+            "alert": state["alert"],
+            "observations": planning_observations,
+            "diagnosis": self._compact_diagnosis(state["diagnosis"]),
+            "available_tools": [
+                spec.model_dump(mode="json")
+                for spec in specs.values()
+                if spec.risk != RiskLevel.READ_ONLY
+            ],
+        }
+        system = (
+            "You are a conservative Kubernetes remediation planner. Choose only allowlisted "
+            "tools, prefer reversible actions, and provide explicit verification criteria. "
+            "Treat each available tool's declared risk as the minimum risk classification. "
+            "When rollout history shows that the active revision introduced the fault and "
+            "an earlier healthy revision exists, roll back to that exact healthy revision; "
+            "do not restart because a restart preserves the faulty image or configuration."
         )
-        plan = await self.provider.structured(
-            system=(
-                "You are a conservative Kubernetes remediation planner. Choose only allowlisted "
-                "tools, prefer reversible actions, and provide explicit verification criteria."
-            ),
-            prompt=prompt,
-            schema=RemediationPlan,
-            metadata={"incident_id": state["incident_id"], "node": "plan"},
-        )
+        plan: RemediationPlan | None = None
+        for attempt in range(2):
+            plan = await self.provider.structured(
+                system=system,
+                prompt=json.dumps(payload, ensure_ascii=False),
+                schema=RemediationPlan,
+                metadata={"incident_id": state["incident_id"], "node": "plan"},
+            )
+            feedback = self._plan_feedback(state, plan, specs)
+            if feedback is None:
+                break
+            if attempt == 1:
+                raise PermissionError(f"Model plan remained unsafe after replanning: {feedback}")
+            payload["rejected_plan"] = plan.model_dump(mode="json")
+            payload["planning_feedback"] = feedback
+
+        assert plan is not None
         for action in plan.actions:
             self.policy.validate(action)
-            if action.tool_name not in {spec.name for spec in self.tools.list_specs()}:
+            if action.tool_name not in specs:
                 raise PermissionError(f"Model selected a non-allowlisted tool: {action.tool_name}")
+            minimum_risk = specs[action.tool_name].risk
+            if RISK_ORDER[action.risk] < RISK_ORDER[minimum_risk]:
+                raise PermissionError(
+                    f"Model under-classified {action.tool_name}: "
+                    f"declared={action.risk.value}, minimum={minimum_risk.value}"
+                )
         return {
             "plan": plan.model_dump(mode="json"),
             "timeline": [_event("remediation.planned", plan.summary)],
         }
+
+    @staticmethod
+    def _compact_diagnosis(diagnosis: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "root_cause": diagnosis.get("root_cause"),
+            "confidence": diagnosis.get("confidence"),
+            "evidence_summary": diagnosis.get("evidence_summary", []),
+            "hypotheses": [
+                {
+                    "statement": hypothesis.get("statement"),
+                    "confidence": hypothesis.get("confidence"),
+                    "contradictions": hypothesis.get("contradictions", []),
+                    "evidence": [
+                        {key: value for key, value in evidence.items() if key != "raw"}
+                        for evidence in hypothesis.get("evidence", [])
+                    ],
+                }
+                for hypothesis in diagnosis.get("hypotheses", [])
+            ],
+        }
+
+    @staticmethod
+    def _plan_feedback(
+        state: IncidentState,
+        plan: RemediationPlan,
+        specs: dict[str, Any] | None = None,
+    ) -> str | None:
+        if not plan.actions:
+            return "A remediation plan must contain at least one allowlisted action"
+        action = plan.actions[0]
+        spec = (specs or {}).get(action.tool_name)
+        if spec is not None and spec.risk == RiskLevel.READ_ONLY:
+            return (
+                f"{action.tool_name} is read-only and cannot remediate the incident; select one "
+                "of the provided mutating remediation tools"
+            )
+        revisions = state.get("observations", {}).get("rollout", {}).get("revisions", [])
+        active = [
+            revision
+            for revision in revisions
+            if (revision.get("replicas") or 0) > 0 or (revision.get("ready_replicas") or 0) > 0
+        ]
+        if not active:
+            return None
+        current = max(active, key=lambda revision: int(revision.get("revision", 0)))
+        current_revision = int(current.get("revision", 0))
+        previous = [
+            revision
+            for revision in revisions
+            if int(revision.get("revision", 0)) < current_revision
+        ]
+        if not previous:
+            return None
+        target = max(previous, key=lambda revision: int(revision.get("revision", 0)))
+        target_revision = int(target.get("revision", 0))
+
+        if action.tool_name == "rollback_deployment":
+            requested = action.arguments.get("revision")
+            try:
+                requested_revision = int(requested)
+            except (TypeError, ValueError):
+                requested_revision = 0
+            available = {int(revision.get("revision", 0)) for revision in revisions}
+            if requested_revision not in available or requested_revision != target_revision:
+                return (
+                    f"rollback revision {requested!r} is not the exact prior known revision; "
+                    f"replan rollback_deployment with revision {target_revision} based on the "
+                    "provided rollout history"
+                )
+            return None
+
+        change_cause = str(current.get("change_cause") or "").lower()
+        fault_markers = {"failure", "fault", "error", "broken", "timeout"}
+        if action.tool_name == "restart_deployment" and any(
+            marker in change_cause for marker in fault_markers
+        ):
+            return (
+                f"restart_deployment preserves suspect revision {current_revision} "
+                f"({current.get('change_cause')}); replan with rollback_deployment to the known "
+                f"prior revision {target_revision}"
+            )
+        return None
 
     async def _prepare_approval(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])

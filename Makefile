@@ -1,4 +1,4 @@
-.PHONY: install test lint eval demo serve console console-build kind-up kind-fault kind-e2e kind-down \
+.PHONY: install test lint eval demo serve console console-live console-live-down console-build kind-up kind-fault kind-e2e kind-down \
 	observability-up observability-fault observability-e2e golden-path-e2e \
 	observability-down
 
@@ -22,6 +22,12 @@ serve:
 
 console:
 	scripts/dev-console.sh
+
+console-live:
+	scripts/live-console.sh
+
+console-live-down:
+	scripts/observability-down.sh
 
 console-build:
 	npm --prefix web install

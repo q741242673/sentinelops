@@ -72,6 +72,20 @@ at the high-risk rollback, and resumes the same LangGraph thread when you approv
 is local-only; FastAPI remains the Agent control plane so the UI operates real incident state
 instead of static mock data.
 
+For a fully live local demo, start Docker and provide an OpenAI-compatible model key, then run:
+
+```bash
+SENTINELOPS_MODEL_API_KEY=replace-me make console-live
+```
+
+This mode creates a kind cluster, deploys Prometheus, Loki, Tempo, OpenTelemetry Collector and
+the demo services, injects a failing inventory revision, and keeps checkout traffic flowing. The
+console waits for the real `HighInventoryErrorRate` alert and a queryable failed trace before the
+Agent reads Kubernetes rollout history, metrics, logs and spans. The default model endpoint is
+DeepSeek `deepseek-chat`; the provider remains replaceable through the existing model variables.
+The cluster is retained when the console stops so subsequent starts can reuse the node image.
+Remove it with `make console-live-down`.
+
 Other deterministic scenario:
 
 ```bash

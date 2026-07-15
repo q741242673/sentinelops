@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from kubernetes import client, config
 from kubernetes.config.config_exception import ConfigException
@@ -22,8 +23,15 @@ class KubernetesBackend:
             config.load_incluster_config()
         except ConfigException:
             config.load_kube_config()
-        self.core = client.CoreV1Api()
-        self.apps = client.AppsV1Api()
+        configuration = client.Configuration.get_default_copy()
+        hostname = urlsplit(configuration.host).hostname
+        if hostname in {"127.0.0.1", "localhost", "::1"}:
+            # The Kubernetes client automatically inherits HTTP(S)_PROXY. A kind
+            # API server is always local and must not be sent through that proxy.
+            configuration.proxy = None
+        api_client = client.ApiClient(configuration)
+        self.core = client.CoreV1Api(api_client)
+        self.apps = client.AppsV1Api(api_client)
 
     async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         started = time.perf_counter()
