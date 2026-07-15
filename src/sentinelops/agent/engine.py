@@ -114,6 +114,29 @@ class IncidentAgent:
             "rollout": ("get_rollout_history", {"name": service}),
             "metrics": ("get_service_metrics", {"name": service}),
         }
+        service_label = json.dumps(service)
+        if self.tools.has_tool("query_prometheus"):
+            calls["prometheus"] = (
+                "query_prometheus",
+                {
+                    "query": (
+                        "sum by (status) (rate(http_requests_total{"
+                        f"service={service_label}"
+                        "}[5m]))"
+                    )
+                },
+            )
+        if self.tools.has_tool("search_loki"):
+            calls["loki"] = (
+                "search_loki",
+                {
+                    "query": (f'{{app={service_label}}} |~ "(?i)(error|fatal|timeout|exception)"'),
+                    "limit": 100,
+                },
+            )
+        trace_id = state["alert"].get("labels", {}).get("trace_id")
+        if trace_id and self.tools.has_tool("get_trace"):
+            calls["trace"] = ("get_trace", {"trace_id": trace_id})
         observations: dict[str, Any] = {}
         for key, (tool_name, arguments) in calls.items():
             result = await self.tools.call(tool_name, arguments)

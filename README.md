@@ -158,6 +158,32 @@ make kind-down
 
 The same scenario runs in GitHub Actions on every push and pull request.
 
+## Observability evidence
+
+SentinelOps can enrich Kubernetes evidence with read-only Prometheus, Loki, and Tempo queries.
+Configure only the backends that are available:
+
+```dotenv
+SENTINELOPS_PROMETHEUS_URL=http://127.0.0.1:9090
+SENTINELOPS_LOKI_URL=http://127.0.0.1:3100
+SENTINELOPS_TEMPO_URL=http://127.0.0.1:3200
+SENTINELOPS_OBSERVABILITY_TIMEOUT_SECONDS=10
+```
+
+When configured, live investigations automatically collect a bounded HTTP error-rate query and
+recent error logs for the alerted service. A Tempo trace is fetched only when the alert includes
+a `trace_id` label. All three tools are read-only and apply hard limits:
+
+| Tool | Boundary |
+|---|---|
+| `query_prometheus` | instant query, 1,000-character maximum |
+| `search_loki` | backward range query, maximum 200 entries |
+| `get_trace` | validated 16-64 character hexadecimal trace ID |
+
+The HTTP client uses explicit configured base URLs, a maximum 60-second timeout, and ignores
+ambient proxy variables so internal telemetry is not accidentally routed through an external
+proxy.
+
 ## MCP server
 
 Install the optional extra and start the stdio server:
@@ -167,9 +193,9 @@ python -m pip install -e ".[mcp]"
 sentinelops-mcp
 ```
 
-The MCP server exposes focused Kubernetes tools, while the Agent host remains responsible for
-approval and policy. This separation prevents a tool server from silently granting itself
-automation authority.
+The MCP server exposes focused Kubernetes and configured observability tools, while the Agent
+host remains responsible for approval and policy. This separation prevents a tool server from
+silently granting itself automation authority.
 
 ## Safety model
 
@@ -198,8 +224,8 @@ The first suite checks two incidents end-to-end and records:
 - mutating tool count;
 - end-to-end duration.
 
-The next milestone will add fault injection against a disposable `kind` cluster, request-level
-SLIs from Prometheus, model cost/latency telemetry, and trace-level graders.
+The next evaluation milestone adds request-level SLI fixtures, model cost/latency telemetry, and
+trace-level graders.
 
 ## Repository map
 
@@ -207,7 +233,7 @@ SLIs from Prometheus, model cost/latency telemetry, and trace-level graders.
 src/sentinelops/
 ├── agent/          # graph, state, policy, interrupt/resume
 ├── llm/            # provider-neutral contract and adapters
-├── tools/          # allowlist, simulator, Kubernetes API backend
+├── tools/          # allowlist, simulator, Kubernetes and observability backends
 ├── api.py          # FastAPI endpoints
 ├── mcp_server.py   # optional MCP facade
 └── runtime.py      # dependency wiring
@@ -226,7 +252,8 @@ tests/              # graph, policy and tool-boundary tests
 - [x] Kubernetes API and MCP adapters
 - [x] REST API and CI evaluation
 - [x] Disposable `kind` fault lab
-- [ ] Prometheus, Loki and Tempo MCP servers
+- [x] Prometheus, Loki and Tempo MCP query adapters
+- [ ] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
 - [ ] PostgreSQL checkpointer and event store
 - [ ] OpenTelemetry spans for model and tool calls
 - [ ] Web incident command center
