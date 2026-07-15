@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sentinelops"
+version = "0.1.0"
+description = "Model-agnostic Kubernetes incident diagnosis and remediation agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SentinelOps Contributors" }]
+dependencies = [
+  "fastapi>=0.115,<1",
+  "kubernetes>=30,<35",
+  "langgraph>=0.6,<2",
+  "openai>=1.68,<3",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "pyyaml>=6,<7",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.9,<2"]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+sentinelops = "sentinelops.cli:main"
+sentinelops-mcp = "sentinelops.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sentinelops"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
