@@ -1,5 +1,6 @@
 .PHONY: install test lint eval demo serve kind-up kind-fault kind-e2e kind-down \
-	observability-up observability-e2e observability-down
+	observability-up observability-fault observability-e2e golden-path-e2e \
+	observability-down
 
 install:
 	python -m pip install -e ".[dev]"
@@ -34,7 +35,13 @@ kind-down:
 observability-up:
 	scripts/observability-up.sh
 
+observability-fault:
+	scripts/inject-observability-fault.sh
+
 observability-e2e:
+	scripts/e2e-observability.sh
+
+golden-path-e2e:
 	scripts/e2e-observability.sh
 
 observability-down:

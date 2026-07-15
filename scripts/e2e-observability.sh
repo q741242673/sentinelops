@@ -37,6 +37,7 @@ start_port_forward() {
 }
 
 "${ROOT_DIR}/scripts/observability-up.sh"
+"${ROOT_DIR}/scripts/inject-observability-fault.sh"
 
 start_port_forward service/order-service 18080:8000
 start_port_forward service/prometheus 19090:9090
@@ -49,3 +50,12 @@ wait_for_url http://127.0.0.1:13100/ready
 wait_for_url http://127.0.0.1:13200/ready
 
 python "${ROOT_DIR}/scripts/observability_e2e.py"
+
+export SENTINELOPS_TOOL_BACKEND=kubernetes
+export SENTINELOPS_MODEL_PROVIDER="${SENTINELOPS_MODEL_PROVIDER:-rule_based}"
+export SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
+export SENTINELOPS_PROMETHEUS_URL=http://127.0.0.1:19090
+export SENTINELOPS_LOKI_URL=http://127.0.0.1:13100
+export SENTINELOPS_TEMPO_URL=http://127.0.0.1:13200
+
+python "${ROOT_DIR}/scripts/golden_path_e2e.py"

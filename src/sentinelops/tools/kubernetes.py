@@ -153,6 +153,9 @@ class KubernetesBackend:
             "name": replica_set.metadata.name,
             "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
             "images": [container.image for container in containers],
+            "change_cause": (replica_set.spec.template.metadata.annotations or {}).get(
+                "sentinelops.io/change-cause"
+            ),
             "replicas": replica_set.status.replicas or 0,
             "ready_replicas": replica_set.status.ready_replicas or 0,
         }

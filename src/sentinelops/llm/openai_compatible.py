@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, TypeVar
 
+import httpx
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
@@ -16,7 +17,11 @@ class OpenAICompatibleProvider:
 
     def __init__(self, *, model: str, api_key: str, base_url: str | None = None) -> None:
         self.model = model
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=httpx.AsyncClient(trust_env=False),
+        )
 
     async def structured(
         self,

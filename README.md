@@ -210,6 +210,52 @@ kubectl get pods -n sentinelops-demo
 make observability-down
 ```
 
+### Live incident golden path
+
+The telemetry lab also exercises the complete incident loop rather than stopping after a
+successful query:
+
+```mermaid
+sequenceDiagram
+    participant P as Prometheus
+    participant A as SentinelOps
+    participant O as Operator
+    participant K as Kubernetes
+    P->>A: HighInventoryErrorRate firing
+    A->>K: Read pods, logs, and rollout history
+    A->>P: Query request error rate
+    A->>A: Correlate Loki logs and Tempo trace
+    A->>O: Propose revision 1 rollback
+    O->>A: Approve
+    A->>K: Roll back inventory-service
+    A->>P: Verify request error rate below 1%
+```
+
+Run it with:
+
+```bash
+make golden-path-e2e
+```
+
+The command starts with a healthy inventory revision, rolls out a configuration that fails every
+third reservation, waits for the real Prometheus alert to fire, and supplies its labels plus a
+failed trace ID to SentinelOps. The agent collects Kubernetes, Prometheus, Loki, and Tempo
+evidence, pauses on its high-risk rollback, resumes after approval, and continuously checks the
+10-second request error rate. The test passes only after the alert clears and six fresh checkout
+requests all return HTTP 200.
+
+CI uses the deterministic `rule_based` provider so this acceptance test needs no model key. To
+exercise the same infrastructure path with DeepSeek or another OpenAI-compatible endpoint, set
+the model variables before running the command:
+
+```bash
+SENTINELOPS_MODEL_PROVIDER=openai_compatible \
+SENTINELOPS_MODEL_NAME=your-model-name \
+SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1 \
+SENTINELOPS_MODEL_API_KEY=replace-me \
+make golden-path-e2e
+```
+
 ## MCP server
 
 Install the optional extra and start the stdio server:
@@ -280,6 +326,7 @@ tests/              # graph, policy and tool-boundary tests
 - [x] Disposable `kind` fault lab
 - [x] Prometheus, Loki and Tempo MCP query adapters
 - [x] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
+- [x] Firing Prometheus alert to approved rollback and request-SLI recovery loop
 - [ ] PostgreSQL checkpointer and event store
 - [ ] OpenTelemetry spans for model and tool calls
 - [ ] Web incident command center

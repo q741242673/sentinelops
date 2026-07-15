@@ -47,11 +47,14 @@ class RuleBasedProvider:
     @staticmethod
     def _infer_scenario(observations: dict[str, Any]) -> str:
         declared = observations.get("scenario")
-        if declared in {"bad_rollout", "db_pool_exhaustion"}:
+        if declared in {"bad_rollout", "db_pool_exhaustion", "inventory_faulty_rollout"}:
             return declared
 
         pods = observations.get("pods", {}).get("items", [])
         logs = "\n".join(observations.get("logs", {}).get("lines", [])).lower()
+        all_evidence = json.dumps(observations, ensure_ascii=False).lower()
+        if "inventory_reservation_failed" in all_evidence or "synthetic_timeout" in all_evidence:
+            return "inventory_faulty_rollout"
         has_unhealthy_rollout_pod = any(
             (not pod.get("ready"))
             and (
@@ -65,7 +68,36 @@ class RuleBasedProvider:
         return "db_pool_exhaustion"
 
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
-        if scenario == "bad_rollout":
+        if scenario == "inventory_faulty_rollout":
+            evidence = [
+                Evidence(
+                    source="prometheus",
+                    query="query_prometheus",
+                    finding="Inventory request metrics contain HTTP 503 responses",
+                    raw=observations.get("prometheus", {}),
+                ),
+                Evidence(
+                    source="loki",
+                    query="search_loki",
+                    finding="Inventory logs report synthetic reservation timeouts",
+                    raw=observations.get("loki", {}),
+                ),
+                Evidence(
+                    source="tempo",
+                    query="get_trace",
+                    finding="The failed checkout trace crosses the inventory service",
+                    raw=observations.get("trace", {}),
+                ),
+                Evidence(
+                    source="kubernetes.rollout",
+                    query="get_rollout_history",
+                    finding="The error-producing configuration is deployment revision 2",
+                    raw=observations.get("rollout", {}),
+                ),
+            ]
+            root_cause = "Inventory deployment revision 2 enabled a synthetic reservation failure"
+            hypothesis = "The latest inventory configuration rollout introduced the 503 errors"
+        elif scenario == "bad_rollout":
             evidence = [
                 Evidence(
                     source="kubernetes.events",
@@ -108,7 +140,18 @@ class RuleBasedProvider:
         )
 
     def _plan(self, scenario: str, payload: dict[str, Any]) -> RemediationPlan:
-        if scenario == "bad_rollout":
+        if scenario == "inventory_faulty_rollout":
+            service = payload["alert"]["service"]
+            action = RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": service, "revision": 1},
+                rationale=(
+                    "Revision 2 introduced inventory 503 responses while revision 1 was healthy"
+                ),
+                expected_outcome="Inventory 503 responses stop and checkout traffic recovers",
+                risk=RiskLevel.HIGH,
+            )
+        elif scenario == "bad_rollout":
             action = RemediationAction(
                 tool_name="rollback_deployment",
                 arguments={"name": "order-service", "revision": 1},

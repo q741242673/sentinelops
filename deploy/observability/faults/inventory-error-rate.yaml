@@ -1,0 +1,11 @@
+spec:
+  template:
+    metadata:
+      annotations:
+        sentinelops.io/change-cause: enable-every-third-inventory-failure
+    spec:
+      containers:
+        - name: inventory-service
+          env:
+            - name: FAIL_EVERY
+              value: "3"

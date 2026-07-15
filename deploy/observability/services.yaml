@@ -12,6 +12,8 @@ spec:
     metadata:
       labels:
         app: inventory-service
+      annotations:
+        sentinelops.io/change-cause: healthy-baseline
     spec:
       containers:
         - name: inventory-service
@@ -23,7 +25,7 @@ spec:
             - name: SERVICE_ROLE
               value: inventory
             - name: FAIL_EVERY
-              value: "3"
+              value: "0"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector:4318
           ports:

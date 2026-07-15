@@ -130,7 +130,10 @@ class IncidentAgent:
             calls["loki"] = (
                 "search_loki",
                 {
-                    "query": (f'{{app={service_label}}} |~ "(?i)(error|fatal|timeout|exception)"'),
+                    "query": (
+                        f"{{service_name={service_label}}} "
+                        '|~ "(?i)(error|failed|fatal|timeout|exception)"'
+                    ),
                     "limit": 100,
                 },
             )
@@ -260,6 +263,8 @@ class IncidentAgent:
         healthy = False
         metrics: ToolResult | None = None
         pods: ToolResult | None = None
+        prometheus: ToolResult | None = None
+        request_error_rate: float | None = None
         attempts = 0
         for attempt_index in range(1, 31):
             attempts = attempt_index
@@ -269,9 +274,30 @@ class IncidentAgent:
             pods_healthy = bool(pod_items) and all(item.get("ready") for item in pod_items)
             error_rate = metrics.content.get("error_rate")
             availability = metrics.content.get("availability")
-            indicators_healthy = (error_rate is not None and error_rate < 0.01) or (
-                availability is not None and availability >= 1.0
-            )
+            if self.tools.has_tool("query_prometheus"):
+                service_label = json.dumps(service)
+                prometheus = await self.tools.call(
+                    "query_prometheus",
+                    {
+                        "query": (
+                            "(sum(rate(http_requests_total{"
+                            f'service={service_label},status=~"5.."'
+                            "}[10s])) or vector(0)) / clamp_min(sum(rate(http_requests_total{"
+                            f"service={service_label}"
+                            "}[10s])), 0.001)"
+                        )
+                    },
+                )
+                request_error_rate = self._prometheus_scalar(prometheus)
+                indicators_healthy = (
+                    prometheus.success
+                    and request_error_rate is not None
+                    and request_error_rate < 0.01
+                )
+            else:
+                indicators_healthy = (error_rate is not None and error_rate < 0.01) or (
+                    availability is not None and availability >= 1.0
+                )
             healthy = metrics.success and pods.success and pods_healthy and indicators_healthy
             if healthy:
                 break
@@ -286,10 +312,28 @@ class IncidentAgent:
                     "Service recovered" if healthy else "Recovery criteria not met",
                     metrics=metrics.content,
                     pods=pods.content,
+                    prometheus=prometheus.content if prometheus else None,
+                    request_error_rate=request_error_rate,
                     attempts=attempts,
                 )
             ],
         }
+
+    @staticmethod
+    def _prometheus_scalar(result: ToolResult) -> float | None:
+        if not result.success:
+            return None
+        series = result.content.get("result", [])
+        if not series:
+            return None
+        value = series[0].get("value", [])
+        if len(value) != 2:
+            return None
+        try:
+            scalar = float(value[1])
+        except (TypeError, ValueError):
+            return None
+        return scalar if scalar == scalar else None
 
     async def _postmortem(self, state: IncidentState) -> dict[str, Any]:
         diagnosis = Diagnosis.model_validate(state["diagnosis"])
