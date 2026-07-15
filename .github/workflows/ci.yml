@@ -33,3 +33,19 @@ jobs:
           sudo mv kind /usr/local/bin/kind
       - run: python -m pip install -e "."
       - run: scripts/e2e-kind.sh
+
+  observability-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind \
+            https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+      - run: python -m pip install -e "."
+      - run: scripts/e2e-observability.sh

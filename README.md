@@ -184,6 +184,32 @@ The HTTP client uses explicit configured base URLs, a maximum 60-second timeout,
 ambient proxy variables so internal telemetry is not accidentally routed through an external
 proxy.
 
+### In-cluster telemetry lab
+
+The repository also ships a reproducible telemetry lab: two instrumented FastAPI services,
+Prometheus, Loki, Tempo, and an OpenTelemetry Collector, all running inside a disposable `kind`
+cluster. The inventory service fails every third reservation, producing correlated success and
+failure metrics, structured OTLP logs, and distributed traces.
+
+Run the complete acceptance test:
+
+```bash
+make observability-e2e
+```
+
+The test builds one model-neutral demo-service image, generates twelve checkout requests, and
+uses SentinelOps' production observability adapters to prove that all three signals are
+queryable. It fails unless Prometheus returns request samples, Loki returns checkout logs, and
+Tempo returns spans for a trace ID produced by the request.
+
+To keep the lab running for exploration:
+
+```bash
+SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER=true make observability-e2e
+kubectl get pods -n sentinelops-demo
+make observability-down
+```
+
 ## MCP server
 
 Install the optional extra and start the stdio server:
@@ -253,7 +279,7 @@ tests/              # graph, policy and tool-boundary tests
 - [x] REST API and CI evaluation
 - [x] Disposable `kind` fault lab
 - [x] Prometheus, Loki and Tempo MCP query adapters
-- [ ] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
+- [x] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
 - [ ] PostgreSQL checkpointer and event store
 - [ ] OpenTelemetry spans for model and tool calls
 - [ ] Web incident command center
