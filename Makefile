@@ -1,4 +1,5 @@
-.PHONY: install test lint eval demo serve kind-up kind-fault kind-e2e kind-down
+.PHONY: install test lint eval demo serve kind-up kind-fault kind-e2e kind-down \
+	observability-up observability-e2e observability-down
 
 install:
 	python -m pip install -e ".[dev]"
@@ -30,3 +31,11 @@ kind-e2e:
 kind-down:
 	scripts/kind-down.sh
 
+observability-up:
+	scripts/observability-up.sh
+
+observability-e2e:
+	scripts/e2e-observability.sh
+
+observability-down:
+	scripts/observability-down.sh
