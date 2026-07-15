@@ -14,7 +14,7 @@ def create_server():
 
     settings = get_settings()
     registry = build_tool_registry(settings)
-    server = FastMCP("sentinelops-kubernetes")
+    server = FastMCP("sentinelops-tools")
 
     async def invoke(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         result = await registry.call(name, arguments)
@@ -62,6 +62,34 @@ def create_server():
     async def scale_deployment(name: str, replicas: int) -> dict[str, Any]:
         """Scale a deployment. The host must enforce human approval."""
         return await invoke("scale_deployment", {"name": name, "replicas": replicas})
+
+    @server.tool()
+    async def query_prometheus(query: str, time: str = "") -> dict[str, Any]:
+        """Run a bounded, read-only Prometheus instant query."""
+        arguments = {"query": query}
+        if time:
+            arguments["time"] = time
+        return await invoke("query_prometheus", arguments)
+
+    @server.tool()
+    async def search_loki(
+        query: str,
+        limit: int = 100,
+        start: str = "",
+        end: str = "",
+    ) -> dict[str, Any]:
+        """Search a bounded, read-only range of Loki log streams."""
+        arguments: dict[str, Any] = {"query": query, "limit": limit}
+        if start:
+            arguments["start"] = start
+        if end:
+            arguments["end"] = end
+        return await invoke("search_loki", arguments)
+
+    @server.tool()
+    async def get_trace(trace_id: str) -> dict[str, Any]:
+        """Fetch a Tempo trace by trace ID."""
+        return await invoke("get_trace", {"trace_id": trace_id})
 
     return server
 

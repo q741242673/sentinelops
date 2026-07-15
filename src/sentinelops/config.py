@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     model_api_key: SecretStr | None = None
     kubernetes_namespace: str = "sentinelops-demo"
     auto_approve_max_risk: Literal["read_only", "low", "medium", "high", "critical"] = "low"
+    prometheus_url: str | None = None
+    loki_url: str | None = None
+    tempo_url: str | None = None
+    observability_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
 
 
 @lru_cache
