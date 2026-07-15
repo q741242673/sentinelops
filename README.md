@@ -256,6 +256,19 @@ SENTINELOPS_MODEL_API_KEY=replace-me \
 make golden-path-e2e
 ```
 
+The `deepseek-e2e` GitHub Actions workflow runs this complete path against the real
+`deepseek-chat` API. It is deliberately `workflow_dispatch` only, so pull requests and pushes do
+not consume model credits. Configure a repository Actions secret named `DEEPSEEK_API_KEY`, then
+start it from the Actions page or with:
+
+```bash
+gh workflow run deepseek-e2e.yml
+```
+
+The secret is injected only into the final incident-loop step. A successful run proves that the
+model used live Kubernetes, Prometheus, Loki, and Tempo evidence to select an allowlisted action,
+paused for approval, rolled the deployment back, and verified traffic and alert recovery.
+
 ## MCP server
 
 Install the optional extra and start the stdio server:
