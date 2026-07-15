@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -233,18 +234,27 @@ class IncidentAgent:
 
     async def _verify(self, state: IncidentState) -> dict[str, Any]:
         service = state["alert"]["service"]
-        metrics = await self.tools.call("get_service_metrics", {"name": service})
-        pods = await self.tools.call("list_pods", {"label_selector": f"app={service}"})
-        error_rate = metrics.content.get("error_rate")
-        availability = metrics.content.get("availability")
-        healthy = (
-            metrics.success
-            and pods.success
-            and (
-                (error_rate is not None and error_rate < 0.01)
-                or (availability is not None and availability >= 1.0)
+        healthy = False
+        metrics: ToolResult | None = None
+        pods: ToolResult | None = None
+        attempts = 0
+        for attempt_index in range(1, 31):
+            attempts = attempt_index
+            metrics = await self.tools.call("get_service_metrics", {"name": service})
+            pods = await self.tools.call("list_pods", {"label_selector": f"app={service}"})
+            pod_items = pods.content.get("items", [])
+            pods_healthy = bool(pod_items) and all(item.get("ready") for item in pod_items)
+            error_rate = metrics.content.get("error_rate")
+            availability = metrics.content.get("availability")
+            indicators_healthy = (error_rate is not None and error_rate < 0.01) or (
+                availability is not None and availability >= 1.0
             )
-        )
+            healthy = metrics.success and pods.success and pods_healthy and indicators_healthy
+            if healthy:
+                break
+            await asyncio.sleep(1)
+
+        assert metrics is not None and pods is not None
         return {
             "status": IncidentStatus.RESOLVED.value if healthy else IncidentStatus.FAILED.value,
             "timeline": [
@@ -252,6 +262,8 @@ class IncidentAgent:
                     "recovery.verified",
                     "Service recovered" if healthy else "Recovery criteria not met",
                     metrics=metrics.content,
+                    pods=pods.content,
+                    attempts=attempts,
                 )
             ],
         }

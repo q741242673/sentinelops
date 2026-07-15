@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -50,16 +51,27 @@ class KubernetesBackend:
     def _tool_list_pods(self, arguments: dict[str, Any]) -> dict[str, Any]:
         label_selector = arguments.get("label_selector", "")
         pods = self.core.list_namespaced_pod(self.namespace, label_selector=label_selector)
+        return {"items": [self._pod_summary(pod) for pod in pods.items]}
+
+    @staticmethod
+    def _pod_summary(pod: Any) -> dict[str, Any]:
+        statuses = pod.status.container_statuses or []
+        waiting_reasons = [
+            status.state.waiting.reason
+            for status in statuses
+            if status.state and status.state.waiting
+        ]
         return {
-            "items": [
-                {
-                    "name": pod.metadata.name,
-                    "phase": pod.status.phase,
-                    "ready": all(c.ready for c in (pod.status.container_statuses or [])),
-                    "restarts": sum(c.restart_count for c in (pod.status.container_statuses or [])),
-                }
-                for pod in pods.items
-            ]
+            "name": pod.metadata.name,
+            "phase": pod.status.phase,
+            "ready": bool(statuses) and all(status.ready for status in statuses),
+            "restarts": sum(status.restart_count for status in statuses),
+            "waiting_reasons": waiting_reasons,
+            "created_at": (
+                pod.metadata.creation_timestamp.isoformat()
+                if pod.metadata.creation_timestamp
+                else None
+            ),
         }
 
     def _tool_list_events(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -84,7 +96,14 @@ class KubernetesBackend:
             )
             if not pods.items:
                 raise RuntimeError("No matching pod found")
-            name = pods.items[0].metadata.name
+            ranked = sorted(
+                pods.items,
+                key=lambda pod: (
+                    self._pod_summary(pod)["ready"],
+                    -self._pod_summary(pod)["restarts"],
+                ),
+            )
+            name = ranked[0].metadata.name
         logs = self.core.read_namespaced_pod_log(
             name=name,
             namespace=self.namespace,
@@ -98,11 +117,44 @@ class KubernetesBackend:
         replica_sets = self.apps.list_namespaced_replica_set(
             self.namespace, label_selector=f"app={name}"
         )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
         return {
             "deployment": name,
             "generation": deployment.metadata.generation,
             "observed_generation": deployment.status.observed_generation,
-            "replica_sets": [rs.metadata.name for rs in replica_sets.items],
+            "revisions": [self._replica_set_summary(rs) for rs in owned],
+        }
+
+    @staticmethod
+    def _owned_replica_sets(deployment: Any, replica_sets: list[Any]) -> list[Any]:
+        deployment_uid = deployment.metadata.uid
+        owned = [
+            replica_set
+            for replica_set in replica_sets
+            if any(
+                owner.uid == deployment_uid and owner.kind == "Deployment"
+                for owner in (replica_set.metadata.owner_references or [])
+            )
+        ]
+        return sorted(
+            owned,
+            key=lambda replica_set: int(
+                (replica_set.metadata.annotations or {}).get(
+                    "deployment.kubernetes.io/revision", "0"
+                )
+            ),
+        )
+
+    @staticmethod
+    def _replica_set_summary(replica_set: Any) -> dict[str, Any]:
+        annotations = replica_set.metadata.annotations or {}
+        containers = replica_set.spec.template.spec.containers or []
+        return {
+            "name": replica_set.metadata.name,
+            "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
+            "images": [container.image for container in containers],
+            "replicas": replica_set.status.replicas or 0,
+            "ready_replicas": replica_set.status.ready_replicas or 0,
         }
 
     def _tool_get_service_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -133,10 +185,51 @@ class KubernetesBackend:
         return {"deployment": name, "restarted": True}
 
     def _tool_rollback_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise RuntimeError(
-            "Rollback requires an external deployment controller adapter; "
-            "use Argo Rollouts/GitOps MCP in production"
+        name = arguments["name"]
+        target_revision = int(arguments["revision"])
+        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        if deployment.spec.paused:
+            raise RuntimeError("Cannot rollback a paused deployment")
+
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
         )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
+        target = next(
+            (
+                replica_set
+                for replica_set in owned
+                if int(
+                    (replica_set.metadata.annotations or {}).get(
+                        "deployment.kubernetes.io/revision", "0"
+                    )
+                )
+                == target_revision
+            ),
+            None,
+        )
+        if target is None:
+            available = [self._replica_set_summary(item)["revision"] for item in owned]
+            raise RuntimeError(
+                f"Revision {target_revision} was not found for {name}; available={available}"
+            )
+
+        deployment.spec.template = copy.deepcopy(target.spec.template)
+        annotations = deployment.spec.template.metadata.annotations or {}
+        annotations["sentinelops.io/rolledBackAt"] = datetime.now(UTC).isoformat()
+        deployment.spec.template.metadata.annotations = annotations
+        self.apps.replace_namespaced_deployment(
+            name,
+            self.namespace,
+            deployment,
+        )
+        return {
+            "deployment": name,
+            "rolled_back": True,
+            "source_revision": target_revision,
+            "source_replica_set": target.metadata.name,
+        }
 
     def _tool_scale_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]

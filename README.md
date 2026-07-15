@@ -129,9 +129,34 @@ Apply the example namespace-scoped role after reviewing it:
 kubectl apply -f deploy/rbac.yaml
 ```
 
-The included live adapter supports bounded reads, rolling restart, and scaling. Production
-rollback is deliberately not faked with an unsafe patch: connect the repository's deployment
-controller (Argo Rollouts, Flux, or another GitOps controller) as a separate tool.
+The live adapter supports bounded reads, rolling restart, scaling, and revision rollback.
+Rollback resolves an owned ReplicaSet by `deployment.kubernetes.io/revision`, restores its Pod
+template through a resource-version-guarded Deployment update, and then waits for every matching
+Pod and the workload availability signal to recover. In GitOps-managed production environments,
+replace this adapter with an Argo Rollouts or Flux MCP tool so Git remains the source of truth.
+
+## Real kind fault lab
+
+The repository includes a real Kubernetes end-to-end scenario. It creates a disposable `kind`
+cluster, deploys a healthy NGINX-backed `order-service`, injects a broken Deployment revision,
+waits until the new Pod reaches `CrashLoopBackOff`, and runs SentinelOps against the Kubernetes
+API. After approval, SentinelOps restores revision 1 and verifies the Pods recover.
+
+Requirements: Docker, `kind`, and `kubectl`.
+
+```bash
+make kind-e2e
+```
+
+To keep the cluster for inspection:
+
+```bash
+SENTINELOPS_KEEP_KIND_CLUSTER=true make kind-e2e
+kubectl get pods,rs,deploy -n sentinelops-demo
+make kind-down
+```
+
+The same scenario runs in GitHub Actions on every push and pull request.
 
 ## MCP server
 
@@ -200,7 +225,7 @@ tests/              # graph, policy and tool-boundary tests
 - [x] Offline Kubernetes incident simulator
 - [x] Kubernetes API and MCP adapters
 - [x] REST API and CI evaluation
-- [ ] Disposable `kind` fault lab
+- [x] Disposable `kind` fault lab
 - [ ] Prometheus, Loki and Tempo MCP servers
 - [ ] PostgreSQL checkpointer and event store
 - [ ] OpenTelemetry spans for model and tool calls
@@ -210,4 +235,3 @@ tests/              # graph, policy and tool-boundary tests
 ## License
 
 Apache-2.0
-

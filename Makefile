@@ -1,4 +1,4 @@
-.PHONY: install test lint eval demo serve
+.PHONY: install test lint eval demo serve kind-up kind-fault kind-e2e kind-down
 
 install:
 	python -m pip install -e ".[dev]"
@@ -17,4 +17,16 @@ demo:
 
 serve:
 	sentinelops serve
+
+kind-up:
+	scripts/kind-up.sh
+
+kind-fault:
+	scripts/inject-bad-rollout.sh
+
+kind-e2e:
+	scripts/e2e-kind.sh
+
+kind-down:
+	scripts/kind-down.sh
 
