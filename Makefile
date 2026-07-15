@@ -1,4 +1,4 @@
-.PHONY: install test lint eval demo serve kind-up kind-fault kind-e2e kind-down \
+.PHONY: install test lint eval demo serve console console-build kind-up kind-fault kind-e2e kind-down \
 	observability-up observability-fault observability-e2e golden-path-e2e \
 	observability-down
 
@@ -19,6 +19,13 @@ demo:
 
 serve:
 	sentinelops serve
+
+console:
+	scripts/dev-console.sh
+
+console-build:
+	npm --prefix web install
+	npm --prefix web run build
 
 kind-up:
 	scripts/kind-up.sh
