@@ -14,10 +14,6 @@ from sentinelops.runtime import build_agent
 async def run_demo(scenario: str, approve: bool) -> None:
     settings = Settings(tool_backend="simulator", model_provider="rule_based")
     agent = build_agent(settings, scenario=scenario)
-    await run_incident(agent, settings, approve=approve, scenario=scenario)
-
-
-async def run_incident(agent, settings: Settings, *, approve: bool, scenario: str) -> None:
     alert = Alert(
         name="HighOrderServiceErrorRate",
         namespace=settings.kubernetes_namespace,
@@ -26,6 +22,10 @@ async def run_incident(agent, settings: Settings, *, approve: bool, scenario: st
         summary="Order service error rate exceeded the 5% SLO threshold",
         labels={"scenario": scenario},
     )
+    await run_incident(agent, alert, approve=approve)
+
+
+async def run_incident(agent, alert: Alert, *, approve: bool) -> None:
     record = await agent.start(alert)
     print(json.dumps(record.model_dump(mode="json"), indent=2, ensure_ascii=False))
     if approve and record.status != IncidentStatus.AWAITING_APPROVAL:
@@ -42,12 +42,21 @@ async def run_incident(agent, settings: Settings, *, approve: bool, scenario: st
             raise SystemExit(2)
 
 
-async def run_live(approve: bool) -> None:
+async def run_live(approve: bool, service: str, trace_id: str, summary: str) -> None:
     settings = get_settings()
     if settings.tool_backend != "kubernetes":
         raise SystemExit("Set SENTINELOPS_TOOL_BACKEND=kubernetes before using investigate")
     agent = build_agent(settings)
-    await run_incident(agent, settings, approve=approve, scenario="live_cluster")
+    labels = {"trace_id": trace_id} if trace_id else {}
+    alert = Alert(
+        name=f"High{service.title().replace('-', '')}ErrorRate",
+        namespace=settings.kubernetes_namespace,
+        service=service,
+        severity="critical",
+        summary=summary,
+        labels=labels,
+    )
+    await run_incident(agent, alert, approve=approve)
 
 
 def main() -> None:
@@ -70,6 +79,12 @@ def main() -> None:
         action="store_true",
         help="Approve the proposed remediation after the graph pauses",
     )
+    investigate.add_argument("--service", default="order-service")
+    investigate.add_argument("--trace-id", default="")
+    investigate.add_argument(
+        "--summary",
+        default="Service error rate exceeded the SLO threshold",
+    )
 
     serve = subparsers.add_parser("serve", help="Start the REST API")
     serve.add_argument("--host", default="127.0.0.1")
@@ -79,7 +94,7 @@ def main() -> None:
     if args.command == "demo":
         asyncio.run(run_demo(args.scenario, args.approve))
     elif args.command == "investigate":
-        asyncio.run(run_live(args.approve))
+        asyncio.run(run_live(args.approve, args.service, args.trace_id, args.summary))
     elif args.command == "serve":
         uvicorn.run("sentinelops.api:app", host=args.host, port=args.port, reload=False)
 

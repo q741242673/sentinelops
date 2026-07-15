@@ -95,3 +95,18 @@ async def test_agent_collects_configured_observability_evidence() -> None:
 
     assert record.status == IncidentStatus.AWAITING_APPROVAL
     assert observability.calls == ["query_prometheus", "search_loki"]
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ({"result": [{"value": [1_700_000_000, "0.0"]}]}, 0.0),
+        ({"result": [{"value": [1_700_000_000, "0.25"]}]}, 0.25),
+        ({"result": []}, None),
+        ({"result": [{"value": [1_700_000_000, "NaN"]}]}, None),
+    ],
+)
+def test_prometheus_scalar_parsing(content, expected) -> None:
+    result = ToolResult(tool_name="query_prometheus", success=True, content=content)
+
+    assert IncidentAgent._prometheus_scalar(result) == expected

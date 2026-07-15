@@ -39,6 +39,7 @@ def test_owned_replica_sets_are_filtered_and_sorted() -> None:
         "order-service-1",
         "order-service-2",
     ]
+    assert KubernetesBackend._replica_set_summary(result[0])["change_cause"] is None
 
 
 def test_rollback_restores_target_template_with_resource_version_guard() -> None:
