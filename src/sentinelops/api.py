@@ -4,6 +4,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from sentinelops import __version__
+from sentinelops.agent import IncidentAgent
+from sentinelops.config import get_settings
 from sentinelops.domain import Alert, IncidentRecord
 from sentinelops.runtime import build_agent
 
@@ -12,12 +14,22 @@ app = FastAPI(
     version=__version__,
     description="Model-agnostic Kubernetes incident diagnosis and remediation agent",
 )
-agent = build_agent()
+incident_agents: dict[str, IncidentAgent] = {}
+incident_records: dict[str, IncidentRecord] = {}
 
 
 class ApprovalDecision(BaseModel):
     approved: bool
     note: str = ""
+
+
+class RuntimeInfo(BaseModel):
+    environment: str
+    tool_backend: str
+    model_provider: str
+    model_name: str
+    namespace: str
+    approval_mode: str = "human_gated"
 
 
 @app.get("/health")
@@ -27,13 +39,34 @@ async def health() -> dict[str, str]:
 
 @app.post("/api/v1/incidents", response_model=IncidentRecord, status_code=201)
 async def create_incident(alert: Alert) -> IncidentRecord:
-    return await agent.start(alert)
+    incident_agent = build_agent()
+    record = await incident_agent.start(alert)
+    incident_agents[record.id] = incident_agent
+    incident_records[record.id] = record
+    return record
+
+
+@app.get("/api/v1/incidents", response_model=list[IncidentRecord])
+async def list_incidents() -> list[IncidentRecord]:
+    return sorted(incident_records.values(), key=lambda record: record.created_at, reverse=True)
+
+
+@app.get("/api/v1/runtime", response_model=RuntimeInfo)
+async def get_runtime() -> RuntimeInfo:
+    settings = get_settings()
+    return RuntimeInfo(
+        environment=settings.environment,
+        tool_backend=settings.tool_backend,
+        model_provider=settings.model_provider,
+        model_name=settings.model_name,
+        namespace=settings.kubernetes_namespace,
+    )
 
 
 @app.get("/api/v1/incidents/{incident_id}", response_model=IncidentRecord)
 async def get_incident(incident_id: str) -> IncidentRecord:
     try:
-        return agent.get(incident_id)
+        return incident_records[incident_id]
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Incident not found") from exc
 
@@ -41,11 +74,13 @@ async def get_incident(incident_id: str) -> IncidentRecord:
 @app.post("/api/v1/incidents/{incident_id}/approval", response_model=IncidentRecord)
 async def decide_incident(incident_id: str, decision: ApprovalDecision) -> IncidentRecord:
     try:
-        return await agent.resume(
+        record = await incident_agents[incident_id].resume(
             incident_id,
             approved=decision.approved,
             note=decision.note,
         )
+        incident_records[incident_id] = record
+        return record
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Incident not found") from exc
     except RuntimeError as exc:

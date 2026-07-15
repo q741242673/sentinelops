@@ -8,9 +8,9 @@ Kubernetes context, produces a diagnosis tied to evidence, proposes a reversible
 pauses for approval when risk exceeds policy, executes through a constrained tool registry,
 and verifies recovery before generating a postmortem.
 
-> Status: runnable v0.1 foundation. The offline simulator and evaluation suite work without a
-> Kubernetes cluster or model API key. The real Kubernetes and OpenAI-compatible adapters are
-> included for integration work.
+> Status: runnable v0.1. The local Incident Console and offline simulator work without a
+> Kubernetes cluster or model API key. The real kind, Prometheus, Loki, Tempo, and DeepSeek
+> golden path is verified in GitHub Actions.
 
 ## Why this repository exists
 
@@ -56,6 +56,21 @@ sentinelops demo --scenario bad_rollout --approve
 
 The command prints the record before approval, resumes the same graph thread, performs a
 simulated rollback, verifies the new health snapshot, and prints the final postmortem.
+
+### Local Incident Console
+
+The portfolio demo includes a local operations console that visualizes the complete Agent graph,
+evidence-backed diagnosis, allowlisted remediation, approval gate, and recovery audit trail.
+Node.js 22+ is required in addition to Python.
+
+```bash
+make console
+```
+
+Open `http://127.0.0.1:5173`. The console creates a deterministic incident on first load, pauses
+at the high-risk rollback, and resumes the same LangGraph thread when you approve it. The browser
+is local-only; FastAPI remains the Agent control plane so the UI operates real incident state
+instead of static mock data.
 
 Other deterministic scenario:
 
