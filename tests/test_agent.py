@@ -847,6 +847,7 @@ def test_restart_is_rejected_when_it_preserves_a_faulty_rollout() -> None:
                         "replicas": 0,
                         "change_cause": "healthy-baseline",
                         "health_status": "healthy",
+                        "health_proof": {"valid": True, "status": "healthy"},
                     },
                     {
                         "revision": 6,
@@ -909,6 +910,7 @@ def test_unknown_rollback_revision_is_rejected_in_favor_of_exact_prior() -> None
                         "replicas": 0,
                         "change_cause": "healthy-baseline",
                         "health_status": "healthy",
+                        "health_proof": {"valid": True, "status": "healthy"},
                     },
                     {"revision": 12, "replicas": 1, "change_cause": "enable-failure"},
                 ]
@@ -1019,9 +1021,10 @@ def test_revision_health_never_uses_free_text_or_unknown_values(
     assert IncidentAgent._revision_is_known_healthy(revision) is False
 
 
-def test_exact_structured_health_status_overrides_misleading_free_text() -> None:
+def test_valid_health_proof_overrides_misleading_free_text() -> None:
     revision = {
         "health_status": "healthy",
+        "health_proof": {"valid": True, "status": "healthy"},
         "change_cause": "unhealthy-release",
     }
 

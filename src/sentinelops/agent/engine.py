@@ -1313,7 +1313,8 @@ class IncidentAgent:
 
         if (
             action.tool_name == "restart_deployment"
-            and current.get("health_status") == "unhealthy"
+            and IncidentAgent._revision_is_known_healthy(target)
+            and not IncidentAgent._revision_is_known_healthy(current)
         ):
             return (
                 f"restart_deployment 会保留可疑 revision {current_revision} "
@@ -1340,7 +1341,12 @@ class IncidentAgent:
 
     @staticmethod
     def _revision_is_known_healthy(revision: dict[str, Any]) -> bool:
-        return revision.get("health_status") == "healthy"
+        proof = revision.get("health_proof")
+        return (
+            isinstance(proof, dict)
+            and proof.get("valid") is True
+            and proof.get("status") == "healthy"
+        )
 
     async def _prepare_approval(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])

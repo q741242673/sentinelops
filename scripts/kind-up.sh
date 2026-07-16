@@ -14,8 +14,17 @@ fi
 
 kubectl config use-context "kind-${CLUSTER_NAME}"
 kubectl apply -f "${ROOT_DIR}/deploy/kind/workload.yaml"
+kubectl patch deployment/order-service \
+  --namespace sentinelops-demo \
+  --type merge \
+  --patch '{"spec":{"template":{"metadata":{"annotations":{"sentinelops.io/health-status":null}}}}}'
 kubectl rollout status deployment/order-service \
   --namespace sentinelops-demo \
   --timeout 120s
+python3 "${ROOT_DIR}/scripts/attest_revision_health.py" \
+  --context "kind-${CLUSTER_NAME}" \
+  --namespace sentinelops-demo \
+  --deployment order-service \
+  --verifier sentinelops-kind-bootstrap
 
 echo "SentinelOps kind lab is ready on context kind-${CLUSTER_NAME}"

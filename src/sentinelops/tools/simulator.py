@@ -77,6 +77,7 @@ class SimulatedKubernetesBackend:
                     "ready_replicas": 1,
                     "status": "stable",
                     "health_status": "healthy",
+                    "health_proof": {"valid": True, "status": "healthy"},
                 }
             ]
         else:
@@ -88,6 +89,7 @@ class SimulatedKubernetesBackend:
                     "ready_replicas": 0,
                     "status": "stable",
                     "health_status": "healthy",
+                    "health_proof": {"valid": True, "status": "healthy"},
                 },
                 {
                     "revision": 2,
@@ -95,7 +97,8 @@ class SimulatedKubernetesBackend:
                     "replicas": 1,
                     "ready_replicas": 0,
                     "status": "failed",
-                    "health_status": "unhealthy",
+                    "health_status": "unknown",
+                    "health_proof": {"valid": False, "status": "unknown"},
                 },
             ]
         return {

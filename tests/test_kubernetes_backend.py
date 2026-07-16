@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from sentinelops.revision_health import (
+    build_health_proof_annotations,
+    revision_subject,
+    runtime_image_fingerprint,
+)
 from sentinelops.tools.kubernetes import KubernetesBackend
 
 
@@ -14,22 +20,47 @@ def replica_set(
     revision: int,
     *,
     owner_uid: str = "deployment-uid",
-    health_status: str | None = None,
+    healthy_proof: bool = False,
+    template_health_status: str | None = None,
+    controller: bool = True,
 ):
     template_annotations = {"sentinelops.io/version": f"1.{revision}.0"}
-    if health_status is not None:
-        template_annotations["sentinelops.io/health-status"] = health_status
+    if template_health_status is not None:
+        template_annotations["sentinelops.io/health-status"] = template_health_status
     template = ns(
         metadata=ns(annotations=template_annotations),
         spec=ns(containers=[ns(name="order-service", image=f"order:{revision}")]),
     )
+    annotations = {"deployment.kubernetes.io/revision": str(revision)}
+    if healthy_proof:
+        subject = revision_subject(
+            deployment_uid=owner_uid,
+            replica_set_uid=f"replica-set-uid-{revision}",
+            revision=str(revision),
+            template_hash=f"hash-{revision}",
+            containers=[("order-service", f"order:{revision}")],
+            runtime_images=runtime_image_fingerprint(
+                [("order-service", f"docker-pullable://order@sha256:{revision}")]
+            ),
+        )
+        annotations.update(
+            build_health_proof_annotations(
+                subject,
+                verified_at=datetime.now(UTC),
+                verifier="test-release-pipeline",
+            )
+        )
     return ns(
         metadata=ns(
             name=f"order-service-{revision}",
-            annotations={"deployment.kubernetes.io/revision": str(revision)},
-            owner_references=[ns(uid=owner_uid, kind="Deployment")],
+            uid=f"replica-set-uid-{revision}",
+            annotations=annotations,
+            labels={"pod-template-hash": f"hash-{revision}"},
+            owner_references=[
+                ns(uid=owner_uid, kind="Deployment", controller=controller)
+            ],
         ),
-        spec=ns(template=template),
+        spec=ns(template=template, replicas=1),
         status=ns(replicas=1, ready_replicas=1),
     )
 
@@ -37,10 +68,11 @@ def replica_set(
 def test_owned_replica_sets_are_filtered_and_sorted() -> None:
     deployment = ns(metadata=ns(uid="deployment-uid"))
     unrelated = replica_set(9, owner_uid="another-deployment")
+    non_controller = replica_set(8, controller=False)
 
     result = KubernetesBackend._owned_replica_sets(
         deployment,
-        [replica_set(2), unrelated, replica_set(1)],
+        [replica_set(2), unrelated, non_controller, replica_set(1)],
     )
 
     assert [item.metadata.name for item in result] == [
@@ -51,20 +83,71 @@ def test_owned_replica_sets_are_filtered_and_sorted() -> None:
     assert KubernetesBackend._replica_set_summary(result[0])["health_status"] == "unknown"
 
 
-def test_replica_set_health_status_is_a_controlled_value() -> None:
-    healthy = KubernetesBackend._replica_set_summary(
-        replica_set(1, health_status="healthy")
+def test_replica_set_health_requires_a_valid_revision_bound_proof() -> None:
+    healthy = KubernetesBackend._replica_set_summary(replica_set(1, healthy_proof=True))
+    inherited = KubernetesBackend._replica_set_summary(
+        replica_set(2, template_health_status="healthy")
     )
-    unhealthy = KubernetesBackend._replica_set_summary(
-        replica_set(2, health_status="unhealthy")
-    )
-    invalid = KubernetesBackend._replica_set_summary(
-        replica_set(3, health_status="not-healthy")
-    )
+    copied = replica_set(3)
+    copied.metadata.annotations.update(replica_set(1, healthy_proof=True).metadata.annotations)
+    copied.metadata.annotations["deployment.kubernetes.io/revision"] = "3"
+    invalid = KubernetesBackend._replica_set_summary(copied)
 
     assert healthy["health_status"] == "healthy"
-    assert unhealthy["health_status"] == "unhealthy"
+    assert healthy["health_proof"]["valid"] is True
+    assert inherited["health_status"] == "unknown"
     assert invalid["health_status"] == "unknown"
+    assert invalid["health_proof"]["valid"] is False
+
+
+def test_attestation_writes_proof_to_exact_ready_replica_set_metadata() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    backend.core = Mock()
+    deployment = ns(metadata=ns(uid="deployment-uid"))
+    target = replica_set(4)
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(items=[target])
+    backend.core.list_namespaced_pod.return_value = ns(
+        items=[
+            ns(
+                metadata=ns(
+                    owner_references=[
+                        ns(
+                            uid="replica-set-uid-4",
+                            kind="ReplicaSet",
+                            controller=True,
+                        )
+                    ]
+                ),
+                status=ns(
+                    container_statuses=[
+                        ns(
+                            name="order-service",
+                            ready=True,
+                            image_id="docker-pullable://order@sha256:4",
+                        )
+                    ]
+                )
+            )
+        ]
+    )
+
+    result = backend._attest_current_revision_healthy("order-service")
+
+    assert result["revision"] == 4
+    call = backend.apps.patch_namespaced_replica_set.call_args
+    assert call.args[:2] == ("order-service-4", "sentinelops-demo")
+    proof_annotations = call.args[2]["metadata"]["annotations"]
+    assert proof_annotations["sentinelops.io/health-proof-revision"] == "4"
+    assert proof_annotations["sentinelops.io/health-proof-replicaset-uid"] == (
+        "replica-set-uid-4"
+    )
+    assert "sentinelops.io/health-status" not in proof_annotations
+    assert backend.core.list_namespaced_pod.call_args.kwargs["label_selector"] == (
+        "app=order-service,pod-template-hash=hash-4"
+    )
 
 
 def test_rollback_restores_target_template_with_resource_version_guard() -> None:
@@ -80,6 +163,7 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
         spec=ns(paused=False, template=current_template),
     )
     target = replica_set(1)
+    target.spec.template.metadata.annotations["sentinelops.io/health-status"] = "healthy"
     backend.apps.read_namespaced_deployment.return_value = deployment
     backend.apps.list_namespaced_replica_set.return_value = ns(items=[target, replica_set(2)])
 
@@ -89,6 +173,7 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
     assert deployment.spec.template is not target.spec.template
     assert deployment.spec.template.spec.containers[0].image == "order:1"
     assert "sentinelops.io/rolledBackAt" in deployment.spec.template.metadata.annotations
+    assert "sentinelops.io/health-status" not in deployment.spec.template.metadata.annotations
     backend.apps.replace_namespaced_deployment.assert_called_once_with(
         "order-service",
         "sentinelops-demo",
@@ -132,7 +217,7 @@ def test_demo_fault_injection_patches_failure_rate_and_waits_for_rollout() -> No
     body = backend.apps.patch_namespaced_deployment.call_args.args[2]
     assert body["spec"]["template"]["metadata"]["annotations"][
         "sentinelops.io/health-status"
-    ] == "unhealthy"
+    ] is None
     assert body["spec"]["template"]["spec"]["containers"][0]["env"] == [
         {"name": "FAIL_EVERY", "value": "3"}
     ]
@@ -156,6 +241,12 @@ def test_reset_demo_baseline_sets_known_healthy_config() -> None:
     backend._tool_get_rollout_history = Mock(  # type: ignore[method-assign]
         return_value={"revisions": [{"revision": 8, "replicas": 1}]}
     )
+    backend._attest_current_revision_healthy = Mock(  # type: ignore[method-assign]
+        return_value={
+            "revision": 8,
+            "health_proof": {"valid": True, "status": "healthy"},
+        }
+    )
 
     result = backend._tool_reset_demo_baseline(
         {"name": "inventory-service", "timeout_seconds": 1}
@@ -168,9 +259,8 @@ def test_reset_demo_baseline_sets_known_healthy_config() -> None:
     assert template["metadata"]["annotations"]["sentinelops.io/change-cause"] == (
         "healthy-baseline"
     )
-    assert template["metadata"]["annotations"]["sentinelops.io/health-status"] == (
-        "healthy"
-    )
+    assert template["metadata"]["annotations"]["sentinelops.io/health-status"] is None
     assert template["spec"]["containers"][0]["env"] == [
         {"name": "FAIL_EVERY", "value": "0"}
     ]
+    backend._attest_current_revision_healthy.assert_called_once_with("inventory-service")

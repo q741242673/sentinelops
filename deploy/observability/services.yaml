@@ -14,7 +14,6 @@ spec:
         app: inventory-service
       annotations:
         sentinelops.io/change-cause: healthy-baseline
-        sentinelops.io/health-status: healthy
     spec:
       containers:
         - name: inventory-service

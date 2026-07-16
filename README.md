@@ -221,7 +221,18 @@ kubectl apply -f deploy/rbac.yaml
 
 请在接入生产集群前检查并缩小权限范围。当前工具支持读取 Pod、事件、日志和发布历史，以及滚动重启、回滚和扩缩容。模型本身拿不到任意 Shell、Secret 或特权 Pod 权限。
 
-如果希望 Agent 自动提出回滚，发布流水线需要在确认版本健康后为对应 Pod 模板写入 `sentinelops.io/health-status: healthy`。没有这个标记或值不是 `healthy` 的历史版本都会被当成未知状态，Agent 不会自动回滚到它。
+如果希望 Agent 自动提出回滚，发布流水线需要先完成就绪检查，再给这一次发布对应的 ReplicaSet 写入健康证明：
+
+```bash
+python3 scripts/attest_revision_health.py \
+  --namespace sentinelops-demo \
+  --deployment order-service \
+  --verifier production-release-pipeline
+```
+
+证明会绑定 Deployment UID、ReplicaSet UID、revision、Pod 模板哈希、镜像引用、实际运行的镜像 ID、Git commit 和验证时间。它只写在这个 ReplicaSet 自己的 metadata 上，不会跟着 Deployment 模板传播到未来版本。证明缺失、被复制、字段不完整或与当前 revision 不一致时都会被当成未知状态，Agent 不会自动回滚到它。
+
+生产环境建议使用不可变镜像 digest，并让独立的发布验证身份拥有写证明权限；Agent 自己只读这些证明。示例 RBAC 仍然没有给 Agent 修改 ReplicaSet 的权限。这里的可信边界是 Kubernetes 的 RBAC 和审计日志，并不是独立的数字签名；如果多个不可信主体都能修改 ReplicaSet annotation，应再接外部签名或准入控制，不能只依赖这组注解。
 
 ## 配置监控和代码变更证据
 

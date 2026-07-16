@@ -147,5 +147,9 @@ async def test_simulator_rollout_uses_structured_health_status() -> None:
     assert result.success is True
     assert [item["health_status"] for item in result.content["revisions"]] == [
         "healthy",
-        "unhealthy",
+        "unknown",
+    ]
+    assert [item["health_proof"]["valid"] for item in result.content["revisions"]] == [
+        True,
+        False,
     ]

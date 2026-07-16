@@ -12,6 +12,12 @@ from kubernetes import client, config
 from kubernetes.config.config_exception import ConfigException
 
 from sentinelops.domain import ToolResult
+from sentinelops.revision_health import (
+    build_health_proof_annotations,
+    revision_subject,
+    runtime_image_fingerprint,
+    verify_health_proof,
+)
 
 
 class KubernetesBackend:
@@ -150,7 +156,9 @@ class KubernetesBackend:
             replica_set
             for replica_set in replica_sets
             if any(
-                owner.uid == deployment_uid and owner.kind == "Deployment"
+                owner.uid == deployment_uid
+                and owner.kind == "Deployment"
+                and getattr(owner, "controller", False) is True
                 for owner in (replica_set.metadata.owner_references or [])
             )
         ]
@@ -168,20 +176,132 @@ class KubernetesBackend:
         annotations = replica_set.metadata.annotations or {}
         template_annotations = replica_set.spec.template.metadata.annotations or {}
         containers = replica_set.spec.template.spec.containers or []
-        health_status = template_annotations.get("sentinelops.io/health-status")
-        if health_status not in {"healthy", "unhealthy"}:
-            health_status = "unknown"
+        labels = replica_set.metadata.labels or {}
+        owners = replica_set.metadata.owner_references or []
+        deployment_owner = next(
+            (
+                owner
+                for owner in owners
+                if owner.kind == "Deployment" and getattr(owner, "controller", False) is True
+            ),
+            None,
+        )
+        revision = annotations.get("deployment.kubernetes.io/revision", "0")
+        proof = verify_health_proof(
+            annotations,
+            deployment_uid=str(getattr(deployment_owner, "uid", "")),
+            replica_set_uid=str(replica_set.metadata.uid or ""),
+            revision=revision,
+            template_hash=labels.get("pod-template-hash", ""),
+            containers=[(container.name, container.image) for container in containers],
+            git_commit=template_annotations.get("sentinelops.io/git-commit", ""),
+        )
         return {
             "name": replica_set.metadata.name,
-            "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
+            "revision": int(revision),
             "images": [container.image for container in containers],
             "change_cause": template_annotations.get("sentinelops.io/change-cause"),
-            "health_status": health_status,
+            "health_status": proof["status"],
+            "health_proof": proof,
             "git_commit": template_annotations.get("sentinelops.io/git-commit"),
             "repository": template_annotations.get("sentinelops.io/repository"),
             "source_path": template_annotations.get("sentinelops.io/source-path"),
             "replicas": replica_set.status.replicas or 0,
             "ready_replicas": replica_set.status.ready_replicas or 0,
+        }
+
+    def _attest_current_revision_healthy(
+        self,
+        name: str,
+        *,
+        verifier: str = "sentinelops-demo-controller",
+    ) -> dict[str, Any]:
+        """Write a health proof to the exact ready ReplicaSet, never its Pod template."""
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
+        if not owned:
+            raise RuntimeError(f"No owned ReplicaSet found for {name}")
+        target = owned[-1]
+        desired = target.spec.replicas or 0
+        if desired <= 0 or (target.status.ready_replicas or 0) != desired:
+            raise RuntimeError(f"Current ReplicaSet for {name} is not fully ready")
+
+        labels = target.metadata.labels or {}
+        template_hash = labels.get("pod-template-hash", "")
+        if not template_hash:
+            raise RuntimeError(f"Current ReplicaSet for {name} has no pod-template-hash")
+        pods = self.core.list_namespaced_pod(
+            self.namespace,
+            label_selector=f"app={name},pod-template-hash={template_hash}",
+            _request_timeout=self._api_timeout(),
+        )
+        ready_image_ids: dict[str, set[str]] = {}
+        ready_pods = 0
+        for pod in pods.items:
+            if not any(
+                owner.uid == target.metadata.uid
+                and owner.kind == "ReplicaSet"
+                and getattr(owner, "controller", False) is True
+                for owner in (pod.metadata.owner_references or [])
+            ):
+                continue
+            statuses = pod.status.container_statuses or []
+            if not statuses or not all(status.ready and status.image_id for status in statuses):
+                continue
+            ready_pods += 1
+            for status in statuses:
+                ready_image_ids.setdefault(status.name, set()).add(status.image_id)
+        if ready_pods < desired:
+            raise RuntimeError(f"Ready Pods for {name} do not provide complete runtime image IDs")
+
+        containers = target.spec.template.spec.containers or []
+        expected_names = {container.name for container in containers}
+        if set(ready_image_ids) != expected_names or any(
+            len(image_ids) != 1 for image_ids in ready_image_ids.values()
+        ):
+            raise RuntimeError(f"Runtime images for {name} are incomplete or inconsistent")
+        runtime_images = runtime_image_fingerprint(
+            [
+                (container_name, next(iter(image_ids)))
+                for container_name, image_ids in ready_image_ids.items()
+            ]
+        )
+        annotations = target.metadata.annotations or {}
+        revision = annotations.get("deployment.kubernetes.io/revision", "0")
+        template_annotations = target.spec.template.metadata.annotations or {}
+        subject = revision_subject(
+            deployment_uid=str(deployment.metadata.uid),
+            replica_set_uid=str(target.metadata.uid),
+            revision=revision,
+            template_hash=template_hash,
+            containers=[(container.name, container.image) for container in containers],
+            runtime_images=runtime_images,
+            git_commit=template_annotations.get("sentinelops.io/git-commit", ""),
+        )
+        proof_annotations = build_health_proof_annotations(
+            subject,
+            verified_at=datetime.now(UTC),
+            verifier=verifier,
+        )
+        self.apps.patch_namespaced_replica_set(
+            target.metadata.name,
+            self.namespace,
+            {"metadata": {"annotations": proof_annotations}},
+            _request_timeout=self._api_timeout(),
+        )
+        return {
+            "replica_set": target.metadata.name,
+            "revision": int(revision),
+            "health_proof": {"valid": True, "status": "healthy"},
         }
 
     def _tool_get_service_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -229,7 +349,7 @@ class KubernetesBackend:
                             "sentinelops.io/change-cause": (
                                 "enable-every-third-inventory-failure"
                             ),
-                            "sentinelops.io/health-status": "unhealthy",
+                            "sentinelops.io/health-status": None,
                             "sentinelops.io/fault-injected-at": injected_at,
                         }
                     },
@@ -303,7 +423,7 @@ class KubernetesBackend:
                     "metadata": {
                         "annotations": {
                             "sentinelops.io/change-cause": "healthy-baseline",
-                            "sentinelops.io/health-status": "healthy",
+                            "sentinelops.io/health-status": None,
                             "sentinelops.io/baseline-restored-at": restored_at,
                         }
                     },
@@ -342,10 +462,12 @@ class KubernetesBackend:
             ):
                 history = self._tool_get_rollout_history({"name": name})
                 active = [item for item in history["revisions"] if item["replicas"] > 0]
+                proof = self._attest_current_revision_healthy(name)
                 return {
                     "deployment": name,
                     "baseline_restored": True,
-                    "revision": active[-1]["revision"] if active else None,
+                    "revision": proof["revision"] if active else None,
+                    "health_proof": proof["health_proof"],
                 }
             time.sleep(0.5)
         raise RuntimeError(f"Timed out waiting for the healthy baseline rollout on {name}")
@@ -383,6 +505,7 @@ class KubernetesBackend:
 
         deployment.spec.template = copy.deepcopy(target.spec.template)
         annotations = deployment.spec.template.metadata.annotations or {}
+        annotations.pop("sentinelops.io/health-status", None)
         annotations["sentinelops.io/rolledBackAt"] = datetime.now(UTC).isoformat()
         deployment.spec.template.metadata.annotations = annotations
         self.apps.replace_namespaced_deployment(
