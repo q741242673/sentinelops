@@ -33,6 +33,10 @@ class KubernetesBackend:
         self.core = client.CoreV1Api(api_client)
         self.apps = client.AppsV1Api(api_client)
 
+    def _api_timeout(self) -> float:
+        """Bound individual API calls so a stalled local cluster cannot hang the console."""
+        return 5.0
+
     async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         started = time.perf_counter()
         handler: Callable[[dict[str, Any]], dict[str, Any]] | None = getattr(
@@ -121,9 +125,15 @@ class KubernetesBackend:
 
     def _tool_get_rollout_history(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments.get("name", "order-service")
-        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
         replica_sets = self.apps.list_namespaced_replica_set(
-            self.namespace, label_selector=f"app={name}"
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
         )
         owned = self._owned_replica_sets(deployment, replica_sets.items)
         return {
@@ -185,7 +195,11 @@ class KubernetesBackend:
         """Inject the portfolio demo fault without exposing it as an Agent tool."""
         name = arguments.get("name", "inventory-service")
         timeout_seconds = float(arguments.get("timeout_seconds", 45))
-        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
         containers = deployment.spec.template.spec.containers or []
         container = next((item for item in containers if item.name == name), containers[0])
         env = {item.name: item.value for item in (container.env or [])}
@@ -223,11 +237,20 @@ class KubernetesBackend:
                 }
             }
         }
-        updated = self.apps.patch_namespaced_deployment(name, self.namespace, body)
+        updated = self.apps.patch_namespaced_deployment(
+            name,
+            self.namespace,
+            body,
+            _request_timeout=self._api_timeout(),
+        )
         target_generation = updated.metadata.generation
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            current = self.apps.read_namespaced_deployment_status(name, self.namespace)
+            current = self.apps.read_namespaced_deployment_status(
+                name,
+                self.namespace,
+                _request_timeout=self._api_timeout(),
+            )
             desired = current.spec.replicas or 0
             if (
                 (current.status.observed_generation or 0) >= target_generation

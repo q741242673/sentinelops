@@ -298,7 +298,20 @@ function App() {
     setError(null);
     setDemoMessage(null);
     try {
-      const result = await api.injectDemoFault();
+      let job = await api.injectDemoFault();
+      setDemoMessage("故障注入任务已提交，正在等待 Kubernetes 完成滚动更新…");
+      const deadline = Date.now() + 70_000;
+      while (job.status === "injecting" && Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+        job = await api.getDemoFaultJob(job.id);
+      }
+      if (job.status === "injecting") {
+        throw new Error("故障注入超时，请确认 Docker Desktop 和 kind 集群正在运行");
+      }
+      if (job.status === "failed" || !job.result) {
+        throw new Error(job.error ?? "故障注入失败");
+      }
+      const result = job.result;
       setFaultReady(true);
       setDemoMessage(
         result.already_active

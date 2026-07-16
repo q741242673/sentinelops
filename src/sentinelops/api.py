@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from typing import Literal
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -27,11 +29,22 @@ incident_agents: dict[str, IncidentAgent] = {}
 incident_records: dict[str, IncidentRecord] = {}
 alert_fingerprints: dict[str, str] = {}
 incident_tasks: set[asyncio.Task[None]] = set()
+demo_fault_tasks: set[asyncio.Task[None]] = set()
 
 
 class ApprovalDecision(BaseModel):
     approved: bool
     note: str = ""
+
+
+class DemoFaultJob(BaseModel):
+    id: str
+    status: Literal["injecting", "active", "failed"]
+    result: dict[str, object] | None = None
+    error: str | None = None
+
+
+demo_fault_jobs: dict[str, DemoFaultJob] = {}
 
 
 class RuntimeInfo(BaseModel):
@@ -136,12 +149,56 @@ async def create_demo_incident() -> IncidentRecord:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/demo/faults")
-async def create_demo_fault() -> dict[str, object]:
+async def _run_demo_fault(job_id: str) -> None:
+    settings = get_settings()
     try:
-        return await inject_demo_fault(get_settings())
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        result = await asyncio.wait_for(
+            inject_demo_fault(settings),
+            timeout=settings.demo_alert_timeout_seconds + 10,
+        )
+    except TimeoutError:
+        demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
+            update={
+                "status": "failed",
+                "error": (
+                    "连接 kind Kubernetes API 超时，"
+                    "请确认 Docker Desktop 和 kind 集群正在运行。"
+                ),
+            }
+        )
+    except Exception as exc:
+        demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
+            update={"status": "failed", "error": str(exc)}
+        )
+    else:
+        demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
+            update={"status": "active", "result": result}
+        )
+
+
+@app.post("/api/v1/demo/faults", response_model=DemoFaultJob, status_code=202)
+async def create_demo_fault() -> DemoFaultJob:
+    active_job = next(
+        (job for job in demo_fault_jobs.values() if job.status == "injecting"),
+        None,
+    )
+    if active_job:
+        return active_job
+
+    job = DemoFaultJob(id=str(uuid4()), status="injecting")
+    demo_fault_jobs[job.id] = job
+    task = asyncio.create_task(_run_demo_fault(job.id))
+    demo_fault_tasks.add(task)
+    task.add_done_callback(demo_fault_tasks.discard)
+    return job
+
+
+@app.get("/api/v1/demo/faults/{job_id}", response_model=DemoFaultJob)
+async def get_demo_fault(job_id: str) -> DemoFaultJob:
+    try:
+        return demo_fault_jobs[job_id]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="故障注入任务不存在") from exc
 
 
 @app.post("/api/v1/webhooks/alertmanager", status_code=202)

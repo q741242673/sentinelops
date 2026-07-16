@@ -96,3 +96,10 @@ export interface DemoFaultResult {
   revision: number | null;
   failure_every: string;
 }
+
+export interface DemoFaultJob {
+  id: string;
+  status: "injecting" | "active" | "failed";
+  result: DemoFaultResult | null;
+  error: string | null;
+}

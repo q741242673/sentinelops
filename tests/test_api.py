@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -40,8 +42,16 @@ async def test_api_incident_approval_flow() -> None:
         assert demo.json()["status"] == "awaiting_approval"
 
         fault = await client.post("/api/v1/demo/faults")
-        assert fault.status_code == 200
-        assert fault.json()["fault_active"] is True
+        assert fault.status_code == 202
+        fault_job = fault.json()
+        assert fault_job["status"] == "injecting"
+        for _ in range(20):
+            fault_status = await client.get(f"/api/v1/demo/faults/{fault_job['id']}")
+            if fault_status.json()["status"] != "injecting":
+                break
+            await asyncio.sleep(0)
+        assert fault_status.json()["status"] == "active"
+        assert fault_status.json()["result"]["fault_active"] is True
 
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
