@@ -448,14 +448,27 @@ function App() {
         : demoMode === "reflection"
           ? await api.injectReflectionDemoFault()
           : await api.injectDemoFault();
-      const deadline = Date.now() + 70_000;
-      while (job.status === "injecting" && Date.now() < deadline) {
+      const deadline = Date.now() + 120_000;
+      while (
+        (job.status === "injecting" || job.phase === "waiting_for_alert")
+        && Date.now() < deadline
+      ) {
+        setDemoMessage(
+          job.phase === "resetting_baseline"
+            ? "正在恢复健康基线并清理上一轮告警…"
+            : job.phase === "injecting_fault"
+              ? "健康基线已确认，正在向 kind 集群注入新故障…"
+              : "故障已生效，正在等待 Alertmanager 产生新的告警事件…",
+        );
         await new Promise((resolve) => window.setTimeout(resolve, 350));
         job = await api.getDemoFaultJob(job.id);
       }
       if (job.status === "injecting") throw new Error("故障注入超时，请检查本地集群状态");
       if (job.status === "failed" || !job.result) throw new Error(job.error ?? "故障注入失败");
-      setDemoMessage("故障已生效，正在等待 Alertmanager 告警；告警到达后页面会立即切换。");
+      if (job.phase !== "incident_started") {
+        throw new Error("故障已经生效，但 Alertmanager 未在 120 秒内创建新事故");
+      }
+      setDemoMessage("Alertmanager 已创建新事故，Agent 正在实时处理。");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "故障注入失败");
       setDemoMessage("演示未启动，请根据错误信息检查环境。");

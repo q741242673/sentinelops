@@ -246,3 +246,53 @@ async def test_provider_startup_failure_marks_placeholder_failed(
     failed = api_module.incident_records[record.id]
     assert failed.status == api_module.IncidentStatus.FAILED
     assert failed.timeline[-1].type == "automation.failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expected_injector"),
+    [
+        ("bad_rollout", "manual"),
+        ("transient_runtime_fault", "automatic"),
+        ("ambiguous_change_fault", "manual"),
+    ],
+)
+async def test_every_lab_fault_starts_from_a_clean_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_injector: str,
+) -> None:
+    calls: list[str] = []
+
+    async def reset(settings):
+        calls.append("reset")
+        return {"baseline_restored": True}
+
+    async def inject_manual(settings):
+        calls.append("manual")
+        return {"fault_active": True}
+
+    async def inject_automatic(settings):
+        calls.append("automatic")
+        return {"fault_active": True}
+
+    def arm_profile(mode, run_id):
+        calls.append("arm")
+
+    monkeypatch.setattr(api_module, "reset_demo_environment", reset)
+    monkeypatch.setattr(api_module, "inject_demo_fault", inject_manual)
+    monkeypatch.setattr(api_module, "inject_auto_demo_fault", inject_automatic)
+    monkeypatch.setattr(api_module.lab_profiles, "arm", arm_profile)
+    job = api_module.DemoFaultJob(
+        id=f"clean-{scenario}",
+        scenario=scenario,
+        status="injecting",
+    )
+    api_module.demo_fault_jobs[job.id] = job
+
+    await api_module._run_demo_fault(job.id)
+
+    assert calls == ["reset", "arm", expected_injector]
+    completed = api_module.demo_fault_jobs[job.id]
+    assert completed.status == "active"
+    assert completed.phase == "waiting_for_alert"

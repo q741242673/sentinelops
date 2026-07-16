@@ -144,6 +144,8 @@ export interface DemoFaultJob {
   id: string;
   scenario: "bad_rollout" | "transient_runtime_fault" | "ambiguous_change_fault";
   status: "injecting" | "active" | "failed";
+  phase: "resetting_baseline" | "injecting_fault" | "waiting_for_alert" | "incident_started";
+  incident_id: string | null;
   result: DemoFaultResult | null;
   error: string | null;
 }

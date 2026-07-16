@@ -14,7 +14,7 @@ from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
-LabMode = Literal["automatic_remediation", "bounded_reflection"]
+LabMode = Literal["manual_approval", "automatic_remediation", "bounded_reflection"]
 
 
 def build_simulated_lab_agent(
@@ -86,6 +86,78 @@ class VerifiedRuntimeStateRunbook(IncidentRunbook):
         return None
 
 
+class FaultyRolloutRunbook(IncidentRunbook):
+    """Lab contract for the explicit faulty-rollout + human-approval workflow."""
+
+    id = "lab.faulty-rollout.v1"
+
+    @staticmethod
+    def _verified_revisions(state: IncidentState) -> tuple[int, int] | None:
+        revisions = state.get("observations", {}).get("rollout", {}).get("revisions", [])
+        active = [
+            item
+            for item in revisions
+            if (item.get("replicas") or 0) > 0
+            or (item.get("ready_replicas") or 0) > 0
+            or item.get("status") == "failed"
+        ]
+        if not active:
+            return None
+        current = max(active, key=lambda item: int(item.get("revision", 0)))
+        current_revision = int(current.get("revision", 0))
+        previous = [
+            item for item in revisions if int(item.get("revision", 0)) < current_revision
+        ]
+        if not previous:
+            return None
+        change_cause = str(current.get("change_cause") or current.get("status") or "").lower()
+        verified_fault = (
+            "enable-every-third-inventory-failure" in change_cause
+            or change_cause == "failed"
+        )
+        if not verified_fault:
+            return None
+        target_revision = max(int(item.get("revision", 0)) for item in previous)
+        return current_revision, target_revision
+
+    def planning_guidance(self, state: IncidentState) -> str | None:
+        revisions = self._verified_revisions(state)
+        if revisions is None:
+            return None
+        current, target = revisions
+        service = state["alert"]["service"]
+        return (
+            f"Lab 已通过 Kubernetes 发布历史验证 {service} revision {current} 是显式注入的"
+            f"故障发布，已知上一健康 revision 为 {target}。只允许提议 rollback_deployment "
+            "回滚到该 revision；该高风险操作必须保留人工审批。"
+        )
+
+    def plan_feedback(
+        self,
+        state: IncidentState,
+        plan: RemediationPlan,
+        specs: dict[str, Any],
+    ) -> str | None:
+        revisions = self._verified_revisions(state)
+        if revisions is None:
+            return "The trusted faulty-rollout runbook has no verified rollback target"
+        _, target = revisions
+        if not plan.actions:
+            return "The trusted faulty-rollout runbook requires one remediation action"
+        action = plan.actions[0]
+        if action.tool_name != "rollback_deployment":
+            return "The trusted faulty-rollout runbook permits only rollback_deployment"
+        if action.arguments.get("name") != state["alert"]["service"]:
+            return "rollback_deployment must target the alerted service"
+        try:
+            requested = int(action.arguments.get("revision"))
+        except (TypeError, ValueError):
+            return f"rollback_deployment must target verified revision {target}"
+        if requested != target:
+            return f"rollback_deployment must target verified revision {target}"
+        return None
+
+
 class BoundedReflectionRunbook(IncidentRunbook):
     id = "lab.bounded-reflection.v1"
 
@@ -100,6 +172,7 @@ class BoundedReflectionRunbook(IncidentRunbook):
 @dataclass(frozen=True)
 class LabIncidentProfile:
     id: str
+    run_id: str
     mode: LabMode
     expected_alert: str
     expected_service: str
@@ -119,6 +192,7 @@ class LabProfileCoordinator:
         self._armed: dict[LabMode, str] = {}
 
     def arm(self, mode: LabMode, run_id: str) -> None:
+        self._armed.clear()
         self._armed[mode] = run_id
 
     def disarm(self, mode: LabMode) -> None:
@@ -135,6 +209,21 @@ class LabProfileCoordinator:
         confidence_threshold: float,
     ) -> LabIncidentProfile | None:
         if (
+            "manual_approval" in self._armed
+            and alert_name == "HighInventoryErrorRate"
+            and service == "inventory-service"
+        ):
+            run_id = self._armed.pop("manual_approval")
+            return LabIncidentProfile(
+                id=f"lab.manual-approval.v1:{run_id}",
+                run_id=run_id,
+                mode="manual_approval",
+                expected_alert=alert_name,
+                expected_service=service,
+                runbook=FaultyRolloutRunbook(),
+                auto_approve_max_risk=RiskLevel.LOW,
+            )
+        if (
             "automatic_remediation" in self._armed
             and alert_name == "InventoryTransientRuntimeFault"
             and service == "inventory-service"
@@ -142,6 +231,7 @@ class LabProfileCoordinator:
             run_id = self._armed.pop("automatic_remediation")
             return LabIncidentProfile(
                 id=f"lab.auto-remediation.v1:{run_id}",
+                run_id=run_id,
                 mode="automatic_remediation",
                 expected_alert=alert_name,
                 expected_service=service,
@@ -158,6 +248,7 @@ class LabProfileCoordinator:
             run_id = self._armed.pop("bounded_reflection")
             return LabIncidentProfile(
                 id=f"lab.bounded-reflection.v1:{run_id}",
+                run_id=run_id,
                 mode="bounded_reflection",
                 expected_alert=alert_name,
                 expected_service=service,

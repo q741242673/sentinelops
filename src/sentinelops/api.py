@@ -23,7 +23,7 @@ from sentinelops.demo import (
     reset_demo_environment,
 )
 from sentinelops.domain import Alert, ExecutionStep, IncidentRecord, IncidentStatus, TimelineEvent
-from sentinelops.lab_profiles import LabIncidentProfile, LabProfileCoordinator
+from sentinelops.lab_profiles import LabIncidentProfile, LabMode, LabProfileCoordinator
 from sentinelops.runtime import build_agent
 
 app = FastAPI(
@@ -54,6 +54,13 @@ class DemoFaultJob(BaseModel):
         "ambiguous_change_fault",
     ]
     status: Literal["injecting", "active", "failed"]
+    phase: Literal[
+        "resetting_baseline",
+        "injecting_fault",
+        "waiting_for_alert",
+        "incident_started",
+    ] = "resetting_baseline"
+    incident_id: str | None = None
     result: dict[str, object] | None = None
     error: str | None = None
 
@@ -218,8 +225,12 @@ async def _run_demo_fault(job_id: str) -> None:
     settings = get_settings()
     job = demo_fault_jobs[job_id]
     try:
-        if job.scenario == "transient_runtime_fault":
-            await reset_demo_environment(settings)
+        await reset_demo_environment(settings)
+        _release_demo_alert_deduplication()
+        lab_profiles.arm(_job_profile_mode(job), job.id)
+        demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
+            update={"phase": "injecting_fault"}
+        )
         result = await asyncio.wait_for(
             (
                 inject_auto_demo_fault(settings)
@@ -252,7 +263,7 @@ async def _run_demo_fault(job_id: str) -> None:
                 "investigation_mode": "bounded_reflection",
             }
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
-            update={"status": "active", "result": result}
+            update={"status": "active", "phase": "waiting_for_alert", "result": result}
         )
 
 
@@ -263,23 +274,21 @@ async def create_demo_fault() -> DemoFaultJob:
 
 @app.post("/api/v1/demo/auto-faults", response_model=DemoFaultJob, status_code=202)
 async def create_auto_demo_fault() -> DemoFaultJob:
-    job = _create_demo_fault_job("transient_runtime_fault")
-    lab_profiles.arm("automatic_remediation", job.id)
-    return job
+    return _create_demo_fault_job("transient_runtime_fault")
 
 
 @app.post("/api/v1/demo/reflection-faults", response_model=DemoFaultJob, status_code=202)
 async def create_reflection_demo_fault() -> DemoFaultJob:
-    job = _create_demo_fault_job("ambiguous_change_fault")
-    lab_profiles.arm("bounded_reflection", job.id)
-    return job
+    return _create_demo_fault_job("ambiguous_change_fault")
 
 
 @app.post("/api/v1/demo/reset")
 async def reset_demo() -> dict[str, Any]:
     lab_profiles.clear()
     try:
-        return await reset_demo_environment(get_settings())
+        result = await reset_demo_environment(get_settings())
+        _release_demo_alert_deduplication()
+        return result
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -311,10 +320,28 @@ def _create_demo_fault_job(
 
 
 def _disarm_job_profile(job: DemoFaultJob) -> None:
-    if job.scenario == "transient_runtime_fault":
+    if job.scenario == "bad_rollout":
+        lab_profiles.disarm("manual_approval")
+    elif job.scenario == "transient_runtime_fault":
         lab_profiles.disarm("automatic_remediation")
     elif job.scenario == "ambiguous_change_fault":
         lab_profiles.disarm("bounded_reflection")
+
+
+def _job_profile_mode(job: DemoFaultJob) -> LabMode:
+    if job.scenario == "bad_rollout":
+        return "manual_approval"
+    if job.scenario == "transient_runtime_fault":
+        return "automatic_remediation"
+    return "bounded_reflection"
+
+
+def _release_demo_alert_deduplication() -> None:
+    demo_alerts = {"HighInventoryErrorRate", "InventoryTransientRuntimeFault"}
+    for fingerprint, incident_id in list(alert_fingerprints.items()):
+        record = incident_records.get(incident_id)
+        if record and record.alert.name in demo_alerts:
+            alert_fingerprints.pop(fingerprint, None)
 
 
 @app.get("/api/v1/demo/faults/{job_id}", response_model=DemoFaultJob)
@@ -395,6 +422,10 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
             active_step_id=active_step_id,
         )
         _publish_incident(placeholder)
+        if profile and profile.run_id in demo_fault_jobs:
+            demo_fault_jobs[profile.run_id] = demo_fault_jobs[profile.run_id].model_copy(
+                update={"phase": "incident_started", "incident_id": placeholder.id}
+            )
         alert_fingerprints[fingerprint] = placeholder.id
         _schedule_investigation(placeholder.id, alert, profile)
         accepted.append(
