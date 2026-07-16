@@ -51,3 +51,4 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
 
     assert plan.actions[0].tool_name == "rollback_deployment"
     assert plan.actions[0].arguments == {"name": "inventory-service", "revision": 1}
+    assert "修复" in plan.summary

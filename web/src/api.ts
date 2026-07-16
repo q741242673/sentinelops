@@ -35,6 +35,10 @@ export const api = {
     request<DemoFaultJob>("/api/v1/demo/faults", {
       method: "POST",
     }),
+  injectAutoDemoFault: () =>
+    request<DemoFaultJob>("/api/v1/demo/auto-faults", {
+      method: "POST",
+    }),
   getDemoFaultJob: (jobId: string) =>
     request<DemoFaultJob>(`/api/v1/demo/faults/${jobId}`),
   decideIncident: (incidentId: string, approved: boolean) =>

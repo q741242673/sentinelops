@@ -62,6 +62,38 @@ async def test_rejected_action_is_not_executed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transient_runtime_fault_is_auto_remediated_without_human_gate() -> None:
+    settings = Settings(
+        tool_backend="simulator",
+        model_provider="rule_based",
+        auto_approve_max_risk="medium",
+    )
+    agent = build_agent(settings, scenario="transient_runtime_fault")
+    alert = Alert(
+        name="InventoryTransientRuntimeFault",
+        namespace="sentinelops-demo",
+        service="inventory-service",
+        severity="warning",
+        summary="库存服务存在进程内瞬态故障",
+        labels={
+            "scenario": "transient_runtime_fault",
+            "auto_remediation": "true",
+        },
+    )
+
+    record = await agent.start(alert)
+
+    assert record.status == IncidentStatus.RESOLVED
+    assert record.approval is None
+    assert record.plan is not None
+    assert record.plan.actions[0].tool_name == "restart_deployment"
+    assert record.execution_results[0].success is True
+    assert any(event.type == "approval.auto_approved" for event in record.timeline)
+    assert IncidentAgent._diagnosis_needs_localization(record.diagnosis) is False
+    assert IncidentAgent._plan_needs_localization(record.plan) is False
+
+
+@pytest.mark.asyncio
 async def test_agent_collects_configured_observability_evidence() -> None:
     class RecordingObservabilityBackend:
         def __init__(self) -> None:

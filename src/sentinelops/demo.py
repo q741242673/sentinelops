@@ -175,3 +175,20 @@ async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
     if not result.success:
         raise RuntimeError(result.error or "Failed to inject the live demo fault")
     return result.content
+
+
+async def inject_auto_demo_fault(settings: Settings) -> dict[str, Any]:
+    if settings.tool_backend == "simulator":
+        return {
+            "service": "inventory-service",
+            "fault_active": True,
+            "fault_type": "transient_runtime_fault",
+        }
+    if not settings.demo_inventory_url:
+        raise RuntimeError("SENTINELOPS_DEMO_INVENTORY_URL is required for the auto demo")
+    async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+        response = await client.post(
+            f"{settings.demo_inventory_url.rstrip('/')}/demo/transient-fault"
+        )
+        response.raise_for_status()
+        return dict(response.json())

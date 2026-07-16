@@ -20,6 +20,7 @@ const EVENT_LABELS: Record<string, string> = {
   "diagnosis.completed": "定位根因",
   "remediation.planned": "生成修复方案",
   "approval.requested": "请求人工审批",
+  "approval.auto_approved": "安全策略自动授权",
   "approval.decided": "记录审批决定",
   "action.executed": "执行白名单操作",
   "recovery.verified": "确认服务恢复",
@@ -49,6 +50,8 @@ const TOOL_LABELS: Record<string, string> = {
   scale_deployment: "调整副本数",
 };
 
+type DemoMode = "manual" | "auto";
+
 function shortId(id: string): string {
   return id.slice(0, 8).toUpperCase();
 }
@@ -70,6 +73,9 @@ function sourceLabel(source: string): string {
     prometheus: "Prometheus 指标",
     loki: "Loki 日志",
     tempo: "Tempo 链路",
+    "kubernetes.rollout": "Kubernetes 发布记录",
+    "kubernetes.events": "Kubernetes 事件",
+    "kubernetes.logs": "Kubernetes 日志",
   };
   return labels[source.toLowerCase()] ?? source;
 }
@@ -78,6 +84,7 @@ function alertTitle(name: string): string {
   const labels: Record<string, string> = {
     HighInventoryErrorRate: "库存服务错误率过高",
     HighOrderServiceErrorRate: "订单服务错误率过高",
+    InventoryTransientRuntimeFault: "库存服务瞬态运行时故障",
   };
   return labels[name] ?? name;
 }
@@ -85,11 +92,13 @@ function alertTitle(name: string): string {
 function alertSummary(summary: string): string {
   if (summary.includes("Inventory HTTP 503")) return "库存服务 HTTP 503 错误率超过结账链路 SLO";
   if (summary.includes("Order service error rate")) return "订单服务错误率超过 5% SLO 阈值";
+  if (summary.includes("transient in-memory runtime fault")) return "库存服务存在进程内瞬态运行时故障";
   return summary;
 }
 
 function stageState(incident: Incident, event: string, activeEvent?: string): string {
   const events = new Set(incident.timeline.map((item) => item.type));
+  if (event === "approval.decided" && events.has("approval.auto_approved")) return "complete";
   if (events.has(event)) return "complete";
   if (activeEvent && events.has(activeEvent)) return "active";
   if (incident.status === "failed" || incident.status === "rejected") return "stopped";
@@ -161,46 +170,78 @@ function TimelineItem({ event, last }: { event: TimelineEvent; last: boolean }) 
 }
 
 function DemoRunbook({
+  mode,
   liveMode,
   faultBusy,
   actionBusy,
   faultReady,
   incident,
   message,
+  onModeChange,
   onInject,
   onInvestigate,
 }: {
+  mode: DemoMode;
   liveMode: boolean;
   faultBusy: boolean;
   actionBusy: boolean;
   faultReady: boolean;
   incident: Incident | null;
   message: string | null;
+  onModeChange: (mode: DemoMode) => void;
   onInject: () => void;
   onInvestigate: () => void;
 }) {
   const investigated = Boolean(incident);
-  const approved = incident?.timeline.some((event) => event.type === "approval.decided") ?? false;
+  const approved = incident?.timeline.some((event) =>
+    ["approval.decided", "approval.auto_approved"].includes(event.type)
+  ) ?? false;
+  const autoMode = mode === "auto";
   return (
     <section className="demo-runbook">
       <div className="demo-runbook-head">
         <div>
           <span className="section-kicker">本地真实演示</span>
-          <h2>故障自动发现与修复</h2>
+          <h2>{autoMode ? "无人值守自动修复" : "人工审批安全修复"}</h2>
         </div>
         <span className="demo-mode"><i />{liveMode ? "真实 kind 集群" : "Simulator 模式"}</span>
+      </div>
+      <div className="demo-mode-tabs" role="tablist" aria-label="选择演示模式">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={!autoMode}
+          className={!autoMode ? "active" : ""}
+          onClick={() => onModeChange("manual")}
+          disabled={faultBusy || actionBusy}
+        >
+          <strong>人工审批</strong><span>高风险回滚需要运维确认</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={autoMode}
+          className={autoMode ? "active auto" : ""}
+          onClick={() => onModeChange("auto")}
+          disabled={faultBusy || actionBusy}
+        >
+          <strong>自动修复</strong><span>中风险重启由策略自动授权</span>
+        </button>
       </div>
       <div className="demo-steps">
         <article className={faultReady ? "complete" : "active"}>
           <span className="demo-step-number">1</span>
-          <div><strong>注入故障</strong><p>让 inventory-service 每 3 次请求失败 1 次</p></div>
+          <div>
+            <strong>{autoMode ? "注入进程内瞬态故障" : "注入错误发布"}</strong>
+            <p>{autoMode ? "模拟只能通过重启清除的内存状态异常" : "让 inventory-service 每 3 次请求失败 1 次"}</p>
+          </div>
           <button type="button" onClick={onInject} disabled={faultBusy || actionBusy}>
-            {faultBusy ? "正在注入…" : faultReady ? "再次检查" : "注入真实故障"}
+            {faultBusy ? "正在注入…" : faultReady ? "再次运行" : autoMode ? "启动自动修复演示" : "注入真实故障"}
           </button>
         </article>
         <article className={investigated ? "complete" : faultReady ? "active" : ""}>
           <span className="demo-step-number">2</span>
-          <div><strong>自动发现与调查</strong><p>Alertmanager 推送后自动关联全部证据</p></div>
+          <div><strong>自动发现与中文诊断</strong><p>Alertmanager 推送后，DeepSeek 自动关联全部证据</p></div>
           {liveMode ? (
             <span className="demo-step-state">
               {investigated ? "Agent 已自动启动" : faultReady ? "等待 Alertmanager 推送" : "注入后无需手动点击"}
@@ -213,9 +254,12 @@ function DemoRunbook({
         </article>
         <article className={approved ? "complete" : incident?.status === "awaiting_approval" ? "active" : ""}>
           <span className="demo-step-number">3</span>
-          <div><strong>批准并验证</strong><p>检查回滚版本，批准后自动验证错误率</p></div>
+          <div>
+            <strong>{autoMode ? "策略授权并自动验证" : "人工批准并验证"}</strong>
+            <p>{autoMode ? "策略自动批准 Deployment 重启并验证恢复" : "检查回滚版本，批准后自动验证错误率"}</p>
+          </div>
           <span className="demo-step-state">
-            {incident?.status === "resolved" ? "修复完成" : incident?.status === "awaiting_approval" ? "请在右侧批准" : "等待调查结果"}
+            {incident?.status === "resolved" ? "修复完成" : incident?.status === "awaiting_approval" ? "请在右侧批准" : approved ? "已自动授权，正在修复" : "等待调查结果"}
           </span>
         </article>
       </div>
@@ -231,7 +275,11 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [actionBusy, setActionBusy] = useState(false);
   const [faultBusy, setFaultBusy] = useState(false);
-  const [faultReady, setFaultReady] = useState(false);
+  const [demoMode, setDemoMode] = useState<DemoMode>("manual");
+  const [faultReady, setFaultReady] = useState<Record<DemoMode, boolean>>({
+    manual: false,
+    auto: false,
+  });
   const [demoMessage, setDemoMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -242,6 +290,7 @@ function App() {
         setSelectedId(next[0].id);
         if (next[0].alert.labels.source === "alertmanager") {
           setDemoMessage("Alertmanager 已自动发现告警，Agent 正在后台采集证据并调查根因。 ");
+          if (next[0].alert.labels.auto_remediation === "true") setDemoMode("auto");
         }
       }
       return next;
@@ -292,13 +341,17 @@ function App() {
   const verification = selected?.timeline.find((event) => event.type === "recovery.verified");
   const requestErrorRate = verification?.data.request_error_rate;
   const liveMode = runtime?.tool_backend === "kubernetes";
+  const selectedIsAuto = selected?.alert.labels.auto_remediation === "true";
+  const demoIncident = selected && selectedIsAuto === (demoMode === "auto") ? selected : null;
 
   async function injectFault() {
     setFaultBusy(true);
     setError(null);
     setDemoMessage(null);
     try {
-      let job = await api.injectDemoFault();
+      let job = demoMode === "auto"
+        ? await api.injectAutoDemoFault()
+        : await api.injectDemoFault();
       setDemoMessage("故障注入任务已提交，正在等待 Kubernetes 完成滚动更新…");
       const deadline = Date.now() + 70_000;
       while (job.status === "injecting" && Date.now() < deadline) {
@@ -312,11 +365,13 @@ function App() {
         throw new Error(job.error ?? "故障注入失败");
       }
       const result = job.result;
-      setFaultReady(true);
+      setFaultReady((current) => ({ ...current, [demoMode]: true }));
       setDemoMessage(
-        result.already_active
-          ? `故障已经存在：revision ${result.revision ?? "—"}，正在等待 Alertmanager 自动推送。`
-          : `故障已注入：revision ${result.revision ?? "—"}。接下来无需点击，Alertmanager 会自动启动 Agent。`,
+        demoMode === "auto"
+          ? "瞬态故障已激活。接下来无需操作：Alertmanager 会启动 DeepSeek，安全策略将自动授权重启并验证恢复。"
+          : result.already_active
+            ? `故障已经存在：revision ${result.revision ?? "—"}，正在等待 Alertmanager 自动推送。`
+            : `故障已注入：revision ${result.revision ?? "—"}。接下来无需点击，Alertmanager 会自动启动 Agent。`,
       );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "故障注入失败");
@@ -438,12 +493,14 @@ function App() {
         ) : !selected ? (
           <div className="workspace">
             <DemoRunbook
+              mode={demoMode}
               liveMode={liveMode}
               faultBusy={faultBusy}
               actionBusy={actionBusy}
-              faultReady={faultReady}
+              faultReady={faultReady[demoMode]}
               incident={null}
               message={demoMessage}
+              onModeChange={setDemoMode}
               onInject={injectFault}
               onInvestigate={createIncident}
             />
@@ -456,12 +513,14 @@ function App() {
         ) : (
           <div className="workspace">
             <DemoRunbook
+              mode={demoMode}
               liveMode={liveMode}
               faultBusy={faultBusy}
               actionBusy={actionBusy}
-              faultReady={faultReady}
-              incident={selected}
+              faultReady={faultReady[demoMode]}
+              incident={demoIncident}
               message={demoMessage}
+              onModeChange={setDemoMode}
               onInject={injectFault}
               onInvestigate={createIncident}
             />
@@ -490,7 +549,11 @@ function App() {
               <article><span>严重程度</span><strong className="critical-text">严重</strong><small>检测到 SLO 违约</small></article>
               <article><span>AI 置信度</span><strong>{Math.round((selected.diagnosis?.confidence ?? 0) * 100)}%</strong><small>基于多源证据的诊断</small></article>
               <article><span>关联证据</span><strong>{evidence.length}</strong><small>跨系统关联的数据源</small></article>
-              <article><span>安全模式</span><strong>人工审批门</strong><small>高风险操作不会自动执行</small></article>
+              <article>
+                <span>安全模式</span>
+                <strong>{selectedIsAuto ? "策略自动授权" : "人工审批门"}</strong>
+                <small>{selectedIsAuto ? "中风险操作按策略自动执行" : "高风险操作不会自动执行"}</small>
+              </article>
             </section>
 
             <section className="flow-card">
@@ -507,7 +570,7 @@ function App() {
                         <span className="stage-node">{state === "complete" ? "✓" : index + 1}</span>
                         {index < FLOW_STAGES.length - 1 && <span className="stage-line" />}
                       </div>
-                      <strong>{stage.label}</strong>
+                      <strong>{stage.label === "审批" && selectedIsAuto ? "自动授权" : stage.label}</strong>
                       <span>{state === "complete" ? "完成" : state === "active" ? "等待中" : "排队中"}</span>
                     </div>
                   );

@@ -15,6 +15,7 @@ from sentinelops.config import get_settings
 from sentinelops.demo import (
     build_demo_alert,
     enrich_alert_with_failed_trace,
+    inject_auto_demo_fault,
     inject_demo_fault,
 )
 from sentinelops.domain import Alert, IncidentRecord, IncidentStatus, TimelineEvent
@@ -39,6 +40,7 @@ class ApprovalDecision(BaseModel):
 
 class DemoFaultJob(BaseModel):
     id: str
+    scenario: Literal["bad_rollout", "transient_runtime_fault"]
     status: Literal["injecting", "active", "failed"]
     result: dict[str, object] | None = None
     error: str | None = None
@@ -98,10 +100,13 @@ def _alert_from_alertmanager(item: AlertmanagerAlert, fingerprint: str) -> Alert
 
 
 async def _investigate_alert(incident_id: str, alert: Alert) -> None:
-    agent = build_agent()
+    settings = get_settings()
+    if alert.labels.get("auto_remediation") == "true":
+        settings = settings.model_copy(update={"auto_approve_max_risk": "medium"})
+    agent = build_agent(settings)
     incident_agents[incident_id] = agent
     try:
-        alert = await enrich_alert_with_failed_trace(get_settings(), alert)
+        alert = await enrich_alert_with_failed_trace(settings, alert)
         incident_records[incident_id] = await agent.start(alert, incident_id=incident_id)
     except Exception as exc:
         current = incident_records[incident_id]
@@ -151,9 +156,14 @@ async def create_demo_incident() -> IncidentRecord:
 
 async def _run_demo_fault(job_id: str) -> None:
     settings = get_settings()
+    job = demo_fault_jobs[job_id]
     try:
         result = await asyncio.wait_for(
-            inject_demo_fault(settings),
+            (
+                inject_auto_demo_fault(settings)
+                if job.scenario == "transient_runtime_fault"
+                else inject_demo_fault(settings)
+            ),
             timeout=settings.demo_alert_timeout_seconds + 10,
         )
     except TimeoutError:
@@ -178,14 +188,29 @@ async def _run_demo_fault(job_id: str) -> None:
 
 @app.post("/api/v1/demo/faults", response_model=DemoFaultJob, status_code=202)
 async def create_demo_fault() -> DemoFaultJob:
+    return _create_demo_fault_job("bad_rollout")
+
+
+@app.post("/api/v1/demo/auto-faults", response_model=DemoFaultJob, status_code=202)
+async def create_auto_demo_fault() -> DemoFaultJob:
+    return _create_demo_fault_job("transient_runtime_fault")
+
+
+def _create_demo_fault_job(
+    scenario: Literal["bad_rollout", "transient_runtime_fault"],
+) -> DemoFaultJob:
     active_job = next(
-        (job for job in demo_fault_jobs.values() if job.status == "injecting"),
+        (
+            job
+            for job in demo_fault_jobs.values()
+            if job.status == "injecting" and job.scenario == scenario
+        ),
         None,
     )
     if active_job:
         return active_job
 
-    job = DemoFaultJob(id=str(uuid4()), status="injecting")
+    job = DemoFaultJob(id=str(uuid4()), scenario=scenario, status="injecting")
     demo_fault_jobs[job.id] = job
     task = asyncio.create_task(_run_demo_fault(job.id))
     demo_fault_tasks.add(task)
@@ -263,6 +288,7 @@ async def get_runtime() -> RuntimeInfo:
         model_provider=settings.model_provider,
         model_name=settings.model_name,
         namespace=settings.kubernetes_namespace,
+        approval_mode="risk_based",
     )
 
 

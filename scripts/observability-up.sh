@@ -56,6 +56,10 @@ kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/prometheus
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/alertmanager
+kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+  rollout restart deployment/inventory-service
+kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+  rollout restart deployment/order-service
 
 for deployment in loki tempo alertmanager prometheus otel-collector inventory-service order-service; do
   wait_for_deployment "${deployment}"

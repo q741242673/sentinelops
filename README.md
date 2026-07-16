@@ -79,13 +79,19 @@ SENTINELOPS_MODEL_API_KEY=replace-me make console-live
 ```
 
 This mode creates a healthy kind cluster and deploys Prometheus, Alertmanager, Loki, Tempo,
-OpenTelemetry Collector and the demo services. Click **注入真实故障** in the console; no manual
-investigation trigger is required. Prometheus fires `HighInventoryErrorRate`, Alertmanager pushes
-the alert into SentinelOps, and the Agent automatically reads Kubernetes rollout history,
-metrics, logs and spans. The default model endpoint is DeepSeek `deepseek-chat`; the provider
-remains replaceable through the existing model variables. High-risk rollback still pauses for
-operator approval. The cluster is retained when the console stops so subsequent starts can reuse
-the node image. Remove it with `make console-live-down`.
+OpenTelemetry Collector and the demo services. The Chinese console offers two real workflows:
+
+- **人工审批** injects a faulty rollout. Prometheus fires `HighInventoryErrorRate`; DeepSeek
+  diagnoses it in Simplified Chinese and proposes a high-risk rollback that pauses for approval.
+- **自动修复** injects an in-memory runtime fault. Prometheus fires
+  `InventoryTransientRuntimeFault`; DeepSeek diagnoses it in Simplified Chinese and the scoped
+  demo policy automatically authorizes a medium-risk rolling restart without a human click.
+
+Both workflows enter through Alertmanager, collect Kubernetes, Prometheus, Loki, and Tempo
+evidence, and use deterministic recovery verification rather than asking the model whether its
+own action succeeded. The provider remains replaceable through the existing model variables. The
+cluster is retained when the console stops so subsequent starts can reuse the node image. Remove
+it with `make console-live-down`.
 
 Other deterministic scenario:
 
@@ -323,7 +329,7 @@ silently granting itself automation authority.
 |---|---|---|
 | Read-only | logs, pods, events | automatic |
 | Low | bounded metadata operation | automatic |
-| Medium | restart deployment | approval required |
+| Medium | restart deployment | approval required by default; auto-demo policy may authorize |
 | High | rollback or scale | approval required |
 | Permanently denied | arbitrary exec, secrets, privileged Pod | rejected |
 

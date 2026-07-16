@@ -193,6 +193,34 @@ button.nav-item { cursor: pointer; }
 .demo-runbook-head h2 { margin: 0; color: #dceae5; font-size: 16px; font-weight: 600; }
 .demo-mode { display: flex; align-items: center; gap: 7px; color: #82a89a; font-size: 9px; }
 .demo-mode i { width: 6px; height: 6px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 8px var(--mint); }
+.demo-mode-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 17px;
+}
+.demo-mode-tabs button {
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid #29443a;
+  border-radius: 8px;
+  color: #789087;
+  background: rgba(7, 19, 15, 0.5);
+  text-align: left;
+  cursor: pointer;
+}
+.demo-mode-tabs button.active {
+  border-color: rgba(243, 188, 104, 0.48);
+  color: #ddc28f;
+  background: rgba(74, 49, 18, 0.14);
+}
+.demo-mode-tabs button.active.auto {
+  border-color: rgba(126, 226, 184, 0.45);
+  color: #a8dcc7;
+  background: rgba(32, 87, 65, 0.16);
+}
+.demo-mode-tabs strong { display: block; color: inherit; font-size: 10px; }
+.demo-mode-tabs span { display: block; margin-top: 3px; color: #587067; font-size: 8px; }
 .demo-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 17px; }
 .demo-steps article {
   min-width: 0;
@@ -364,6 +392,7 @@ button:disabled { cursor: wait; opacity: 0.6; }
   .workspace { padding: 25px 17px 48px; }
   .demo-runbook { padding: 17px; }
   .demo-runbook-head { align-items: flex-start; flex-direction: column; }
+  .demo-mode-tabs { grid-template-columns: 1fr; }
   .incident-hero { flex-direction: column; }
   .secondary-button { width: 100%; justify-content: center; }
   .flow-stages { grid-template-columns: repeat(3, 1fr); row-gap: 22px; }

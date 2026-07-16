@@ -168,7 +168,7 @@ class IncidentAgent:
         return {
             "status": IncidentStatus.INVESTIGATING.value,
             "observations": observations,
-            "timeline": [_event("context.collected", "Collected Kubernetes diagnostic context")],
+            "timeline": [_event("context.collected", "已采集 Kubernetes 与可观测性诊断上下文")],
         }
 
     async def _diagnose(self, state: IncidentState) -> dict[str, Any]:
@@ -178,19 +178,18 @@ class IncidentAgent:
         )
         diagnosis = await self.provider.structured(
             system=(
-                "You are an evidence-driven Kubernetes incident investigator. "
-                "Do not claim a root cause without citing observations. Evaluate Kubernetes "
-                "pods, logs, and rollout history together with every configured observability "
-                "source. When rollout history contains a causal change, cite that rollout "
-                "explicitly using a distinct evidence source. Write every human-facing text "
-                "field in Simplified Chinese, while preserving technical identifiers, queries, "
-                "tool names, and Kubernetes resource names."
+                "你是一名以证据为依据的 Kubernetes 事故调查专家。没有观测证据时不得断言根因。"
+                "必须综合分析 Pod、事件、日志、发布历史以及已配置的全部可观测性数据源。"
+                "如果发布历史包含因果变更，必须将该发布记录作为独立证据明确引用。"
+                "root_cause、hypotheses.statement、evidence.finding、contradictions 和 "
+                "evidence_summary 等所有面向用户的文字必须使用简体中文。技术标识符、"
+                "查询语句、工具名和 Kubernetes 资源名保持原样。"
             ),
             prompt=prompt,
             schema=Diagnosis,
             metadata={"incident_id": state["incident_id"], "node": "diagnose"},
         )
-        if not self._contains_chinese(diagnosis.root_cause):
+        if self._diagnosis_needs_localization(diagnosis):
             diagnosis = await self.provider.structured(
                 system=(
                     "你是技术内容本地化助手。必须把所有面向用户的文字字段翻译成简体中文，"
@@ -236,14 +235,14 @@ class IncidentAgent:
             ],
         }
         system = (
-            "You are a conservative Kubernetes remediation planner. Choose only allowlisted "
-            "tools, prefer reversible actions, and provide explicit verification criteria. "
-            "Treat each available tool's declared risk as the minimum risk classification. "
-            "When rollout history shows that the active revision introduced the fault and "
-            "an earlier healthy revision exists, roll back to that exact healthy revision; "
-            "do not restart because a restart preserves the faulty image or configuration. "
-            "Write every human-facing text field in Simplified Chinese, while preserving "
-            "technical identifiers, commands, and tool names."
+            "你是一名保守的 Kubernetes 修复规划专家。只能选择白名单工具，优先选择可逆操作，"
+            "并给出明确的验证标准。工具声明的风险等级是最低风险等级，不得降低。"
+            "如果发布历史证明当前 revision 引入故障且存在更早的健康 revision，必须精确回滚到"
+            "该健康 revision；不能用重启替代，因为重启会保留故障镜像或配置。"
+            "如果 alert.labels.scenario 为 transient_runtime_fault，说明故障仅存在于进程内存且"
+            "当前发布版本没有变化，应选择 restart_deployment 清除瞬态状态。"
+            "summary、rationale、expected_outcome、rollback 和 verification 等所有面向用户的"
+            "文字必须使用简体中文；技术标识符、命令、参数和工具名保持原样。"
         )
         plan: RemediationPlan | None = None
         for attempt in range(2):
@@ -253,6 +252,21 @@ class IncidentAgent:
                 schema=RemediationPlan,
                 metadata={"incident_id": state["incident_id"], "node": "plan"},
             )
+            if self._plan_needs_localization(plan):
+                plan = await self.provider.structured(
+                    system=(
+                        "你是技术内容本地化助手。必须把修复方案中的 summary、rationale、"
+                        "expected_outcome、rollback 和 verification 翻译成简体中文。"
+                        "不得修改 tool_name、arguments、risk、事实或技术标识符。"
+                        "只返回符合指定结构的数据。"
+                    ),
+                    prompt=json.dumps(plan.model_dump(mode="json"), ensure_ascii=False),
+                    schema=RemediationPlan,
+                    metadata={
+                        "incident_id": state["incident_id"],
+                        "node": "plan_localization",
+                    },
+                )
             feedback = self._plan_feedback(state, plan, specs)
             if feedback is None:
                 break
@@ -301,6 +315,21 @@ class IncidentAgent:
     def _contains_chinese(value: str) -> bool:
         return any("\u4e00" <= character <= "\u9fff" for character in value)
 
+    @classmethod
+    def _diagnosis_needs_localization(cls, diagnosis: Diagnosis) -> bool:
+        values = [diagnosis.root_cause, *diagnosis.evidence_summary]
+        for hypothesis in diagnosis.hypotheses:
+            values.extend([hypothesis.statement, *hypothesis.contradictions])
+            values.extend(evidence.finding for evidence in hypothesis.evidence)
+        return any(value and not cls._contains_chinese(value) for value in values)
+
+    @classmethod
+    def _plan_needs_localization(cls, plan: RemediationPlan) -> bool:
+        values = [plan.summary, plan.rollback, *plan.verification]
+        for action in plan.actions:
+            values.extend([action.rationale, action.expected_outcome])
+        return any(value and not cls._contains_chinese(value) for value in values)
+
     @staticmethod
     def _plan_feedback(
         state: IncidentState,
@@ -316,6 +345,20 @@ class IncidentAgent:
                 f"{action.tool_name} is read-only and cannot remediate the incident; select one "
                 "of the provided mutating remediation tools"
             )
+        scenario = state.get("alert", {}).get("labels", {}).get("scenario")
+        if scenario == "transient_runtime_fault":
+            if action.tool_name != "restart_deployment":
+                return (
+                    "transient_runtime_fault is an in-memory process fault with no rollout "
+                    "change; replan with restart_deployment"
+                )
+            if action.arguments.get("name") != state["alert"]["service"]:
+                return (
+                    "restart_deployment must target the alerted service "
+                    f"{state['alert']['service']}"
+                )
+            return None
+
         revisions = state.get("observations", {}).get("rollout", {}).get("revisions", [])
         active = [
             revision
@@ -366,11 +409,27 @@ class IncidentAgent:
     async def _prepare_approval(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         if not self.policy.requires_approval(action):
-            return {"approved": True, "approval_request": None}
+            risk_label = {
+                RiskLevel.READ_ONLY: "只读",
+                RiskLevel.LOW: "低",
+                RiskLevel.MEDIUM: "中",
+                RiskLevel.HIGH: "高",
+                RiskLevel.CRITICAL: "严重",
+            }[action.risk]
+            return {
+                "approved": True,
+                "approval_request": None,
+                "timeline": [
+                    _event(
+                        "approval.auto_approved",
+                        f"策略已自动批准{risk_label}风险操作",
+                    )
+                ],
+            }
         request = ApprovalRequest(
             incident_id=state["incident_id"],
             action=action,
-            reason=f"{action.risk.value} risk action requires explicit approval",
+            reason=f"{action.risk.value} 风险操作需要人工明确批准",
         )
         return {
             "status": IncidentStatus.AWAITING_APPROVAL.value,
@@ -392,7 +451,7 @@ class IncidentAgent:
             "timeline": [
                 _event(
                     "approval.decided",
-                    "Remediation approved" if approved else "Remediation rejected",
+                    "修复操作已批准" if approved else "修复操作已拒绝",
                     note=decision.get("note", ""),
                 )
             ],
@@ -410,7 +469,7 @@ class IncidentAgent:
             "timeline": [
                 _event(
                     "action.executed",
-                    f"{action.tool_name}: {'success' if result.success else 'failed'}",
+                    f"{action.tool_name}：{'执行成功' if result.success else '执行失败'}",
                 )
             ],
         }
@@ -552,7 +611,7 @@ class IncidentAgent:
             "timeline": [
                 _event(
                     "recovery.verified",
-                    "Service recovered" if healthy else "Recovery criteria not met",
+                    "服务已恢复" if healthy else "恢复标准未满足",
                     metrics=metrics.content,
                     pods=pods.content,
                     prometheus=prometheus.content if prometheus else None,
@@ -587,17 +646,26 @@ class IncidentAgent:
     async def _postmortem(self, state: IncidentState) -> dict[str, Any]:
         diagnosis = Diagnosis.model_validate(state["diagnosis"])
         status = state["status"]
+        status_label = {
+            IncidentStatus.RECEIVED.value: "已接收",
+            IncidentStatus.INVESTIGATING.value: "调查中",
+            IncidentStatus.AWAITING_APPROVAL.value: "等待审批",
+            IncidentStatus.REMEDIATING.value: "修复中",
+            IncidentStatus.RESOLVED.value: "已恢复",
+            IncidentStatus.FAILED.value: "修复失败",
+            IncidentStatus.REJECTED.value: "已拒绝",
+        }.get(status, status)
         report = (
-            f"# Incident {state['incident_id']}\n\n"
-            f"- Status: {status}\n"
-            f"- Root cause: {diagnosis.root_cause}\n"
-            f"- Confidence: {diagnosis.confidence:.0%}\n"
-            f"- Evidence: {'; '.join(diagnosis.evidence_summary)}\n"
-            f"- Generated at: {datetime.now(UTC).isoformat()}\n"
+            f"# 事故报告 {state['incident_id']}\n\n"
+            f"- 状态：{status_label}\n"
+            f"- 根本原因：{diagnosis.root_cause}\n"
+            f"- 置信度：{diagnosis.confidence:.0%}\n"
+            f"- 证据：{'；'.join(diagnosis.evidence_summary)}\n"
+            f"- 生成时间：{datetime.now(UTC).isoformat()}\n"
         )
         return {
             "postmortem": report,
-            "timeline": [_event("postmortem.generated", "Generated incident report")],
+            "timeline": [_event("postmortem.generated", "事故报告已生成")],
         }
 
     def _sync_record(self, incident_id: str, state: dict[str, Any]) -> IncidentRecord:

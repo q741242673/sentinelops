@@ -33,15 +33,18 @@ data:
         rules:
           - alert: HighInventoryErrorRate
             expr: |
-              (
-                sum(rate(http_requests_total{service="inventory-service",status=~"5.."}[10s]))
-                or vector(0)
+              ((
+                  sum(rate(http_requests_total{service="inventory-service",status=~"5.."}[10s]))
+                  or vector(0)
+                )
+                /
+                clamp_min(
+                  sum(rate(http_requests_total{service="inventory-service"}[10s])),
+                  0.001
+                ) > 0.1
               )
-              /
-              clamp_min(
-                sum(rate(http_requests_total{service="inventory-service"}[10s])),
-                0.001
-              ) > 0.1
+              unless on()
+              (max(sentinelops_transient_runtime_fault{service="inventory-service"}) == 1)
             for: 4s
             labels:
               severity: critical
@@ -49,6 +52,18 @@ data:
               namespace: sentinelops-demo
             annotations:
               summary: Inventory HTTP 503 rate exceeded the checkout SLO
+          - alert: InventoryTransientRuntimeFault
+            expr: |
+              max(sentinelops_transient_runtime_fault{service="inventory-service"}) == 1
+            for: 2s
+            labels:
+              severity: warning
+              service: inventory-service
+              namespace: sentinelops-demo
+              scenario: transient_runtime_fault
+              auto_remediation: "true"
+            annotations:
+              summary: 库存服务存在进程内瞬态运行时故障
 ---
 apiVersion: apps/v1
 kind: Deployment

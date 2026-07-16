@@ -19,7 +19,7 @@ from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "order-service")
 SERVICE_ROLE = os.getenv("SERVICE_ROLE", "order")
@@ -65,6 +65,13 @@ LATENCY = Histogram(
     ["service", "route"],
 )
 inventory_requests = count(1)
+transient_runtime_fault_active = False
+TRANSIENT_RUNTIME_FAULT = Gauge(
+    "sentinelops_transient_runtime_fault",
+    "Whether the demo service has an in-memory transient runtime fault",
+    ["service"],
+)
+TRANSIENT_RUNTIME_FAULT.labels(service=SERVICE_NAME).set(0)
 tracer = trace.get_tracer(__name__)
 app = FastAPI(title=f"SentinelOps {SERVICE_NAME}")
 
@@ -96,6 +103,15 @@ async def metrics() -> Response:
 @app.post("/reserve")
 async def reserve() -> JSONResponse:
     sequence = next(inventory_requests)
+    if transient_runtime_fault_active:
+        logger.error(
+            "inventory_reservation_failed sequence=%s reason=transient_runtime_fault",
+            sequence,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "sequence": sequence},
+        )
     if FAIL_EVERY and sequence % FAIL_EVERY == 0:
         logger.error("inventory_reservation_failed sequence=%s reason=synthetic_timeout", sequence)
         return JSONResponse(
@@ -104,6 +120,25 @@ async def reserve() -> JSONResponse:
         )
     logger.info("inventory_reserved sequence=%s", sequence)
     return JSONResponse(content={"status": "reserved", "sequence": sequence})
+
+
+@app.post("/demo/transient-fault")
+async def enable_transient_fault() -> JSONResponse:
+    global transient_runtime_fault_active
+    if SERVICE_ROLE != "inventory":
+        return JSONResponse(status_code=409, content={"error": "inventory_service_only"})
+    transient_runtime_fault_active = True
+    TRANSIENT_RUNTIME_FAULT.labels(service=SERVICE_NAME).set(1)
+    logger.error(
+        "transient_runtime_fault_enabled reason=in_memory_state restart_required=true"
+    )
+    return JSONResponse(
+        content={
+            "service": SERVICE_NAME,
+            "fault_active": True,
+            "fault_type": "transient_runtime_fault",
+        }
+    )
 
 
 @app.post("/checkout")

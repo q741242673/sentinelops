@@ -34,7 +34,7 @@ async def test_api_incident_approval_flow() -> None:
         runtime = await client.get("/api/v1/runtime")
         assert runtime.status_code == 200
         assert runtime.json()["model_provider"] == "rule_based"
-        assert runtime.json()["approval_mode"] == "human_gated"
+        assert runtime.json()["approval_mode"] == "risk_based"
         assert runtime.json()["alert_ingestion"] == "alertmanager_webhook"
 
         demo = await client.post("/api/v1/demo/incidents")
@@ -53,6 +53,10 @@ async def test_api_incident_approval_flow() -> None:
         assert fault_status.json()["status"] == "active"
         assert fault_status.json()["result"]["fault_active"] is True
 
+        auto_fault = await client.post("/api/v1/demo/auto-faults")
+        assert auto_fault.status_code == 202
+        assert auto_fault.json()["scenario"] == "transient_runtime_fault"
+
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
             json={"approved": True, "note": "approved in API test"},
@@ -62,7 +66,7 @@ async def test_api_incident_approval_flow() -> None:
 
         fetched = await client.get(f"/api/v1/incidents/{incident['id']}")
         assert fetched.status_code == 200
-        assert fetched.json()["postmortem"].startswith("# Incident")
+        assert fetched.json()["postmortem"].startswith("# 事故报告")
 
         second = await client.post(
             "/api/v1/incidents",

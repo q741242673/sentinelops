@@ -90,15 +90,18 @@ export interface RuntimeInfo {
 }
 
 export interface DemoFaultResult {
-  deployment: string;
+  deployment?: string;
+  service?: string;
   fault_active: boolean;
-  already_active: boolean;
-  revision: number | null;
-  failure_every: string;
+  already_active?: boolean;
+  revision?: number | null;
+  failure_every?: string;
+  fault_type?: string;
 }
 
 export interface DemoFaultJob {
   id: string;
+  scenario: "bad_rollout" | "transient_runtime_fault";
   status: "injecting" | "active" | "failed";
   result: DemoFaultResult | null;
   error: string | null;
