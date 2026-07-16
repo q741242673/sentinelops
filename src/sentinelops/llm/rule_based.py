@@ -75,6 +75,7 @@ class RuleBasedProvider:
         return "db_pool_exhaustion"
 
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
+        current_revision, _ = self._rollout_revisions(observations)
         if scenario == "transient_runtime_fault":
             evidence = [
                 Evidence(
@@ -121,11 +122,13 @@ class RuleBasedProvider:
                 Evidence(
                     source="kubernetes.rollout",
                     query="get_rollout_history",
-                    finding="产生错误的配置来自 Deployment revision 2",
+                    finding=f"产生错误的配置来自 Deployment revision {current_revision}",
                     raw=observations.get("rollout", {}),
                 ),
             ]
-            root_cause = "库存服务 Deployment revision 2 启用了合成预留故障"
+            root_cause = (
+                f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
+            )
             hypothesis = "最新的库存服务配置发布引入了 HTTP 503 错误"
         elif scenario == "bad_rollout":
             evidence = [
@@ -138,11 +141,11 @@ class RuleBasedProvider:
                 Evidence(
                     source="kubernetes.rollout",
                     query="get_rollout_history",
-                    finding="错误峰值从 Deployment revision 2 发布后开始",
+                    finding=f"错误峰值从 Deployment revision {current_revision} 发布后开始",
                     raw=observations.get("rollout", {}),
                 ),
             ]
-            root_cause = "Deployment revision 2 包含损坏的应用镜像"
+            root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
             hypothesis = "最新一次发布引入了本次事故"
         else:
             evidence = [
@@ -170,6 +173,9 @@ class RuleBasedProvider:
         )
 
     def _plan(self, scenario: str, payload: dict[str, Any]) -> RemediationPlan:
+        current_revision, previous_revision = self._rollout_revisions(
+            payload.get("observations", {})
+        )
         if scenario == "transient_runtime_fault":
             service = payload["alert"]["service"]
             action = RemediationAction(
@@ -183,9 +189,10 @@ class RuleBasedProvider:
             service = payload["alert"]["service"]
             action = RemediationAction(
                 tool_name="rollback_deployment",
-                arguments={"name": service, "revision": 1},
+                arguments={"name": service, "revision": previous_revision},
                 rationale=(
-                    "revision 2 引入库存服务 HTTP 503，而 revision 1 已知健康"
+                    f"revision {current_revision} 引入库存服务 HTTP 503，"
+                    f"而 revision {previous_revision} 已知健康"
                 ),
                 expected_outcome="库存服务不再返回 HTTP 503，结账流量恢复",
                 risk=RiskLevel.HIGH,
@@ -193,10 +200,12 @@ class RuleBasedProvider:
         elif scenario == "bad_rollout":
             action = RemediationAction(
                 tool_name="rollback_deployment",
-                arguments={"name": "order-service", "revision": 1},
-                rationale="事故与 revision 2 强相关，并且该版本的 Pod 不健康",
+                arguments={"name": "order-service", "revision": previous_revision},
+                rationale=(
+                    f"事故与 revision {current_revision} 强相关，并且该版本的 Pod 不健康"
+                ),
                 expected_outcome=(
-                    "revision 1 恢复可用，错误率回到基线"
+                    f"revision {previous_revision} 恢复可用，错误率回到基线"
                 ),
                 risk=RiskLevel.HIGH,
             )
@@ -216,3 +225,18 @@ class RuleBasedProvider:
             rollback="停止自动化并恢复到之前的 Deployment revision",
             verification=["可用副本数等于期望副本数", "请求错误率低于 1%"],
         )
+
+    @staticmethod
+    def _rollout_revisions(observations: dict[str, Any]) -> tuple[int, int]:
+        revision_numbers = sorted(
+            {
+                int(item["revision"])
+                for item in observations.get("rollout", {}).get("revisions", [])
+                if str(item.get("revision", "")).isdigit()
+            }
+        )
+        if not revision_numbers:
+            return 2, 1
+        current = revision_numbers[-1]
+        previous = revision_numbers[-2] if len(revision_numbers) > 1 else max(current - 1, 1)
+        return current, previous

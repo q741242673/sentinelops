@@ -50,16 +50,31 @@ docker save "${ALERTMANAGER_IMAGE}" | docker exec --privileged -i "${NODE_CONTAI
   ctr --namespace=k8s.io images import \
   --platform "${NODE_PLATFORM}" --digests --snapshotter=overlayfs -
 
+INVENTORY_DEPLOYMENT_EXISTS=false
+ORDER_DEPLOYMENT_EXISTS=false
+if kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+  get deployment/inventory-service >/dev/null 2>&1; then
+  INVENTORY_DEPLOYMENT_EXISTS=true
+fi
+if kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+  get deployment/order-service >/dev/null 2>&1; then
+  ORDER_DEPLOYMENT_EXISTS=true
+fi
+
 kubectl --context "${CONTEXT}" apply -f "${ROOT_DIR}/deploy/observability/stack.yaml"
 kubectl --context "${CONTEXT}" apply -f "${ROOT_DIR}/deploy/observability/services.yaml"
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/prometheus
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/alertmanager
-kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
-  rollout restart deployment/inventory-service
-kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
-  rollout restart deployment/order-service
+if [[ "${INVENTORY_DEPLOYMENT_EXISTS}" == "true" ]]; then
+  kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+    rollout restart deployment/inventory-service
+fi
+if [[ "${ORDER_DEPLOYMENT_EXISTS}" == "true" ]]; then
+  kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+    rollout restart deployment/order-service
+fi
 
 for deployment in loki tempo alertmanager prometheus otel-collector inventory-service order-service; do
   wait_for_deployment "${deployment}"

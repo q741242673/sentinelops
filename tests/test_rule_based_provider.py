@@ -20,7 +20,7 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
         "prometheus": {"result": [{"metric": {"status": "503"}}]},
         "loki": {"result": [{"values": [["1", "inventory_reservation_failed"]]}]},
         "trace": {"trace": {"resourceSpans": [{"service.name": "inventory-service"}]}},
-        "rollout": {"revisions": [{"revision": 1}, {"revision": 2}]},
+        "rollout": {"revisions": [{"revision": 11}, {"revision": 12}]},
         "scenario": "live_cluster",
     }
     diagnosis = await provider.structured(
@@ -29,7 +29,7 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
         schema=Diagnosis,
     )
 
-    assert "revision 2" in diagnosis.root_cause.lower()
+    assert "revision 12" in diagnosis.root_cause.lower()
     assert {item.source for item in diagnosis.hypotheses[0].evidence} == {
         "prometheus",
         "loki",
@@ -50,5 +50,5 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
     )
 
     assert plan.actions[0].tool_name == "rollback_deployment"
-    assert plan.actions[0].arguments == {"name": "inventory-service", "revision": 1}
+    assert plan.actions[0].arguments == {"name": "inventory-service", "revision": 11}
     assert "修复" in plan.summary
