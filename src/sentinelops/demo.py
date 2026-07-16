@@ -136,6 +136,25 @@ async def build_demo_alert(settings: Settings) -> Alert:
     return await live_demo_alert(settings)
 
 
+async def enrich_alert_with_failed_trace(settings: Settings, alert: Alert) -> Alert:
+    """Attach a fresh failed checkout trace to an event-driven demo alert."""
+    if not settings.demo_order_url:
+        return alert
+    async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+        trace_id = await _find_failed_trace(
+            client,
+            settings.demo_order_url,
+            settings.demo_alert_timeout_seconds,
+        )
+        await _wait_for_trace(
+            client,
+            settings.tempo_url,
+            trace_id,
+            settings.demo_alert_timeout_seconds,
+        )
+    return alert.model_copy(update={"labels": {**alert.labels, "trace_id": trace_id}})
+
+
 async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
     if settings.tool_backend == "simulator":
         return {

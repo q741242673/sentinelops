@@ -15,7 +15,7 @@ if [[ ! -d "${ROOT_DIR}/web/node_modules" ]]; then
   npm --prefix "${ROOT_DIR}/web" install
 fi
 
-python -m sentinelops serve --host 127.0.0.1 --port 8000 &
+python -m sentinelops serve --host "${SENTINELOPS_API_HOST:-127.0.0.1}" --port 8000 &
 API_PID=$!
 
 echo "SentinelOps Console: http://127.0.0.1:5173"

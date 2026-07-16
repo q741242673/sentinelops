@@ -14,6 +14,7 @@ const STATUS_LABELS: Record<Incident["status"], string> = {
 };
 
 const EVENT_LABELS: Record<string, string> = {
+  "alertmanager.received": "Alertmanager 自动发现告警",
   "incident.received": "收到告警",
   "context.collected": "完成证据采集",
   "diagnosis.completed": "定位根因",
@@ -185,7 +186,7 @@ function DemoRunbook({
       <div className="demo-runbook-head">
         <div>
           <span className="section-kicker">本地真实演示</span>
-          <h2>故障注入与自动修复</h2>
+          <h2>故障自动发现与修复</h2>
         </div>
         <span className="demo-mode"><i />{liveMode ? "真实 kind 集群" : "Simulator 模式"}</span>
       </div>
@@ -199,10 +200,16 @@ function DemoRunbook({
         </article>
         <article className={investigated ? "complete" : faultReady ? "active" : ""}>
           <span className="demo-step-number">2</span>
-          <div><strong>AI 调查</strong><p>关联 K8s、Prometheus、Loki 与 Tempo 证据</p></div>
-          <button type="button" onClick={onInvestigate} disabled={faultBusy || actionBusy}>
-            {actionBusy ? "DeepSeek 调查中…" : "开始 AI 调查"}
-          </button>
+          <div><strong>自动发现与调查</strong><p>Alertmanager 推送后自动关联全部证据</p></div>
+          {liveMode ? (
+            <span className="demo-step-state">
+              {investigated ? "Agent 已自动启动" : faultReady ? "等待 Alertmanager 推送" : "注入后无需手动点击"}
+            </span>
+          ) : (
+            <button type="button" onClick={onInvestigate} disabled={faultBusy || actionBusy}>
+              {actionBusy ? "Agent 调查中…" : "开始模拟调查"}
+            </button>
+          )}
         </article>
         <article className={approved ? "complete" : incident?.status === "awaiting_approval" ? "active" : ""}>
           <span className="demo-step-number">3</span>
@@ -230,7 +237,15 @@ function App() {
 
   const loadIncidents = useCallback(async () => {
     const next = await api.listIncidents();
-    setIncidents(next);
+    setIncidents((current) => {
+      if (next[0]?.id && next[0].id !== current[0]?.id) {
+        setSelectedId(next[0].id);
+        if (next[0].alert.labels.source === "alertmanager") {
+          setDemoMessage("Alertmanager 已自动发现告警，Agent 正在后台采集证据并调查根因。 ");
+        }
+      }
+      return next;
+    });
     setSelectedId((current) => current ?? next[0]?.id ?? null);
     return next;
   }, []);
@@ -287,8 +302,8 @@ function App() {
       setFaultReady(true);
       setDemoMessage(
         result.already_active
-          ? `故障已经存在：revision ${result.revision ?? "—"}，可以直接开始 AI 调查。`
-          : `故障已注入：revision ${result.revision ?? "—"}，inventory-service 每 3 次请求失败 1 次。`,
+          ? `故障已经存在：revision ${result.revision ?? "—"}，正在等待 Alertmanager 自动推送。`
+          : `故障已注入：revision ${result.revision ?? "—"}。接下来无需点击，Alertmanager 会自动启动 Agent。`,
       );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "故障注入失败");
@@ -360,9 +375,11 @@ function App() {
         <div className="incident-nav">
           <div className="incident-nav-head">
             <span>最近事故</span>
-            <button type="button" onClick={createIncident} disabled={actionBusy} aria-label="新建事故调查">
-              +
-            </button>
+            {!liveMode && (
+              <button type="button" onClick={createIncident} disabled={actionBusy} aria-label="新建事故调查">
+                +
+              </button>
+            )}
           </div>
           <div className="incident-list">
             {incidents.map((incident) => (
@@ -383,6 +400,7 @@ function App() {
             <div><dt>模型</dt><dd>{runtime?.model_name ?? "—"}</dd></div>
             <div><dt>模型协议</dt><dd>{runtime?.model_provider ?? "—"}</dd></div>
             <div><dt>命名空间</dt><dd>{runtime?.namespace ?? "—"}</dd></div>
+            <div><dt>告警入口</dt><dd>{runtime?.alert_ingestion ?? "—"}</dd></div>
           </dl>
         </div>
       </aside>

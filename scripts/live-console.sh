@@ -8,6 +8,7 @@ ORDER_PORT="${SENTINELOPS_LIVE_ORDER_PORT:-28080}"
 PROMETHEUS_PORT="${SENTINELOPS_LIVE_PROMETHEUS_PORT:-29090}"
 LOKI_PORT="${SENTINELOPS_LIVE_LOKI_PORT:-23100}"
 TEMPO_PORT="${SENTINELOPS_LIVE_TEMPO_PORT:-23200}"
+ALERTMANAGER_PORT="${SENTINELOPS_LIVE_ALERTMANAGER_PORT:-29093}"
 PORT_FORWARD_PIDS=""
 TRAFFIC_PID=""
 
@@ -45,23 +46,18 @@ start_port_forward() {
 }
 
 "${ROOT_DIR}/scripts/observability-up.sh"
-"${ROOT_DIR}/scripts/inject-observability-fault.sh"
 
 start_port_forward service/order-service "${ORDER_PORT}:8000"
 start_port_forward service/prometheus "${PROMETHEUS_PORT}:9090"
 start_port_forward service/loki "${LOKI_PORT}:3100"
 start_port_forward service/tempo "${TEMPO_PORT}:3200"
+start_port_forward service/alertmanager "${ALERTMANAGER_PORT}:9093"
 
 wait_for_url "http://127.0.0.1:${ORDER_PORT}/healthz"
 wait_for_url "http://127.0.0.1:${PROMETHEUS_PORT}/-/ready"
 wait_for_url "http://127.0.0.1:${LOKI_PORT}/ready"
 wait_for_url "http://127.0.0.1:${TEMPO_PORT}/ready"
-
-python "${ROOT_DIR}/scripts/observability_e2e.py" \
-  --order-url "http://127.0.0.1:${ORDER_PORT}" \
-  --prometheus-url "http://127.0.0.1:${PROMETHEUS_PORT}" \
-  --loki-url "http://127.0.0.1:${LOKI_PORT}" \
-  --tempo-url "http://127.0.0.1:${TEMPO_PORT}"
+wait_for_url "http://127.0.0.1:${ALERTMANAGER_PORT}/-/ready"
 
 python "${ROOT_DIR}/scripts/live_console_traffic.py" \
   --order-url "http://127.0.0.1:${ORDER_PORT}" &
@@ -76,6 +72,7 @@ export SENTINELOPS_DEMO_ORDER_URL="http://127.0.0.1:${ORDER_PORT}"
 export SENTINELOPS_PROMETHEUS_URL="http://127.0.0.1:${PROMETHEUS_PORT}"
 export SENTINELOPS_LOKI_URL="http://127.0.0.1:${LOKI_PORT}"
 export SENTINELOPS_TEMPO_URL="http://127.0.0.1:${TEMPO_PORT}"
+export SENTINELOPS_API_HOST=0.0.0.0
 
-echo "Live stack ready: kind + Prometheus + Loki + Tempo + ${SENTINELOPS_MODEL_NAME}"
+echo "Live stack ready: kind + Prometheus + Alertmanager + Loki + Tempo + ${SENTINELOPS_MODEL_NAME}"
 "${ROOT_DIR}/scripts/dev-console.sh"

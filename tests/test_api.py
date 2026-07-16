@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+import sentinelops.api as api_module
 from sentinelops.api import app
 
 
@@ -32,6 +33,7 @@ async def test_api_incident_approval_flow() -> None:
         assert runtime.status_code == 200
         assert runtime.json()["model_provider"] == "rule_based"
         assert runtime.json()["approval_mode"] == "human_gated"
+        assert runtime.json()["alert_ingestion"] == "alertmanager_webhook"
 
         demo = await client.post("/api/v1/demo/incidents")
         assert demo.status_code == 201
@@ -65,3 +67,52 @@ async def test_api_incident_approval_flow() -> None:
         assert second.status_code == 201
         assert second.json()["status"] == "awaiting_approval"
         assert second.json()["id"] != incident["id"]
+
+
+@pytest.mark.asyncio
+async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_module.alert_fingerprints.clear()
+    api_module.incident_records.clear()
+    monkeypatch.setattr(api_module, "_schedule_investigation", lambda *_: None)
+    payload = {
+        "status": "firing",
+        "receiver": "sentinelops",
+        "alerts": [
+            {
+                "status": "firing",
+                "fingerprint": "demo-fingerprint",
+                "labels": {
+                    "alertname": "HighInventoryErrorRate",
+                    "namespace": "sentinelops-demo",
+                    "service": "inventory-service",
+                    "severity": "critical",
+                },
+                "annotations": {"summary": "Inventory SLO exceeded"},
+            }
+        ],
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        accepted = await client.post("/api/v1/webhooks/alertmanager", json=payload)
+        duplicate = await client.post("/api/v1/webhooks/alertmanager", json=payload)
+
+        resolved_payload = payload | {
+            "status": "resolved",
+            "alerts": [payload["alerts"][0] | {"status": "resolved"}],
+        }
+        resolved = await client.post(
+            "/api/v1/webhooks/alertmanager", json=resolved_payload
+        )
+
+    assert accepted.status_code == 202
+    incident_id = accepted.json()["accepted"][0]["incident_id"]
+    assert duplicate.json()["accepted"][0] == {
+        "fingerprint": "demo-fingerprint",
+        "status": "deduplicated",
+        "incident_id": incident_id,
+    }
+    assert api_module.incident_records[incident_id].alert.labels["source"] == "alertmanager"
+    assert resolved.json()["accepted"][0]["status"] == "resolved"
+    assert "demo-fingerprint" not in api_module.alert_fingerprints

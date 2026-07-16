@@ -15,4 +15,5 @@ def build_agent(
         provider=build_provider(settings),
         tools=build_tool_registry(settings, scenario=scenario),
         auto_approve_max_risk=RiskLevel(settings.auto_approve_max_risk),
+        verification_probe_url=settings.demo_order_url,
     )

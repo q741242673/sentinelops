@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -39,10 +40,14 @@ class IncidentAgent:
         provider: LLMProvider,
         tools: ToolRegistry,
         auto_approve_max_risk: RiskLevel = RiskLevel.LOW,
+        verification_probe_url: str | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.policy = ActionPolicy(auto_approve_max_risk)
+        self.verification_probe_url = (
+            verification_probe_url.rstrip("/") if verification_probe_url else None
+        )
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         self.records: dict[str, IncidentRecord] = {}
@@ -77,15 +82,29 @@ class IncidentAgent:
         builder.add_edge("postmortem", END)
         return builder.compile(checkpointer=self.checkpointer)
 
-    async def start(self, alert: Alert) -> IncidentRecord:
-        record = IncidentRecord(alert=alert)
+    async def start(self, alert: Alert, *, incident_id: str | None = None) -> IncidentRecord:
+        record = (
+            IncidentRecord(id=incident_id, alert=alert)
+            if incident_id
+            else IncidentRecord(alert=alert)
+        )
         self.records[record.id] = record
+        timeline = [_event("incident.received", alert.summary)]
+        if alert.labels.get("source") == "alertmanager":
+            timeline.insert(
+                0,
+                _event(
+                    "alertmanager.received",
+                    "Alertmanager 自动推送了一个真实告警",
+                    fingerprint=alert.labels.get("alertmanager_fingerprint"),
+                ),
+            )
         state: IncidentState = {
             "incident_id": record.id,
             "alert": alert.model_dump(mode="json"),
             "status": IncidentStatus.RECEIVED.value,
             "execution_results": [],
-            "timeline": [_event("incident.received", alert.summary)],
+            "timeline": timeline,
         }
         result = await self.graph.ainvoke(state, self._config(record.id))
         return self._sync_record(record.id, result)
@@ -402,44 +421,130 @@ class IncidentAgent:
         metrics: ToolResult | None = None
         pods: ToolResult | None = None
         prometheus: ToolResult | None = None
+        traffic: ToolResult | None = None
+        alert_state: ToolResult | None = None
+        trace_result: ToolResult | None = None
         request_error_rate: float | None = None
+        request_rate: float | None = None
+        alert_firing: bool | None = None
+        successful_probes = 0
+        probe_statuses: list[int | str] = []
+        successful_trace_id: str | None = None
+        healthy_windows = 0
         attempts = 0
-        for attempt_index in range(1, 31):
-            attempts = attempt_index
-            metrics = await self.tools.call("get_service_metrics", {"name": service})
-            pods = await self.tools.call("list_pods", {"label_selector": f"app={service}"})
-            pod_items = pods.content.get("items", [])
-            pods_healthy = bool(pod_items) and all(item.get("ready") for item in pod_items)
-            error_rate = metrics.content.get("error_rate")
-            availability = metrics.content.get("availability")
-            if self.tools.has_tool("query_prometheus"):
-                service_label = json.dumps(service)
-                prometheus = await self.tools.call(
-                    "query_prometheus",
-                    {
-                        "query": (
-                            "(sum(rate(http_requests_total{"
-                            f'service={service_label},status=~"5.."'
-                            "}[10s])) or vector(0)) / clamp_min(sum(rate(http_requests_total{"
-                            f"service={service_label}"
-                            "}[10s])), 0.001)"
+        probe_client = (
+            httpx.AsyncClient(timeout=3, trust_env=False) if self.verification_probe_url else None
+        )
+        try:
+            for attempt_index in range(1, 31):
+                attempts = attempt_index
+                if probe_client:
+                    try:
+                        response = await probe_client.post(
+                            f"{self.verification_probe_url}/checkout"
                         )
-                    },
+                        probe_statuses.append(response.status_code)
+                        if response.status_code == 200:
+                            successful_probes += 1
+                            if successful_probes == 5:
+                                successful_trace_id = (
+                                    str(response.json().get("trace_id") or "") or None
+                                )
+                        else:
+                            successful_probes = 0
+                            successful_trace_id = None
+                    except (httpx.HTTPError, ValueError):
+                        probe_statuses.append("network_error")
+                        successful_probes = 0
+                        successful_trace_id = None
+
+                metrics = await self.tools.call("get_service_metrics", {"name": service})
+                pods = await self.tools.call("list_pods", {"label_selector": f"app={service}"})
+                pod_items = pods.content.get("items", [])
+                pods_healthy = bool(pod_items) and all(item.get("ready") for item in pod_items)
+                error_rate = metrics.content.get("error_rate")
+                availability = metrics.content.get("availability")
+                if self.tools.has_tool("query_prometheus"):
+                    service_label = json.dumps(service)
+                    prometheus = await self.tools.call(
+                        "query_prometheus",
+                        {
+                            "query": (
+                                "(sum(rate(http_requests_total{"
+                                f'service={service_label},status=~"5.."'
+                                "}[10s])) or vector(0)) / clamp_min(sum(rate("
+                                "http_requests_total{"
+                                f"service={service_label}"
+                                "}[10s])), 0.001)"
+                            )
+                        },
+                    )
+                    traffic = await self.tools.call(
+                        "query_prometheus",
+                        {
+                            "query": (
+                                "sum(rate(http_requests_total{"
+                                f"service={service_label}"
+                                "}[10s]))"
+                            )
+                        },
+                    )
+                    alert_name = json.dumps(state["alert"]["name"])
+                    alert_state = await self.tools.call(
+                        "query_prometheus",
+                        {
+                            "query": (
+                                f"ALERTS{{alertname={alert_name},alertstate=\"firing\","
+                                f"service={service_label}}}"
+                            )
+                        },
+                    )
+                    request_error_rate = self._prometheus_scalar(prometheus)
+                    request_rate = self._prometheus_scalar(traffic)
+                    alert_firing = bool(alert_state.content.get("result", []))
+                    indicators_healthy = (
+                        prometheus.success
+                        and traffic.success
+                        and alert_state.success
+                        and request_error_rate is not None
+                        and request_error_rate < 0.01
+                        and request_rate is not None
+                        and request_rate >= 0.1
+                        and not alert_firing
+                    )
+                else:
+                    indicators_healthy = (error_rate is not None and error_rate < 0.01) or (
+                        availability is not None and availability >= 1.0
+                    )
+
+                probes_healthy = probe_client is None or successful_probes >= 5
+                trace_healthy = True
+                if (
+                    successful_trace_id
+                    and successful_probes >= 5
+                    and self.tools.has_tool("get_trace")
+                ):
+                    trace_result = await self.tools.call(
+                        "get_trace", {"trace_id": successful_trace_id}
+                    )
+                    trace_healthy = trace_result.success
+                window_healthy = (
+                    metrics.success
+                    and pods.success
+                    and pods_healthy
+                    and indicators_healthy
+                    and probes_healthy
+                    and trace_healthy
                 )
-                request_error_rate = self._prometheus_scalar(prometheus)
-                indicators_healthy = (
-                    prometheus.success
-                    and request_error_rate is not None
-                    and request_error_rate < 0.01
-                )
-            else:
-                indicators_healthy = (error_rate is not None and error_rate < 0.01) or (
-                    availability is not None and availability >= 1.0
-                )
-            healthy = metrics.success and pods.success and pods_healthy and indicators_healthy
-            if healthy:
-                break
-            await asyncio.sleep(1)
+                healthy_windows = healthy_windows + 1 if window_healthy else 0
+                required_windows = 3 if self.tools.has_tool("query_prometheus") else 1
+                healthy = healthy_windows >= required_windows
+                if healthy:
+                    break
+                await asyncio.sleep(1)
+        finally:
+            if probe_client:
+                await probe_client.aclose()
 
         assert metrics is not None and pods is not None
         return {
@@ -452,6 +557,12 @@ class IncidentAgent:
                     pods=pods.content,
                     prometheus=prometheus.content if prometheus else None,
                     request_error_rate=request_error_rate,
+                    request_rate=request_rate,
+                    alert_firing=alert_firing,
+                    active_probe_statuses=probe_statuses,
+                    successful_trace_id=successful_trace_id,
+                    successful_trace_verified=trace_result.success if trace_result else None,
+                    healthy_windows=healthy_windows,
                     attempts=attempts,
                 )
             ],

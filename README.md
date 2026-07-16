@@ -78,13 +78,14 @@ For a fully live local demo, start Docker and provide an OpenAI-compatible model
 SENTINELOPS_MODEL_API_KEY=replace-me make console-live
 ```
 
-This mode creates a kind cluster, deploys Prometheus, Loki, Tempo, OpenTelemetry Collector and
-the demo services, injects a failing inventory revision, and keeps checkout traffic flowing. The
-console waits for the real `HighInventoryErrorRate` alert and a queryable failed trace before the
-Agent reads Kubernetes rollout history, metrics, logs and spans. The default model endpoint is
-DeepSeek `deepseek-chat`; the provider remains replaceable through the existing model variables.
-The cluster is retained when the console stops so subsequent starts can reuse the node image.
-Remove it with `make console-live-down`.
+This mode creates a healthy kind cluster and deploys Prometheus, Alertmanager, Loki, Tempo,
+OpenTelemetry Collector and the demo services. Click **注入真实故障** in the console; no manual
+investigation trigger is required. Prometheus fires `HighInventoryErrorRate`, Alertmanager pushes
+the alert into SentinelOps, and the Agent automatically reads Kubernetes rollout history,
+metrics, logs and spans. The default model endpoint is DeepSeek `deepseek-chat`; the provider
+remains replaceable through the existing model variables. High-risk rollback still pauses for
+operator approval. The cluster is retained when the console stops so subsequent starts can reuse
+the node image. Remove it with `make console-live-down`.
 
 Other deterministic scenario:
 
@@ -247,17 +248,20 @@ successful query:
 ```mermaid
 sequenceDiagram
     participant P as Prometheus
+    participant M as Alertmanager
     participant A as SentinelOps
     participant O as Operator
     participant K as Kubernetes
-    P->>A: HighInventoryErrorRate firing
+    P->>M: HighInventoryErrorRate firing
+    M->>A: Webhook (fingerprint deduplicated)
     A->>K: Read pods, logs, and rollout history
     A->>P: Query request error rate
     A->>A: Correlate Loki logs and Tempo trace
     A->>O: Propose revision 1 rollback
     O->>A: Approve
     A->>K: Roll back inventory-service
-    A->>P: Verify request error rate below 1%
+    A->>P: Verify traffic, error rate, and alert cleared
+    A->>A: Verify active probes and a fresh success trace
 ```
 
 Run it with:
@@ -267,11 +271,13 @@ make golden-path-e2e
 ```
 
 The command starts with a healthy inventory revision, rolls out a configuration that fails every
-third reservation, waits for the real Prometheus alert to fire, and supplies its labels plus a
-failed trace ID to SentinelOps. The agent collects Kubernetes, Prometheus, Loki, and Tempo
-evidence, pauses on its high-risk rollback, resumes after approval, and continuously checks the
-10-second request error rate. The test passes only after the alert clears and six fresh checkout
-requests all return HTTP 200.
+third reservation, and waits for the real Prometheus alert to fire. In the local console,
+Alertmanager supplies the labels automatically through the webhook and SentinelOps enriches the
+incident with a failed trace ID. The agent collects Kubernetes, Prometheus, Loki, and Tempo
+evidence, pauses on its high-risk rollback, and resumes after approval. Recovery is determined by
+code rather than the model: pods must be ready, request traffic must be present, the 10-second
+error ratio must remain below 1% for three windows, the alert must be cleared, five active probes
+must succeed, and a new successful trace must be queryable in Tempo.
 
 CI uses the deterministic `rule_based` provider so this acceptance test needs no model key. To
 exercise the same infrastructure path with DeepSeek or another OpenAI-compatible endpoint, set

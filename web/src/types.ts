@@ -86,6 +86,7 @@ export interface RuntimeInfo {
   model_name: string;
   namespace: string;
   approval_mode: string;
+  alert_ingestion: string;
 }
 
 export interface DemoFaultResult {
