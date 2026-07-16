@@ -295,7 +295,7 @@ sequenceDiagram
     A->>K: Read pods, logs, and rollout history
     A->>P: Query request error rate
     A->>A: Correlate Loki logs and Tempo trace
-    A->>O: Propose revision 1 rollback
+    A->>O: Propose exact prior healthy revision rollback
     O->>A: Approve
     A->>K: Roll back inventory-service
     A->>P: Verify traffic, error rate, and alert cleared

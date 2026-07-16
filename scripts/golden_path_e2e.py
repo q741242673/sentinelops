@@ -134,10 +134,35 @@ async def main() -> None:
                 raise RuntimeError(f"Expected approval gate, got {record.status.value}")
             if record.plan is None or record.diagnosis is None:
                 raise RuntimeError("Agent did not produce a diagnosis and remediation plan")
+            rollout = await agent.tools.call(
+                "get_rollout_history", {"name": "inventory-service"}
+            )
+            if not rollout.success:
+                raise RuntimeError(f"Could not verify rollout history: {rollout.error}")
+            revisions = rollout.content.get("revisions", [])
+            active = [
+                revision
+                for revision in revisions
+                if (revision.get("replicas") or 0) > 0
+                or (revision.get("ready_replicas") or 0) > 0
+            ]
+            if not active:
+                raise RuntimeError("No active inventory-service revision was found")
+            current_revision = max(
+                int(revision["revision"]) for revision in active
+            )
+            prior_revisions = [
+                int(revision["revision"])
+                for revision in revisions
+                if int(revision["revision"]) < current_revision
+            ]
+            if not prior_revisions:
+                raise RuntimeError("No prior inventory-service revision was found")
+            expected_revision = max(prior_revisions)
             action = record.plan.actions[0]
             if action.tool_name != "rollback_deployment" or action.arguments != {
                 "name": "inventory-service",
-                "revision": 1,
+                "revision": expected_revision,
             }:
                 raise RuntimeError(f"Agent selected an unexpected remediation: {action}")
 
