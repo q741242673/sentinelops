@@ -17,8 +17,12 @@ from sentinelops.domain import (
     RiskLevel,
     ToolResult,
 )
+from sentinelops.lab_profiles import (
+    BoundedReflectionRunbook,
+    VerifiedRuntimeStateRunbook,
+    build_simulated_lab_agent,
+)
 from sentinelops.llm.rule_based import RuleBasedProvider
-from sentinelops.runtime import build_agent
 from sentinelops.tools.base import CompositeBackend, ToolSpec
 from sentinelops.tools.registry import KUBERNETES_TOOL_SPECS, ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
@@ -216,12 +220,10 @@ async def test_complex_demo_forces_one_visible_reflection_round() -> None:
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(SimulatedKubernetesBackend()),
-    )
-    alert = make_alert().model_copy(
-        update={"labels": {"reflection_demo": "true"}}
+        runbook=BoundedReflectionRunbook(),
     )
 
-    record = await agent.start(alert)
+    record = await agent.start(make_alert())
 
     assert record.status == IncidentStatus.AWAITING_APPROVAL
     assert record.reflection_rounds == 1
@@ -233,7 +235,7 @@ async def test_complex_demo_forces_one_visible_reflection_round() -> None:
 @pytest.mark.parametrize("scenario", ["bad_rollout", "db_pool_exhaustion"])
 async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
     settings = Settings(tool_backend="simulator", model_provider="rule_based")
-    agent = build_agent(settings, scenario=scenario)
+    agent = build_simulated_lab_agent(settings, scenario=scenario)
 
     record = await agent.start(make_alert())
 
@@ -252,7 +254,7 @@ async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
 @pytest.mark.asyncio
 async def test_rejected_action_is_not_executed() -> None:
     settings = Settings(tool_backend="simulator", model_provider="rule_based")
-    agent = build_agent(settings, scenario="bad_rollout")
+    agent = build_simulated_lab_agent(settings, scenario="bad_rollout")
 
     record = await agent.start(make_alert())
     record = await agent.resume(record.id, approved=False, note="change freeze")
@@ -268,17 +270,18 @@ async def test_transient_runtime_fault_is_auto_remediated_without_human_gate() -
         model_provider="rule_based",
         auto_approve_max_risk="medium",
     )
-    agent = build_agent(settings, scenario="transient_runtime_fault")
+    agent = build_simulated_lab_agent(
+        settings,
+        scenario="transient_runtime_fault",
+        runbook=VerifiedRuntimeStateRunbook(confidence_threshold=0.8),
+        auto_approve_max_risk=RiskLevel.MEDIUM,
+    )
     alert = Alert(
         name="InventoryTransientRuntimeFault",
         namespace="sentinelops-demo",
         service="inventory-service",
         severity="warning",
         summary="库存服务存在进程内瞬态故障",
-        labels={
-            "scenario": "transient_runtime_fault",
-            "auto_remediation": "true",
-        },
     )
 
     record = await agent.start(alert)
@@ -301,6 +304,7 @@ async def test_verified_transient_fault_ignores_non_causal_revision_contradictio
         provider=provider,
         tools=ToolRegistry(backend),
         auto_approve_max_risk=RiskLevel.MEDIUM,
+        runbook=VerifiedRuntimeStateRunbook(confidence_threshold=0.8),
     )
     alert = Alert(
         name="InventoryTransientRuntimeFault",
@@ -308,10 +312,6 @@ async def test_verified_transient_fault_ignores_non_causal_revision_contradictio
         service="inventory-service",
         severity="warning",
         summary="库存服务存在进程内瞬态故障",
-        labels={
-            "scenario": "transient_runtime_fault",
-            "auto_remediation": "true",
-        },
     )
 
     record = await agent.start(alert)

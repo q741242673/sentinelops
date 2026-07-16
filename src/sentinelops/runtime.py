@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from sentinelops.agent import IncidentAgent
+from sentinelops.agent.runbook import IncidentRunbook
 from sentinelops.config import Settings, get_settings
 from sentinelops.domain import IncidentRecord, RiskLevel
 from sentinelops.llm import build_provider
@@ -12,16 +13,23 @@ from sentinelops.tools import build_tool_registry
 def build_agent(
     settings: Settings | None = None,
     *,
-    scenario: str = "bad_rollout",
+    runbook: IncidentRunbook | None = None,
+    profile_id: str = "production-default",
+    auto_approve_max_risk: RiskLevel | None = None,
+    verification_probe_url: str | None = None,
     progress_callback: Callable[[IncidentRecord], None] | None = None,
 ) -> IncidentAgent:
     settings = settings or get_settings()
     return IncidentAgent(
         provider=build_provider(settings),
-        tools=build_tool_registry(settings, scenario=scenario),
-        auto_approve_max_risk=RiskLevel(settings.auto_approve_max_risk),
-        verification_probe_url=settings.demo_order_url,
+        tools=build_tool_registry(settings),
+        auto_approve_max_risk=(
+            auto_approve_max_risk or RiskLevel(settings.auto_approve_max_risk)
+        ),
+        verification_probe_url=verification_probe_url,
         diagnosis_confidence_threshold=settings.diagnosis_confidence_threshold,
         max_reflection_rounds=settings.max_reflection_rounds,
+        runbook=runbook,
+        profile_id=profile_id,
         progress_callback=progress_callback,
     )

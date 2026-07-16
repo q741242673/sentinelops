@@ -97,6 +97,7 @@ export interface ExecutionStep {
 export interface Incident {
   id: string;
   alert: Alert;
+  execution_profile_id: string;
   status: IncidentStatus;
   diagnosis: Diagnosis | null;
   diagnosis_review: DiagnosisReview | null;

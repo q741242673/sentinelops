@@ -8,6 +8,19 @@ from sentinelops.domain import Diagnosis, RemediationPlan
 from sentinelops.llm.rule_based import RuleBasedProvider
 
 
+def test_infers_runtime_state_fault_before_generic_inventory_failure() -> None:
+    observations = {
+        "logs": {
+            "lines": [
+                "inventory_reservation_failed reason=transient_runtime_fault",
+                "transient_runtime_fault_enabled restart_required=true",
+            ]
+        }
+    }
+
+    assert RuleBasedProvider._infer_scenario(observations) == "transient_runtime_fault"
+
+
 @pytest.mark.asyncio
 async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> None:
     provider = RuleBasedProvider()

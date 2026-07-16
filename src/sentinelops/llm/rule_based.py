@@ -38,9 +38,7 @@ class RuleBasedProvider:
     ) -> T:
         payload = json.loads(prompt)
         observations = payload.get("observations", {})
-        scenario = payload.get("alert", {}).get("labels", {}).get(
-            "scenario"
-        ) or self._infer_scenario(observations)
+        scenario = self._infer_scenario(observations)
 
         if schema is Diagnosis:
             return self._diagnose(scenario, observations)  # type: ignore[return-value]
@@ -73,7 +71,7 @@ class RuleBasedProvider:
 
     @staticmethod
     def _infer_scenario(observations: dict[str, Any]) -> str:
-        declared = observations.get("scenario")
+        declared = observations.get("metrics", {}).get("scenario")
         if declared in {
             "bad_rollout",
             "db_pool_exhaustion",
@@ -85,6 +83,11 @@ class RuleBasedProvider:
         pods = observations.get("pods", {}).get("items", [])
         logs = "\n".join(observations.get("logs", {}).get("lines", [])).lower()
         all_evidence = json.dumps(observations, ensure_ascii=False).lower()
+        if (
+            "transient_runtime_fault_enabled" in all_evidence
+            or "reason=transient_runtime_fault" in all_evidence
+        ):
+            return "transient_runtime_fault"
         if "inventory_reservation_failed" in all_evidence or "synthetic_timeout" in all_evidence:
             return "inventory_faulty_rollout"
         has_unhealthy_rollout_pod = any(

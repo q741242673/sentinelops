@@ -53,6 +53,30 @@ The model selects only a predefined evidence intent; application code builds the
 Kubernetes, Prometheus, Loki, Tempo, or Git query. If the diagnosis remains weak, the graph ends
 in `escalated` and performs no mutating action.
 
+### Production core and Demo Lab boundary
+
+The production Agent core contains only vendor-neutral, scenario-neutral instructions for
+evidence collection, hypothesis testing, risk classification, reversible planning, approval,
+execution, and independent recovery verification. It has no branches for portfolio scenarios
+and does not read alert labels to choose a runbook or raise automation privileges.
+
+Service-specific operational policy enters through a trusted, server-loaded `IncidentRunbook`.
+The host selects that object from authenticated configuration; incoming labels and model output
+cannot construct or select it. The default production profile is `production-default`, with the
+configured risk threshold and no active synthetic traffic generation.
+
+The repeatable portfolio workflows live in the separate Demo Lab layer. Starting an explicit
+Lab endpoint arms a short-lived server-side profile for the next expected alert and service.
+Only that trusted profile may inject its scenario runbook, enable a scoped medium-risk approval
+threshold, or generate synthetic traffic for trace correlation. The resulting
+`execution_profile_id` is stored in the incident record for UI and audit purposes. Labels remain
+untrusted routing metadata: forging `scenario`, `auto_remediation`, or `reflection_demo` cannot
+activate a Lab profile, bypass approval, or cause a cluster write.
+
+`rule_based` is a deterministic offline Lab/CI provider, not a production reasoning provider.
+Production deployments should configure `openai_compatible` (DeepSeek or another compatible
+model endpoint) and retain the same host-side policy and tool boundaries.
+
 ## Quick start
 
 Requirements: Python 3.11+.
@@ -373,7 +397,7 @@ silently granting itself automation authority.
 |---|---|---|
 | Read-only | logs, pods, events | automatic |
 | Low | bounded metadata operation | automatic |
-| Medium | restart deployment | approval required by default; auto-demo policy may authorize |
+| Medium | restart deployment | approval required by default; an explicitly armed Lab profile may authorize |
 | High | rollback or scale | approval required |
 | Permanently denied | arbitrary exec, secrets, privileged Pod | rejected |
 

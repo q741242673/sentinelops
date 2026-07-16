@@ -23,6 +23,7 @@ from sentinelops.demo import (
     reset_demo_environment,
 )
 from sentinelops.domain import Alert, ExecutionStep, IncidentRecord, IncidentStatus, TimelineEvent
+from sentinelops.lab_profiles import LabIncidentProfile, LabProfileCoordinator
 from sentinelops.runtime import build_agent
 
 app = FastAPI(
@@ -35,7 +36,7 @@ incident_records: dict[str, IncidentRecord] = {}
 alert_fingerprints: dict[str, str] = {}
 incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
-reflection_demo_armed = False
+lab_profiles = LabProfileCoordinator()
 incident_streams: dict[str, set[asyncio.Queue[str]]] = {}
 incident_feed_streams: set[asyncio.Queue[str]] = set()
 
@@ -123,30 +124,42 @@ def _publish_incident(record: IncidentRecord) -> None:
         queue.put_nowait(payload)
 
 
-async def _investigate_alert(incident_id: str, alert: Alert) -> None:
-    settings = get_settings()
-    if alert.labels.get("auto_remediation") == "true":
-        settings = settings.model_copy(update={"auto_approve_max_risk": "medium"})
-    agent = build_agent(settings, progress_callback=_publish_incident)
-    incident_agents[incident_id] = agent
+async def _investigate_alert(
+    incident_id: str,
+    alert: Alert,
+    profile: LabIncidentProfile | None = None,
+) -> None:
     try:
-        alert = await enrich_alert_with_failed_trace(settings, alert)
-        current = incident_records[incident_id].model_copy(deep=True)
-        preflight = next(
-            (step for step in current.execution_trace if step.id == "enrich_trace:1"),
-            None,
+        settings = get_settings()
+        agent = build_agent(
+            settings,
+            runbook=profile.runbook if profile else None,
+            profile_id=profile.id if profile else "production-default",
+            auto_approve_max_risk=profile.auto_approve_max_risk if profile else None,
+            verification_probe_url=(
+                settings.demo_order_url if profile and profile.enrich_failed_trace else None
+            ),
+            progress_callback=_publish_incident,
         )
-        if preflight:
-            completed_at = datetime.now(UTC)
-            preflight.status = "completed"
-            preflight.completed_at = completed_at
-            preflight.duration_ms = max(
-                0,
-                (completed_at - (preflight.started_at or completed_at)).total_seconds() * 1000,
+        incident_agents[incident_id] = agent
+        if profile and profile.enrich_failed_trace:
+            alert = await enrich_alert_with_failed_trace(settings, alert)
+            current = incident_records[incident_id].model_copy(deep=True)
+            preflight = next(
+                (step for step in current.execution_trace if step.id == "enrich_trace:1"),
+                None,
             )
-            preflight.detail = "已关联告警、失败请求和调用链上下文"
-            current.active_step_id = None
-            _publish_incident(current)
+            if preflight:
+                completed_at = datetime.now(UTC)
+                preflight.status = "completed"
+                preflight.completed_at = completed_at
+                preflight.duration_ms = max(
+                    0,
+                    (completed_at - (preflight.started_at or completed_at)).total_seconds() * 1000,
+                )
+                preflight.detail = "已关联告警、失败请求和调用链上下文"
+                current.active_step_id = None
+                _publish_incident(current)
         _publish_incident(await agent.start(alert, incident_id=incident_id))
     except Exception as exc:
         current = incident_records[incident_id]
@@ -168,8 +181,12 @@ async def _investigate_alert(incident_id: str, alert: Alert) -> None:
         )
 
 
-def _schedule_investigation(incident_id: str, alert: Alert) -> None:
-    task = asyncio.create_task(_investigate_alert(incident_id, alert))
+def _schedule_investigation(
+    incident_id: str,
+    alert: Alert,
+    profile: LabIncidentProfile | None = None,
+) -> None:
+    task = asyncio.create_task(_investigate_alert(incident_id, alert, profile))
     incident_tasks.add(task)
     task.add_done_callback(incident_tasks.discard)
 
@@ -198,7 +215,6 @@ async def create_demo_incident() -> IncidentRecord:
 
 
 async def _run_demo_fault(job_id: str) -> None:
-    global reflection_demo_armed
     settings = get_settings()
     job = demo_fault_jobs[job_id]
     try:
@@ -213,8 +229,7 @@ async def _run_demo_fault(job_id: str) -> None:
             timeout=settings.demo_alert_timeout_seconds + 10,
         )
     except TimeoutError:
-        if job.scenario == "ambiguous_change_fault":
-            reflection_demo_armed = False
+        _disarm_job_profile(job)
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
             update={
                 "status": "failed",
@@ -225,8 +240,7 @@ async def _run_demo_fault(job_id: str) -> None:
             }
         )
     except Exception as exc:
-        if job.scenario == "ambiguous_change_fault":
-            reflection_demo_armed = False
+        _disarm_job_profile(job)
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
             update={"status": "failed", "error": str(exc)}
         )
@@ -249,20 +263,21 @@ async def create_demo_fault() -> DemoFaultJob:
 
 @app.post("/api/v1/demo/auto-faults", response_model=DemoFaultJob, status_code=202)
 async def create_auto_demo_fault() -> DemoFaultJob:
-    return _create_demo_fault_job("transient_runtime_fault")
+    job = _create_demo_fault_job("transient_runtime_fault")
+    lab_profiles.arm("automatic_remediation", job.id)
+    return job
 
 
 @app.post("/api/v1/demo/reflection-faults", response_model=DemoFaultJob, status_code=202)
 async def create_reflection_demo_fault() -> DemoFaultJob:
-    global reflection_demo_armed
-    reflection_demo_armed = True
-    return _create_demo_fault_job("ambiguous_change_fault")
+    job = _create_demo_fault_job("ambiguous_change_fault")
+    lab_profiles.arm("bounded_reflection", job.id)
+    return job
 
 
 @app.post("/api/v1/demo/reset")
 async def reset_demo() -> dict[str, Any]:
-    global reflection_demo_armed
-    reflection_demo_armed = False
+    lab_profiles.clear()
     try:
         return await reset_demo_environment(get_settings())
     except RuntimeError as exc:
@@ -295,6 +310,13 @@ def _create_demo_fault_job(
     return job
 
 
+def _disarm_job_profile(job: DemoFaultJob) -> None:
+    if job.scenario == "transient_runtime_fault":
+        lab_profiles.disarm("automatic_remediation")
+    elif job.scenario == "ambiguous_change_fault":
+        lab_profiles.disarm("bounded_reflection")
+
+
 @app.get("/api/v1/demo/faults/{job_id}", response_model=DemoFaultJob)
 async def get_demo_fault(job_id: str) -> DemoFaultJob:
     try:
@@ -305,7 +327,6 @@ async def get_demo_fault(job_id: str) -> DemoFaultJob:
 
 @app.post("/api/v1/webhooks/alertmanager", status_code=202)
 async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str, object]:
-    global reflection_demo_armed
     accepted: list[dict[str, object]] = []
     for item in payload.alerts:
         fingerprint = _fingerprint(item)
@@ -317,20 +338,6 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
             continue
         if item.status != "firing":
             continue
-        if (
-            reflection_demo_armed
-            and item.labels.get("alertname") == "HighInventoryErrorRate"
-        ):
-            item = item.model_copy(
-                update={
-                    "labels": {
-                        **item.labels,
-                        "reflection_demo": "true",
-                        "demo_mode": "complex_investigation",
-                    }
-                }
-            )
-            reflection_demo_armed = False
         existing_id = alert_fingerprints.get(fingerprint)
         if existing_id:
             accepted.append(
@@ -342,8 +349,40 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
             )
             continue
         alert = _alert_from_alertmanager(item, fingerprint)
+        profile = lab_profiles.consume(
+            alert_name=alert.name,
+            service=alert.service,
+            confidence_threshold=get_settings().diagnosis_confidence_threshold,
+        )
+        now = datetime.now(UTC)
+        execution_trace = [
+            ExecutionStep(
+                id="incident_received:1",
+                kind="graph",
+                title="接收事故告警",
+                detail=alert.summary,
+                status="completed",
+                started_at=now,
+                completed_at=now,
+                duration_ms=0,
+            )
+        ]
+        active_step_id = None
+        if profile and profile.enrich_failed_trace:
+            execution_trace.append(
+                ExecutionStep(
+                    id="enrich_trace:1",
+                    kind="tool",
+                    title="关联告警与失败调用链",
+                    detail="正在从 Tempo 补齐触发告警的失败请求上下文",
+                    status="running",
+                    started_at=now,
+                )
+            )
+            active_step_id = "enrich_trace:1"
         placeholder = IncidentRecord(
             alert=alert,
+            execution_profile_id=profile.id if profile else "production-default",
             status=IncidentStatus.INVESTIGATING,
             timeline=[
                 TimelineEvent(
@@ -352,31 +391,12 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
                     data={"fingerprint": fingerprint},
                 )
             ],
-            execution_trace=[
-                ExecutionStep(
-                    id="incident_received:1",
-                    kind="graph",
-                    title="接收事故告警",
-                    detail=alert.summary,
-                    status="completed",
-                    started_at=datetime.now(UTC),
-                    completed_at=datetime.now(UTC),
-                    duration_ms=0,
-                ),
-                ExecutionStep(
-                    id="enrich_trace:1",
-                    kind="tool",
-                    title="关联告警与失败调用链",
-                    detail="正在从 Tempo 补齐触发告警的失败请求上下文",
-                    status="running",
-                    started_at=datetime.now(UTC),
-                ),
-            ],
-            active_step_id="enrich_trace:1",
+            execution_trace=execution_trace,
+            active_step_id=active_step_id,
         )
         _publish_incident(placeholder)
         alert_fingerprints[fingerprint] = placeholder.id
-        _schedule_investigation(placeholder.id, alert)
+        _schedule_investigation(placeholder.id, alert, profile)
         accepted.append(
             {
                 "fingerprint": fingerprint,

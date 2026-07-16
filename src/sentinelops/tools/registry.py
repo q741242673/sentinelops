@@ -112,9 +112,9 @@ class ToolRegistry:
         return await self.backend.call(name, arguments)
 
 
-def build_tool_registry(settings: Settings, *, scenario: str = "bad_rollout") -> ToolRegistry:
+def build_tool_registry(settings: Settings) -> ToolRegistry:
     if settings.tool_backend == "simulator":
-        kubernetes: ToolBackend = SimulatedKubernetesBackend(scenario=scenario)
+        kubernetes: ToolBackend = SimulatedKubernetesBackend()
     else:
         kubernetes = KubernetesBackend(namespace=settings.kubernetes_namespace)
     specs = list(KUBERNETES_TOOL_SPECS)

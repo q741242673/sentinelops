@@ -18,7 +18,7 @@ def simulated_demo_alert(settings: Settings) -> Alert:
         service="order-service",
         severity="critical",
         summary="Order service error rate exceeded the 5% SLO threshold",
-        labels={"source": "local-console", "scenario": "bad_rollout"},
+        labels={"source": "local-console"},
     )
 
 

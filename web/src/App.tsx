@@ -383,9 +383,9 @@ function App() {
     if (forceFollow || isNew) {
       setSelectedId(updated.id);
       setDemoMode(
-        updated.alert.labels.reflection_demo === "true"
+        updated.execution_profile_id.startsWith("lab.bounded-reflection")
           ? "reflection"
-          : updated.alert.labels.auto_remediation === "true"
+          : updated.execution_profile_id.startsWith("lab.auto-remediation")
             ? "auto"
             : "manual",
       );
@@ -428,9 +428,9 @@ function App() {
 
   const selected = incidents.find((item) => item.id === selectedId) ?? incidents[0] ?? null;
   const liveMode = runtime?.tool_backend === "kubernetes";
-  const selectedMode: DemoMode = selected?.alert.labels.reflection_demo === "true"
+  const selectedMode: DemoMode = selected?.execution_profile_id.startsWith("lab.bounded-reflection")
     ? "reflection"
-    : selected?.alert.labels.auto_remediation === "true"
+    : selected?.execution_profile_id.startsWith("lab.auto-remediation")
       ? "auto"
       : "manual";
   const selectedEvidence = useMemo(

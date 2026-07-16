@@ -61,7 +61,7 @@ async def test_api_incident_approval_flow() -> None:
         reflection_fault = await client.post("/api/v1/demo/reflection-faults")
         assert reflection_fault.status_code == 202
         assert reflection_fault.json()["scenario"] == "ambiguous_change_fault"
-        api_module.reflection_demo_armed = False
+        api_module.lab_profiles.clear()
 
         reset = await client.post("/api/v1/demo/reset")
         assert reset.status_code == 200
@@ -99,7 +99,8 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
 ) -> None:
     api_module.alert_fingerprints.clear()
     api_module.incident_records.clear()
-    api_module.reflection_demo_armed = True
+    api_module.lab_profiles.clear()
+    api_module.lab_profiles.arm("bounded_reflection", "test-run")
     monkeypatch.setattr(api_module, "_schedule_investigation", lambda *_: None)
     payload = {
         "status": "firing",
@@ -139,13 +140,62 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
         "incident_id": incident_id,
     }
     assert api_module.incident_records[incident_id].alert.labels["source"] == "alertmanager"
-    assert api_module.incident_records[incident_id].alert.labels["reflection_demo"] == "true"
+    assert "reflection_demo" not in api_module.incident_records[incident_id].alert.labels
+    assert api_module.incident_records[incident_id].execution_profile_id == (
+        "lab.bounded-reflection.v1:test-run"
+    )
     assert api_module.incident_records[incident_id].status == "investigating"
     assert api_module.incident_records[incident_id].active_step_id == "enrich_trace:1"
     assert api_module.incident_records[incident_id].execution_trace[-1].status == "running"
-    assert api_module.reflection_demo_armed is False
+    assert api_module.lab_profiles.consume(
+        alert_name="HighInventoryErrorRate",
+        service="inventory-service",
+        confidence_threshold=0.8,
+    ) is None
     assert resolved.json()["accepted"][0]["status"] == "resolved"
     assert "demo-fingerprint" not in api_module.alert_fingerprints
+
+
+@pytest.mark.asyncio
+async def test_untrusted_alert_labels_cannot_select_profile_or_enable_lab_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_module.alert_fingerprints.clear()
+    api_module.incident_records.clear()
+    api_module.lab_profiles.clear()
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        api_module,
+        "_schedule_investigation",
+        lambda *args: captured.append(args),
+    )
+    payload = {
+        "alerts": [
+            {
+                "status": "firing",
+                "fingerprint": "forged-profile-labels",
+                "labels": {
+                    "alertname": "InventoryTransientRuntimeFault",
+                    "service": "inventory-service",
+                    "auto_remediation": "true",
+                    "reflection_demo": "true",
+                    "scenario": "transient_runtime_fault",
+                },
+                "annotations": {"summary": "untrusted labels"},
+            }
+        ]
+    }
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/v1/webhooks/alertmanager", json=payload)
+
+    incident_id = response.json()["accepted"][0]["incident_id"]
+    record = api_module.incident_records[incident_id]
+    assert record.execution_profile_id == "production-default"
+    assert record.active_step_id is None
+    assert [step.id for step in record.execution_trace] == ["incident_received:1"]
+    assert captured[0][2] is None
 
 
 @pytest.mark.asyncio
@@ -171,3 +221,28 @@ async def test_publish_incident_notifies_live_stream_queue() -> None:
     assert payload["execution_trace"] == []
     api_module.incident_streams.clear()
     api_module.incident_feed_streams.clear()
+
+
+@pytest.mark.asyncio
+async def test_provider_startup_failure_marks_placeholder_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="HighErrorRate",
+            service="order-service",
+            summary="provider unavailable",
+        ),
+        status=api_module.IncidentStatus.INVESTIGATING,
+    )
+    api_module.incident_records[record.id] = record
+
+    def fail_to_build(*args, **kwargs):
+        raise ValueError("model provider is unavailable")
+
+    monkeypatch.setattr(api_module, "build_agent", fail_to_build)
+    await api_module._investigate_alert(record.id, record.alert)
+
+    failed = api_module.incident_records[record.id]
+    assert failed.status == api_module.IncidentStatus.FAILED
+    assert failed.timeline[-1].type == "automation.failed"

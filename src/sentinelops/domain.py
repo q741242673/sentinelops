@@ -144,6 +144,7 @@ class ExecutionStep(BaseModel):
 class IncidentRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     alert: Alert
+    execution_profile_id: str = "production-default"
     status: IncidentStatus = IncidentStatus.RECEIVED
     diagnosis: Diagnosis | None = None
     diagnosis_review: DiagnosisReview | None = None

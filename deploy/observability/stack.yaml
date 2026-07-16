@@ -66,8 +66,6 @@ data:
               severity: warning
               service: inventory-service
               namespace: sentinelops-demo
-              scenario: transient_runtime_fault
-              auto_remediation: "true"
             annotations:
               summary: 库存服务存在进程内瞬态运行时故障
 ---
