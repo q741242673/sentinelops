@@ -7,11 +7,11 @@ from time import perf_counter
 
 from sentinelops.config import Settings
 from sentinelops.domain import Alert, IncidentStatus
-from sentinelops.runtime import build_agent
+from sentinelops.lab_profiles import build_simulated_lab_agent
 
 SCENARIOS = {
-    "bad_rollout": "broken application image",
-    "db_pool_exhaustion": "connection pool exhaustion",
+    "bad_rollout": "损坏的应用镜像",
+    "db_pool_exhaustion": "数据库连接池已耗尽",
 }
 
 
@@ -19,7 +19,7 @@ async def evaluate() -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     settings = Settings(tool_backend="simulator", model_provider="rule_based")
     for scenario, expected in SCENARIOS.items():
-        agent = build_agent(settings, scenario=scenario)
+        agent = build_simulated_lab_agent(settings, scenario=scenario)
         alert = Alert(
             name="SyntheticIncident",
             namespace="sentinelops-demo",
