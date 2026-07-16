@@ -339,8 +339,8 @@ function ResultPanel({
         <div className="result-heading"><h2>关键证据</h2><span>{evidence.length} 条</span></div>
         <div className="evidence-list">
           {evidence.length === 0 && <p className="pending-copy">证据采集中…</p>}
-          {evidence.slice(0, 6).map((item: Evidence, index) => (
-            <article key={`${item.source}-${index}`}>
+          {evidence.slice(0, 6).map((item: Evidence) => (
+            <article key={item.evidence_id}>
               <span>{sourceLabel(item.source)}</span>
               <p>{item.finding}</p>
             </article>

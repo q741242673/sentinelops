@@ -35,6 +35,38 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
         "trace": {"trace": {"resourceSpans": [{"service.name": "inventory-service"}]}},
         "rollout": {"revisions": [{"revision": 11}, {"revision": 12}]},
         "scenario": "live_cluster",
+        "evidence_catalog": {
+            "collect_context:1:tool:logs": {
+                "evidence_id": "collect_context:1:tool:logs",
+                "source": "kubernetes_logs",
+                "tool": "get_pod_logs",
+                "success": True,
+            },
+            "collect_context:1:tool:prometheus": {
+                "evidence_id": "collect_context:1:tool:prometheus",
+                "source": "prometheus",
+                "tool": "query_prometheus",
+                "success": True,
+            },
+            "collect_context:1:tool:loki": {
+                "evidence_id": "collect_context:1:tool:loki",
+                "source": "loki",
+                "tool": "search_loki",
+                "success": True,
+            },
+            "collect_context:1:tool:trace": {
+                "evidence_id": "collect_context:1:tool:trace",
+                "source": "tempo",
+                "tool": "get_trace",
+                "success": True,
+            },
+            "collect_context:1:tool:rollout": {
+                "evidence_id": "collect_context:1:tool:rollout",
+                "source": "kubernetes_rollout",
+                "tool": "get_rollout_history",
+                "success": True,
+            },
+        },
     }
     diagnosis = await provider.structured(
         system="diagnose",
@@ -44,11 +76,13 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
 
     assert "revision 12" in diagnosis.root_cause.lower()
     assert {item.source for item in diagnosis.hypotheses[0].evidence} == {
+        "kubernetes_logs",
         "prometheus",
         "loki",
         "tempo",
-        "kubernetes.rollout",
+        "kubernetes_rollout",
     }
+    assert all(item.evidence_id for item in diagnosis.hypotheses[0].evidence)
 
     plan = await provider.structured(
         system="plan",

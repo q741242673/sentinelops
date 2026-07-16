@@ -31,7 +31,8 @@ class AlternativeEliminationProvider(RuleBasedProvider):
                 confidence=0.05,
                 evidence=[
                     Evidence(
-                        source="kubernetes.pods",
+                        evidence_id="collect_context:1:tool:pods",
+                        source="kubernetes_pods",
                         query="list_pods",
                         finding="Pod 基础设施健康，排除了基础设施故障",
                         supports_hypothesis=False,

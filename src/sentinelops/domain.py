@@ -47,11 +47,19 @@ class Alert(BaseModel):
 
 
 class Evidence(BaseModel):
+    evidence_id: str = Field(min_length=1)
     source: str
     query: str
     finding: str
     supports_hypothesis: bool = True
     raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceCatalogEntry(BaseModel):
+    evidence_id: str
+    source: str
+    tool: str
+    success: bool
 
 
 class Hypothesis(BaseModel):
