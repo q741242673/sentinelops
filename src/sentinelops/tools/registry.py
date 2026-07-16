@@ -5,7 +5,12 @@ from typing import Any
 
 from sentinelops.config import Settings
 from sentinelops.domain import RiskLevel, ToolResult
-from sentinelops.tools.base import CompositeBackend, ToolBackend, ToolSpec
+from sentinelops.tools.base import (
+    CompositeBackend,
+    ToolBackend,
+    ToolSpec,
+    tool_call_fingerprint,
+)
 from sentinelops.tools.change import GitChangeBackend
 from sentinelops.tools.kubernetes import KubernetesBackend
 from sentinelops.tools.observability import ObservabilityBackend
@@ -145,6 +150,24 @@ class ToolRegistry:
                 error=validation_error,
             )
         return await self.backend.call(name, arguments)
+
+    async def call_guarded(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        precondition: dict[str, Any],
+    ) -> ToolResult:
+        """Attach a host-generated write guard after validating only public arguments."""
+        validation_error = self.validation_error(name, arguments)
+        if validation_error:
+            return ToolResult(tool_name=name, success=False, error=validation_error)
+        execution_guard = {
+            **precondition,
+            "guarded_tool_name": name,
+            "public_arguments_fingerprint": tool_call_fingerprint(name, arguments),
+        }
+        guarded_arguments = {**arguments, "_precondition": execution_guard}
+        return await self.backend.call(name, guarded_arguments)
 
     @staticmethod
     def _validate_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> str | None:

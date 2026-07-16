@@ -4,11 +4,14 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from sentinelops.revision_health import (
     build_health_proof_annotations,
     revision_subject,
     runtime_image_fingerprint,
 )
+from sentinelops.tools.base import tool_call_fingerprint
 from sentinelops.tools.kubernetes import KubernetesBackend
 
 
@@ -63,6 +66,40 @@ def replica_set(
         spec=ns(template=template, replicas=1),
         status=ns(replicas=1, ready_replicas=1),
     )
+
+
+def rollback_precondition(
+    target,
+    *,
+    tool_name: str = "rollback_deployment",
+    arguments: dict | None = None,
+) -> dict:
+    target_summary = KubernetesBackend._replica_set_summary(target)
+    public_arguments = arguments or {"name": "order-service", "revision": 1}
+    return {
+        "guarded_tool_name": tool_name,
+        "public_arguments_fingerprint": tool_call_fingerprint(
+            tool_name, public_arguments
+        ),
+        "namespace": "sentinelops-demo",
+        "target": "order-service",
+        "deployment_uid": "deployment-uid",
+        "generation": 2,
+        "resource_version": "42",
+        "desired_replicas": 1,
+        "paused": False,
+        "current_revision": 2,
+        "current_replica_set_uid": "replica-set-uid-2",
+        "current_template_hash": "hash-2",
+        "rollback_target": {
+            "revision": 1,
+            "replica_set_uid": "replica-set-uid-1",
+            "health_proof": {
+                key: target_summary["health_proof"].get(key)
+                for key in ("subject", "version", "verified_at", "verifier")
+            },
+        },
+    }
 
 
 def test_owned_replica_sets_are_filtered_and_sorted() -> None:
@@ -159,15 +196,22 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
         spec=ns(containers=[ns(name="order-service", image="order:broken")]),
     )
     deployment = ns(
-        metadata=ns(uid="deployment-uid", resource_version="42"),
-        spec=ns(paused=False, template=current_template),
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
+        spec=ns(paused=False, replicas=1, template=current_template),
     )
-    target = replica_set(1)
+    target = replica_set(1, healthy_proof=True)
     target.spec.template.metadata.annotations["sentinelops.io/health-status"] = "healthy"
+    current = replica_set(2)
     backend.apps.read_namespaced_deployment.return_value = deployment
-    backend.apps.list_namespaced_replica_set.return_value = ns(items=[target, replica_set(2)])
+    backend.apps.list_namespaced_replica_set.return_value = ns(items=[target, current])
 
-    result = backend._tool_rollback_deployment({"name": "order-service", "revision": 1})
+    result = backend._tool_rollback_deployment(
+        {
+            "name": "order-service",
+            "revision": 1,
+            "_precondition": rollback_precondition(target),
+        }
+    )
 
     assert result["rolled_back"] is True
     assert deployment.spec.template is not target.spec.template
@@ -179,6 +223,107 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
         "sentinelops-demo",
         deployment,
     )
+
+
+def test_backend_rejects_rollback_if_proof_changes_after_preflight() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    deployment = ns(
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
+        spec=ns(paused=False, replicas=1),
+    )
+    target = replica_set(1, healthy_proof=True)
+    precondition = rollback_precondition(target)
+    target.metadata.annotations.pop("sentinelops.io/health-proof-status")
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(
+        items=[target, replica_set(2)]
+    )
+
+    with pytest.raises(RuntimeError, match="health proof changed"):
+        backend._tool_rollback_deployment(
+            {
+                "name": "order-service",
+                "revision": 1,
+                "_precondition": precondition,
+            }
+        )
+
+    backend.apps.replace_namespaced_deployment.assert_not_called()
+
+
+def test_backend_rejects_rollback_when_public_revision_differs_from_guard() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    deployment = ns(
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
+        spec=ns(paused=False, replicas=1),
+    )
+    target = replica_set(1, healthy_proof=True)
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(
+        items=[target, replica_set(2)]
+    )
+
+    with pytest.raises(RuntimeError, match="tool or arguments changed"):
+        backend._tool_rollback_deployment(
+            {
+                "name": "order-service",
+                "revision": 2,
+                "_precondition": rollback_precondition(target),
+            }
+        )
+
+    backend.apps.replace_namespaced_deployment.assert_not_called()
+
+
+def test_backend_rejects_guard_replayed_to_another_write_tool() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+
+    with pytest.raises(RuntimeError, match="tool or arguments changed"):
+        backend._tool_restart_deployment(
+            {
+                "name": "order-service",
+                "_precondition": rollback_precondition(
+                    replica_set(1, healthy_proof=True)
+                ),
+            }
+        )
+
+    backend.apps.patch_namespaced_deployment.assert_not_called()
+
+
+def test_restart_uses_fresh_resource_version_as_a_cas_guard() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    deployment = ns(
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
+        spec=ns(paused=False, replicas=1),
+    )
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(
+        items=[replica_set(1), replica_set(2)]
+    )
+    restart_arguments = {"name": "order-service"}
+    precondition = rollback_precondition(
+        replica_set(1, healthy_proof=True),
+        tool_name="restart_deployment",
+        arguments=restart_arguments,
+    )
+    precondition.pop("rollback_target")
+
+    result = backend._tool_restart_deployment(
+        {**restart_arguments, "_precondition": precondition}
+    )
+
+    assert result["restarted"] is True
+    body = backend.apps.patch_namespaced_deployment.call_args.args[2]
+    assert body["metadata"]["resourceVersion"] == "42"
 
 
 def test_demo_fault_injection_patches_failure_rate_and_waits_for_rollout() -> None:

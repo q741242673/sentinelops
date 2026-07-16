@@ -7,6 +7,7 @@ import pytest
 from sentinelops.agent.policy import ActionPolicy
 from sentinelops.domain import RemediationAction, RiskLevel, ToolResult
 from sentinelops.llm.rule_based import RuleBasedProvider
+from sentinelops.tools.base import tool_call_fingerprint
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
@@ -118,6 +119,35 @@ async def test_registry_preserves_existing_read_tool_argument_compatibility() ->
 
     assert result.success is True
     backend.call.assert_awaited_once_with("get_pod_logs", arguments)
+
+
+@pytest.mark.asyncio
+async def test_registry_binds_guard_to_validated_tool_and_public_arguments() -> None:
+    backend = AsyncMock()
+    backend.call.return_value = ToolResult(
+        tool_name="rollback_deployment", success=True
+    )
+    registry = ToolRegistry(backend)
+    arguments = {"name": "order-service", "revision": 1}
+
+    await registry.call_guarded(
+        "rollback_deployment",
+        arguments,
+        {
+            "guarded_tool_name": "restart_deployment",
+            "public_arguments_fingerprint": "attacker-controlled",
+            "deployment_uid": "deployment-uid",
+        },
+    )
+
+    guarded_arguments = backend.call.await_args.args[1]
+    assert guarded_arguments["_precondition"]["guarded_tool_name"] == (
+        "rollback_deployment"
+    )
+    assert guarded_arguments["_precondition"][
+        "public_arguments_fingerprint"
+    ] == tool_call_fingerprint("rollback_deployment", arguments)
+    assert guarded_arguments["_precondition"]["deployment_uid"] == "deployment-uid"
 
 
 def test_rule_provider_infers_bad_rollout_from_live_cluster_evidence() -> None:

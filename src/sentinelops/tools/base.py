@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
 from sentinelops.domain import RiskLevel, ToolResult
+
+
+def tool_call_fingerprint(name: str, arguments: dict[str, Any]) -> str:
+    """Bind an execution guard to one allowlisted tool invocation."""
+    payload = json.dumps(
+        {"tool_name": name, "arguments": arguments},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 class ToolSpec(BaseModel):

@@ -68,30 +68,45 @@ class SimulatedKubernetesBackend:
         return {"scenario": self.scenario, "lines": lines}
 
     def _tool_get_rollout_history(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        deployment_name = arguments.get("name", "order-service")
         if self.scenario != "bad_rollout":
             revisions = [
                 {
+                    "uid": "sim-rs-1",
+                    "template_hash": "sim-template-1",
                     "revision": 1,
                     "image": "order-service:1.0.0",
                     "replicas": 1,
                     "ready_replicas": 1,
                     "status": "stable",
                     "health_status": "healthy",
-                    "health_proof": {"valid": True, "status": "healthy"},
+                    "health_proof": {
+                        "valid": True,
+                        "status": "healthy",
+                        "subject": "sha256:simulated-revision-1",
+                    },
                 }
             ]
         else:
             revisions = [
                 {
+                    "uid": "sim-rs-1",
+                    "template_hash": "sim-template-1",
                     "revision": 1,
                     "image": "order-service:1.0.0",
                     "replicas": 0,
                     "ready_replicas": 0,
                     "status": "stable",
                     "health_status": "healthy",
-                    "health_proof": {"valid": True, "status": "healthy"},
+                    "health_proof": {
+                        "valid": True,
+                        "status": "healthy",
+                        "subject": "sha256:simulated-revision-1",
+                    },
                 },
                 {
+                    "uid": "sim-rs-2",
+                    "template_hash": "sim-template-2",
                     "revision": 2,
                     "image": "order-service:1.1.0",
                     "replicas": 1,
@@ -103,6 +118,13 @@ class SimulatedKubernetesBackend:
             ]
         return {
             "scenario": self.scenario,
+            "namespace": "sentinelops-demo",
+            "deployment_uid": f"sim-deployment-{deployment_name}",
+            "generation": self.current_revision,
+            "observed_generation": self.current_revision,
+            "resource_version": f"sim-rv-{self.current_revision}",
+            "desired_replicas": 1,
+            "paused": False,
             "current_revision": self.current_revision,
             "revisions": revisions,
         }

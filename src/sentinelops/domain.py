@@ -118,6 +118,8 @@ class ApprovalRequest(BaseModel):
     incident_id: str
     action: RemediationAction
     reason: str
+    preflight_snapshot: dict[str, Any]
+    expires_at: datetime
 
 
 class ToolResult(BaseModel):

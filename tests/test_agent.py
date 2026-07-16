@@ -104,6 +104,59 @@ class RecordingSimulator(SimulatedKubernetesBackend):
         return await super().call(name, arguments)
 
 
+class PreflightMutationSimulator(RecordingSimulator):
+    def __init__(self, mutation: str) -> None:
+        super().__init__()
+        self.mutation = mutation
+        self.rollout_reads = 0
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "get_rollout_history":
+            self.calls.append(name)
+            self.rollout_reads += 1
+            if self.rollout_reads > 2 and self.mutation == "read_failure":
+                return ToolResult(
+                    tool_name=name,
+                    success=False,
+                    error="Kubernetes API unavailable during preflight",
+                )
+            result = await SimulatedKubernetesBackend.call(self, name, arguments)
+            if self.rollout_reads > 2 and self.mutation == "new_revision":
+                result.content["generation"] = 3
+                result.content["resource_version"] = "sim-rv-3"
+                result.content["current_revision"] = 3
+                result.content["revisions"].append(
+                    {
+                        "uid": "sim-rs-3",
+                        "revision": 3,
+                        "replicas": 1,
+                        "ready_replicas": 1,
+                        "status": "current",
+                        "health_status": "unknown",
+                        "health_proof": {"valid": False, "status": "unknown"},
+                    }
+                )
+            if self.rollout_reads > 2 and self.mutation == "proof_revoked":
+                target = result.content["revisions"][0]
+                target["health_status"] = "unknown"
+                target["health_proof"] = {
+                    "valid": False,
+                    "status": "unknown",
+                    "subject": target["health_proof"]["subject"],
+                }
+            if self.rollout_reads > 2 and self.mutation == "resource_version_only":
+                result.content["resource_version"] = "sim-rv-status-update"
+            return result
+        if name == "rollback_deployment" and self.mutation == "backend_guard_failure":
+            self.calls.append(name)
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                error="Execution precondition failed: resource_version",
+            )
+        return await super().call(name, arguments)
+
+
 class ContradictoryTransientProvider(RuleBasedProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -682,6 +735,89 @@ async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
     assert record.status == IncidentStatus.RESOLVED
     assert record.execution_results[0].success is True
     assert record.postmortem is not None
+
+
+@pytest.mark.asyncio
+async def test_approved_action_runs_fresh_preflight_before_write() -> None:
+    backend = RecordingSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+    )
+
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    assert record.approval.preflight_snapshot["current_revision"] == 2
+
+    record = await agent.resume(record.id, approved=True, note="approve stable snapshot")
+
+    assert record.status == IncidentStatus.RESOLVED
+    assert backend.calls.count("get_rollout_history") == 3
+    assert backend.calls.count("rollback_deployment") == 1
+    event_types = [event.type for event in record.timeline]
+    assert event_types.index("remediation.preflight_passed") < event_types.index(
+        "action.executed"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["new_revision", "proof_revoked", "read_failure"])
+async def test_approval_is_invalidated_when_fresh_preflight_changes(
+    mutation: str,
+) -> None:
+    backend = PreflightMutationSimulator(mutation)
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+    )
+
+    record = await agent.start(make_alert())
+    assert record.status == IncidentStatus.AWAITING_APPROVAL
+    record = await agent.resume(record.id, approved=True, note="approve stale plan")
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.plan is None
+    assert record.approval is None
+    assert record.execution_results == []
+    assert "rollback_deployment" not in backend.calls
+    assert any(event.type == "approval.invalidated" for event in record.timeline)
+    preflight = next(step for step in record.execution_trace if step.id == "preflight:1")
+    assert preflight.status == "blocked"
+    assert not any(step.id == "execute:1" for step in record.execution_trace)
+
+
+@pytest.mark.asyncio
+async def test_status_only_resource_version_change_does_not_invalidate_approval() -> None:
+    backend = PreflightMutationSimulator("resource_version_only")
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+    )
+
+    record = await agent.start(make_alert())
+    record = await agent.resume(record.id, approved=True, note="status update is harmless")
+
+    assert record.status == IncidentStatus.RESOLVED
+    assert backend.calls.count("rollback_deployment") == 1
+
+
+@pytest.mark.asyncio
+async def test_backend_cas_failure_cannot_be_reported_as_recovered() -> None:
+    backend = PreflightMutationSimulator("backend_guard_failure")
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+    )
+
+    record = await agent.start(make_alert())
+    record = await agent.resume(record.id, approved=True, note="race after preflight")
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.execution_results[0].success is False
+    assert record.plan is None
+    assert record.approval is None
+    assert any(event.type == "approval.invalidated" for event in record.timeline)
+    assert not any(step.id == "verify:1" for step in record.execution_trace)
 
 
 @pytest.mark.asyncio

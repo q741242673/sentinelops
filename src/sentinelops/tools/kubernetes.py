@@ -18,6 +18,7 @@ from sentinelops.revision_health import (
     runtime_image_fingerprint,
     verify_health_proof,
 )
+from sentinelops.tools.base import tool_call_fingerprint
 
 
 class KubernetesBackend:
@@ -142,9 +143,18 @@ class KubernetesBackend:
             _request_timeout=self._api_timeout(),
         )
         owned = self._owned_replica_sets(deployment, replica_sets.items)
+        deployment_annotations = getattr(deployment.metadata, "annotations", None) or {}
         return {
             "deployment": name,
+            "namespace": self.namespace,
+            "deployment_uid": str(deployment.metadata.uid),
             "generation": deployment.metadata.generation,
+            "resource_version": str(deployment.metadata.resource_version),
+            "desired_replicas": deployment.spec.replicas or 0,
+            "paused": bool(deployment.spec.paused),
+            "current_revision": int(
+                deployment_annotations.get("deployment.kubernetes.io/revision", "0")
+            ),
             "observed_generation": deployment.status.observed_generation,
             "revisions": [self._replica_set_summary(rs) for rs in owned],
         }
@@ -198,6 +208,8 @@ class KubernetesBackend:
         )
         return {
             "name": replica_set.metadata.name,
+            "uid": str(replica_set.metadata.uid),
+            "template_hash": labels.get("pod-template-hash", ""),
             "revision": int(revision),
             "images": [container.image for container in containers],
             "change_cause": template_annotations.get("sentinelops.io/change-cause"),
@@ -317,6 +329,129 @@ class KubernetesBackend:
             "note": "Connect Prometheus MCP for request-level SLI metrics",
         }
 
+    def _validated_write_context(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        expected_tool_name: str,
+    ) -> tuple[Any, list[Any]]:
+        precondition = arguments.get("_precondition")
+        if not isinstance(precondition, dict):
+            raise RuntimeError("Missing host-generated execution precondition")
+        public_arguments = {
+            key: value for key, value in arguments.items() if key != "_precondition"
+        }
+        if (
+            precondition.get("guarded_tool_name") != expected_tool_name
+            or precondition.get("public_arguments_fingerprint")
+            != tool_call_fingerprint(expected_tool_name, public_arguments)
+        ):
+            raise RuntimeError(
+                "Execution precondition failed: guarded tool or arguments changed"
+            )
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
+        summaries = [self._replica_set_summary(item) for item in owned]
+        deployment_annotations = getattr(deployment.metadata, "annotations", None) or {}
+        declared_revision = int(
+            deployment_annotations.get("deployment.kubernetes.io/revision", "0")
+        )
+        current = next(
+            (item for item in summaries if int(item["revision"]) == declared_revision),
+            None,
+        )
+        if current is None:
+            active = [
+                item
+                for item in summaries
+                if (item.get("replicas") or 0) > 0
+                or (item.get("ready_replicas") or 0) > 0
+            ]
+            current = (
+                max(active, key=lambda item: int(item["revision"])) if active else None
+            )
+        if current is None:
+            raise RuntimeError("Execution precondition failed: current revision is unknown")
+        actual = {
+            "namespace": self.namespace,
+            "target": name,
+            "deployment_uid": str(deployment.metadata.uid),
+            "generation": int(deployment.metadata.generation),
+            "resource_version": str(deployment.metadata.resource_version),
+            "desired_replicas": int(deployment.spec.replicas or 0),
+            "paused": bool(deployment.spec.paused),
+            "current_revision": int(current["revision"]),
+            "current_replica_set_uid": current["uid"],
+            "current_template_hash": current["template_hash"],
+        }
+        changed = [
+            key
+            for key, value in actual.items()
+            if precondition.get(key) != value
+        ]
+        if changed:
+            raise RuntimeError(
+                "Execution precondition failed: " + ", ".join(changed)
+            )
+
+        rollback_target = precondition.get("rollback_target")
+        if expected_tool_name == "rollback_deployment" and not isinstance(
+            rollback_target, dict
+        ):
+            raise RuntimeError(
+                "Execution precondition failed: rollback health proof is missing"
+            )
+        if rollback_target is not None:
+            if (
+                expected_tool_name != "rollback_deployment"
+                or int(rollback_target.get("revision", -1))
+                != int(public_arguments.get("revision", -2))
+            ):
+                raise RuntimeError(
+                    "Execution precondition failed: rollback target changed"
+                )
+            target = next(
+                (
+                    item
+                    for item in summaries
+                    if int(item["revision"]) == int(rollback_target["revision"])
+                ),
+                None,
+            )
+            expected_proof = rollback_target.get("health_proof")
+            actual_proof = target.get("health_proof") if target else None
+            proof_identity = (
+                {
+                    "subject": actual_proof.get("subject"),
+                    "version": actual_proof.get("version"),
+                    "verified_at": actual_proof.get("verified_at"),
+                    "verifier": actual_proof.get("verifier"),
+                }
+                if isinstance(actual_proof, dict)
+                else None
+            )
+            if (
+                target is None
+                or target["uid"] != rollback_target.get("replica_set_uid")
+                or not isinstance(actual_proof, dict)
+                or actual_proof.get("valid") is not True
+                or actual_proof.get("status") != "healthy"
+                or proof_identity != expected_proof
+            ):
+                raise RuntimeError(
+                    "Execution precondition failed: rollback health proof changed"
+                )
+        return deployment, owned
+
     def _tool_inject_demo_fault(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Inject the portfolio demo fault without exposing it as an Agent tool."""
         name = arguments.get("name", "inventory-service")
@@ -400,7 +535,11 @@ class KubernetesBackend:
 
     def _tool_restart_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
+        deployment, _ = self._validated_write_context(
+            name, arguments, "restart_deployment"
+        )
         body = {
+            "metadata": {"resourceVersion": deployment.metadata.resource_version},
             "spec": {
                 "template": {
                     "metadata": {
@@ -475,15 +614,11 @@ class KubernetesBackend:
     def _tool_rollback_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         target_revision = int(arguments["revision"])
-        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        deployment, owned = self._validated_write_context(
+            name, arguments, "rollback_deployment"
+        )
         if deployment.spec.paused:
             raise RuntimeError("Cannot rollback a paused deployment")
-
-        replica_sets = self.apps.list_namespaced_replica_set(
-            self.namespace,
-            label_selector=f"app={name}",
-        )
-        owned = self._owned_replica_sets(deployment, replica_sets.items)
         target = next(
             (
                 replica_set
@@ -523,7 +658,15 @@ class KubernetesBackend:
     def _tool_scale_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         replicas = int(arguments["replicas"])
+        deployment, _ = self._validated_write_context(
+            name, arguments, "scale_deployment"
+        )
         self.apps.patch_namespaced_deployment_scale(
-            name, self.namespace, {"spec": {"replicas": replicas}}
+            name,
+            self.namespace,
+            {
+                "metadata": {"resourceVersion": deployment.metadata.resource_version},
+                "spec": {"replicas": replicas},
+            },
         )
         return {"deployment": name, "replicas": replicas}

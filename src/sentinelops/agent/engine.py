@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -49,6 +50,7 @@ NODE_PRESENTATION = {
     "plan": ("生成安全修复方案", "正在选择白名单内的可逆操作", "graph"),
     "prepare_approval": ("评估操作风险", "正在根据策略决定是否需要人工批准", "policy"),
     "human_gate": ("等待人工审批", "高风险操作必须由运维人员明确确认", "policy"),
+    "preflight": ("执行前重新校验", "正在确认审批期间集群状态没有变化", "policy"),
     "execute": ("执行修复操作", "正在通过白名单工具修改目标工作负载", "graph"),
     "verify": ("验证服务恢复", "正在检查 Pod、流量、错误率、告警和 Trace", "verification"),
     "postmortem": ("生成事故报告", "正在整理根因、动作与恢复证据", "graph"),
@@ -137,6 +139,7 @@ class IncidentAgent:
             self._traced_node("prepare_approval", self._prepare_approval),
         )
         builder.add_node("human_gate", self._traced_node("human_gate", self._human_gate))
+        builder.add_node("preflight", self._traced_node("preflight", self._preflight))
         builder.add_node("execute", self._traced_node("execute", self._execute))
         builder.add_node("verify", self._traced_node("verify", self._verify))
         builder.add_node("postmortem", self._traced_node("postmortem", self._postmortem))
@@ -159,14 +162,27 @@ class IncidentAgent:
         builder.add_conditional_edges(
             "prepare_approval",
             self._route_approval,
-            {"human_gate": "human_gate", "execute": "execute"},
+            {
+                "human_gate": "human_gate",
+                "preflight": "preflight",
+                "postmortem": "postmortem",
+            },
         )
         builder.add_conditional_edges(
             "human_gate",
-            lambda state: "execute" if state.get("approved") else "end",
-            {"execute": "execute", "end": END},
+            lambda state: "preflight" if state.get("approved") else "end",
+            {"preflight": "preflight", "end": END},
         )
-        builder.add_edge("execute", "verify")
+        builder.add_conditional_edges(
+            "preflight",
+            self._route_after_preflight,
+            {"execute": "execute", "postmortem": "postmortem"},
+        )
+        builder.add_conditional_edges(
+            "execute",
+            self._route_after_execute,
+            {"verify": "verify", "postmortem": "postmortem"},
+        )
         builder.add_edge("verify", "postmortem")
         builder.add_edge("postmortem", END)
         return builder.compile(checkpointer=self.checkpointer)
@@ -272,11 +288,12 @@ class IncidentAgent:
                 )
                 raise
             self._apply_progress_update(state["incident_id"], output)
-            final_status = (
-                "blocked"
-                if name == "human_gate" and not output.get("approved")
-                else "completed"
+            blocked = (
+                name == "human_gate" and not output.get("approved")
+            ) or (
+                name == "preflight" and not output.get("preflight_passed")
             )
+            final_status = "blocked" if blocked else "completed"
             self._finish_step(
                 state["incident_id"],
                 step_id,
@@ -382,6 +399,7 @@ class IncidentAgent:
         key: str,
         tool_name: str,
         arguments: dict[str, Any],
+        precondition: dict[str, Any] | None = None,
     ) -> ToolResult:
         parent_id = self._node_step_id(parent_name, state)
         step_id = f"{parent_id}:tool:{key}"
@@ -405,7 +423,11 @@ class IncidentAgent:
             ),
             active_step_id=step_id,
         )
-        result = await self.tools.call(tool_name, arguments)
+        result = (
+            await self.tools.call_guarded(tool_name, arguments, precondition)
+            if precondition is not None
+            else await self.tools.call(tool_name, arguments)
+        )
         self._finish_step(
             state["incident_id"],
             step_id,
@@ -1348,8 +1370,192 @@ class IncidentAgent:
             and proof.get("status") == "healthy"
         )
 
+    @staticmethod
+    def _action_fingerprint(action: RemediationAction) -> str:
+        payload = json.dumps(
+            action.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+    @staticmethod
+    def _active_revision(rollout: dict[str, Any]) -> dict[str, Any] | None:
+        revisions = rollout.get("revisions", [])
+        try:
+            declared_current = int(rollout.get("current_revision", 0))
+        except (TypeError, ValueError):
+            declared_current = 0
+        if declared_current > 0:
+            exact = next(
+                (
+                    revision
+                    for revision in revisions
+                    if int(revision.get("revision", 0)) == declared_current
+                ),
+                None,
+            )
+            if exact is not None:
+                return exact
+        active = [
+            revision
+            for revision in revisions
+            if (revision.get("replicas") or 0) > 0
+            or (revision.get("ready_replicas") or 0) > 0
+            or str(revision.get("status", "")).lower() in {"failed", "active", "current"}
+        ]
+        if not active:
+            return None
+        return max(active, key=lambda revision: int(revision.get("revision", 0)))
+
+    @classmethod
+    def _build_preflight_snapshot(
+        cls,
+        action: RemediationAction,
+        rollout: dict[str, Any],
+    ) -> dict[str, Any]:
+        required = (
+            "namespace",
+            "deployment_uid",
+            "generation",
+            "resource_version",
+            "desired_replicas",
+            "paused",
+        )
+        missing = [key for key in required if rollout.get(key) in {None, ""}]
+        if missing:
+            raise ValueError(f"rollout 缺少 {', '.join(missing)}")
+        if int(rollout.get("observed_generation") or 0) != int(rollout["generation"]):
+            raise ValueError("Deployment controller 尚未观察到当前 generation")
+        current = cls._active_revision(rollout)
+        if current is None:
+            raise ValueError("rollout 无法确定当前 revision")
+        if not current.get("uid") or not current.get("template_hash"):
+            raise ValueError("当前 revision 缺少 ReplicaSet UID 或 template hash")
+        captured_at = datetime.now(UTC)
+        snapshot: dict[str, Any] = {
+            "action_fingerprint": cls._action_fingerprint(action),
+            "tool_name": action.tool_name,
+            "target": action.arguments.get("name"),
+            "namespace": str(rollout["namespace"]),
+            "deployment_uid": str(rollout["deployment_uid"]),
+            "generation": int(rollout["generation"]),
+            "resource_version": str(rollout["resource_version"]),
+            "desired_replicas": int(rollout["desired_replicas"]),
+            "paused": bool(rollout["paused"]),
+            "current_revision": int(current.get("revision", 0)),
+            "current_replica_set_uid": str(current["uid"]),
+            "current_template_hash": str(current["template_hash"]),
+            "captured_at": captured_at.isoformat(),
+            "expires_at": (captured_at + timedelta(minutes=15)).isoformat(),
+        }
+        if action.tool_name == "rollback_deployment":
+            requested_revision = int(action.arguments["revision"])
+            target = next(
+                (
+                    revision
+                    for revision in rollout.get("revisions", [])
+                    if int(revision.get("revision", 0)) == requested_revision
+                ),
+                None,
+            )
+            if target is None or not cls._revision_is_known_healthy(target):
+                raise ValueError("rollback 目标不存在或健康证明无效")
+            proof = target["health_proof"]
+            target_uid = target.get("uid")
+            proof_subject = proof.get("subject")
+            if not target_uid or not proof_subject:
+                raise ValueError("rollback 目标缺少 ReplicaSet UID 或 proof subject")
+            snapshot["rollback_target"] = {
+                "revision": requested_revision,
+                "replica_set_uid": str(target_uid),
+                "health_proof": {
+                    "subject": str(proof_subject),
+                    "version": proof.get("version"),
+                    "verified_at": proof.get("verified_at"),
+                    "verifier": proof.get("verifier"),
+                },
+            }
+        return snapshot
+
+    @staticmethod
+    def _snapshot_semantics(snapshot: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: snapshot.get(key)
+            for key in (
+                "action_fingerprint",
+                "tool_name",
+                "target",
+                "namespace",
+                "deployment_uid",
+                "generation",
+                "desired_replicas",
+                "paused",
+                "current_revision",
+                "current_replica_set_uid",
+                "current_template_hash",
+                "rollback_target",
+            )
+        }
+
+    def _fresh_plan_feedback(
+        self,
+        state: IncidentState,
+        plan: RemediationPlan,
+        rollout: dict[str, Any],
+        *,
+        evidence_id: str,
+    ) -> str | None:
+        fresh_state = dict(state)
+        observations = dict(state.get("observations", {}))
+        observations["rollout"] = rollout
+        catalog = dict(observations.get("evidence_catalog", {}))
+        catalog[evidence_id] = EvidenceCatalogEntry(
+            evidence_id=evidence_id,
+            source="kubernetes_rollout",
+            tool="get_rollout_history",
+            success=True,
+        ).model_dump(mode="json")
+        observations["evidence_catalog"] = catalog
+        fresh_state["observations"] = observations
+        allowed_targets = {
+            state["alert"]["service"],
+            *self.runbook.additional_remediation_targets(fresh_state),
+        }
+        return self._host_plan_feedback(
+            fresh_state,
+            plan,
+            {spec.name: spec for spec in self.tools.list_specs()},
+            allowed_targets=allowed_targets,
+        )
+
     async def _prepare_approval(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
+        rollout = await self._call_tool_traced(
+            state,
+            parent_name="prepare_approval",
+            key="rollout",
+            tool_name="get_rollout_history",
+            arguments={"name": action.arguments["name"]},
+        )
+        if not rollout.success:
+            return self._preflight_rejected(
+                f"进入审批前无法读取最新 rollout history：{rollout.error or 'unknown error'}"
+            )
+        plan = RemediationPlan.model_validate(state["plan"])
+        feedback = self._fresh_plan_feedback(
+            state,
+            plan,
+            rollout.content,
+            evidence_id="prepare_approval:1:tool:rollout",
+        )
+        if feedback is not None:
+            return self._preflight_rejected(f"进入审批前修复方案已过期：{feedback}")
+        try:
+            snapshot = self._build_preflight_snapshot(action, rollout.content)
+        except (TypeError, ValueError) as exc:
+            return self._preflight_rejected(f"进入审批前无法建立可信快照：{exc}")
         if not self.policy.requires_approval(action):
             risk_label = {
                 RiskLevel.READ_ONLY: "只读",
@@ -1361,6 +1567,7 @@ class IncidentAgent:
             return {
                 "approved": True,
                 "approval_request": None,
+                "preflight_snapshot": snapshot,
                 "timeline": [
                     _event(
                         "approval.auto_approved",
@@ -1374,10 +1581,13 @@ class IncidentAgent:
             incident_id=state["incident_id"],
             action=action,
             reason=f"{action.risk.value} 风险操作需要人工明确批准",
+            preflight_snapshot=snapshot,
+            expires_at=datetime.fromisoformat(snapshot["expires_at"]),
         )
         return {
             "status": IncidentStatus.AWAITING_APPROVAL.value,
             "approval_request": request.model_dump(mode="json"),
+            "preflight_snapshot": snapshot,
             "timeline": [
                 _event(
                     "approval.requested",
@@ -1389,7 +1599,9 @@ class IncidentAgent:
         }
 
     def _route_approval(self, state: IncidentState) -> str:
-        return "human_gate" if state.get("approval_request") else "execute"
+        if state.get("status") == IncidentStatus.ESCALATED.value:
+            return "postmortem"
+        return "human_gate" if state.get("approval_request") else "preflight"
 
     async def _human_gate(self, state: IncidentState) -> dict[str, Any]:
         decision = interrupt(state["approval_request"])
@@ -1408,6 +1620,90 @@ class IncidentAgent:
             ],
         }
 
+    async def _preflight(self, state: IncidentState) -> dict[str, Any]:
+        action = RemediationAction.model_validate(state["plan"]["actions"][0])
+        expected = state.get("preflight_snapshot")
+        if not isinstance(expected, dict):
+            return self._preflight_rejected("规划阶段没有生成可信集群快照")
+        if self._action_fingerprint(action) != expected.get("action_fingerprint"):
+            return self._preflight_rejected("审批绑定的修复动作已经发生变化")
+        try:
+            expires_at = datetime.fromisoformat(str(expected["expires_at"]))
+        except (KeyError, ValueError):
+            return self._preflight_rejected("审批快照缺少合法的过期时间")
+        if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at.astimezone(UTC):
+            return self._preflight_rejected("审批已过期")
+
+        result = await self._call_tool_traced(
+            state,
+            parent_name="preflight",
+            key="rollout",
+            tool_name="get_rollout_history",
+            arguments={"name": action.arguments["name"]},
+        )
+        if not result.success:
+            return self._preflight_rejected(
+                f"无法重新读取最新 rollout history：{result.error or 'unknown error'}"
+            )
+        try:
+            current = self._build_preflight_snapshot(action, result.content)
+        except (TypeError, ValueError) as exc:
+            return self._preflight_rejected(f"最新 rollout 无法通过安全校验：{exc}")
+        expected_semantics = self._snapshot_semantics(expected)
+        current_semantics = self._snapshot_semantics(current)
+        changed = [
+            key
+            for key in expected_semantics
+            if current_semantics.get(key) != expected_semantics.get(key)
+        ]
+        if changed:
+            return self._preflight_rejected(
+                "审批期间集群状态已变化：" + ", ".join(changed)
+            )
+
+        plan = RemediationPlan.model_validate(state["plan"])
+        feedback = self._fresh_plan_feedback(
+            state,
+            plan,
+            result.content,
+            evidence_id="preflight:1:tool:rollout",
+        )
+        if feedback is not None:
+            return self._preflight_rejected(f"最新状态不再允许原修复方案：{feedback}")
+        return {
+            "preflight_passed": True,
+            "execution_precondition": current,
+            "timeline": [
+                _event(
+                    "remediation.preflight_passed",
+                    "执行前校验通过，审批绑定的集群状态未发生变化",
+                    deployment_uid=current["deployment_uid"],
+                    generation=current["generation"],
+                    current_revision=current["current_revision"],
+                )
+            ],
+        }
+
+    @staticmethod
+    def _preflight_rejected(reason: str) -> dict[str, Any]:
+        return {
+            "preflight_passed": False,
+            "approved": False,
+            "approval_request": None,
+            "status": IncidentStatus.ESCALATED.value,
+            "timeline": [
+                _event(
+                    "approval.invalidated",
+                    "审批后的集群状态校验未通过，旧计划已失效且未执行写操作",
+                    reason=reason,
+                )
+            ],
+        }
+
+    @staticmethod
+    def _route_after_preflight(state: IncidentState) -> str:
+        return "execute" if state.get("preflight_passed") else "postmortem"
+
     async def _execute(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         self.policy.validate(action)
@@ -1417,19 +1713,49 @@ class IncidentAgent:
             key=action.tool_name,
             tool_name=action.tool_name,
             arguments=action.arguments,
+            precondition=state.get("execution_precondition"),
         )
+        guard_failed = bool(
+            not result.success
+            and result.error
+            and (
+                "Execution precondition failed" in result.error
+                or "resourceVersion" in result.error
+                or "409" in result.error
+            )
+        )
+        status = (
+            IncidentStatus.REMEDIATING.value
+            if result.success
+            else (
+                IncidentStatus.ESCALATED.value
+                if guard_failed
+                else IncidentStatus.FAILED.value
+            )
+        )
+        timeline = [
+            _event(
+                "approval.invalidated" if guard_failed else "action.executed",
+                (
+                    "写入前集群状态再次变化，旧审批已失效且没有完成写操作"
+                    if guard_failed
+                    else f"{action.tool_name}：{'执行成功' if result.success else '执行失败'}"
+                ),
+                **({"reason": result.error} if guard_failed else {}),
+            )
+        ]
         return {
-            "status": (
-                IncidentStatus.REMEDIATING.value if result.success else IncidentStatus.FAILED.value
-            ),
+            "status": status,
+            "preflight_passed": False if guard_failed else state.get("preflight_passed"),
+            "approval_request": None if guard_failed else state.get("approval_request"),
             "execution_results": [result.model_dump(mode="json")],
-            "timeline": [
-                _event(
-                    "action.executed",
-                    f"{action.tool_name}：{'执行成功' if result.success else '执行失败'}",
-                )
-            ],
+            "timeline": timeline,
         }
+
+    @staticmethod
+    def _route_after_execute(state: IncidentState) -> str:
+        results = state.get("execution_results", [])
+        return "verify" if results and results[-1].get("success") is True else "postmortem"
 
     async def _verify(self, state: IncidentState) -> dict[str, Any]:
         service = state["alert"]["service"]
@@ -1639,12 +1965,21 @@ class IncidentAgent:
         changes = state.get("observations", {}).get("changes")
         if isinstance(changes, dict):
             record.change_evidence = changes
-        if state.get("plan"):
+        if (
+            state.get("status") == IncidentStatus.ESCALATED.value
+            and state.get("preflight_passed") is False
+        ):
+            record.plan = None
+        elif state.get("plan"):
             record.plan = RemediationPlan.model_validate(state["plan"])
         elif state.get("status") == IncidentStatus.ESCALATED.value:
             record.plan = None
-        if state.get("approval_request"):
-            record.approval = ApprovalRequest.model_validate(state["approval_request"])
+        if "approval_request" in state:
+            record.approval = (
+                ApprovalRequest.model_validate(state["approval_request"])
+                if state["approval_request"]
+                else None
+            )
         record.execution_results = [
             ToolResult.model_validate(item) for item in state.get("execution_results", [])
         ]
