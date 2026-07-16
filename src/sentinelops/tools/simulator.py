@@ -68,13 +68,40 @@ class SimulatedKubernetesBackend:
         return {"scenario": self.scenario, "lines": lines}
 
     def _tool_get_rollout_history(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.scenario != "bad_rollout":
+            revisions = [
+                {
+                    "revision": 1,
+                    "image": "order-service:1.0.0",
+                    "replicas": 1,
+                    "ready_replicas": 1,
+                    "status": "stable",
+                    "health_status": "healthy",
+                }
+            ]
+        else:
+            revisions = [
+                {
+                    "revision": 1,
+                    "image": "order-service:1.0.0",
+                    "replicas": 0,
+                    "ready_replicas": 0,
+                    "status": "stable",
+                    "health_status": "healthy",
+                },
+                {
+                    "revision": 2,
+                    "image": "order-service:1.1.0",
+                    "replicas": 1,
+                    "ready_replicas": 0,
+                    "status": "failed",
+                    "health_status": "unhealthy",
+                },
+            ]
         return {
             "scenario": self.scenario,
             "current_revision": self.current_revision,
-            "revisions": [
-                {"revision": 1, "image": "order-service:1.0.0", "status": "stable"},
-                {"revision": 2, "image": "order-service:1.1.0", "status": "failed"},
-            ],
+            "revisions": revisions,
         }
 
     def _tool_get_service_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:

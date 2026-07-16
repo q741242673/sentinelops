@@ -46,7 +46,7 @@ class ReflectionProvider:
             self.diagnosis_calls += 1
             confidence = 0.95 if self.recover_confidence and self.diagnosis_calls > 1 else 0.55
             return Diagnosis(
-                root_cause="最新发布可能导致服务启动失败",
+                root_cause="最新发布引入错误配置",
                 confidence=confidence,
                 hypotheses=[
                     Hypothesis(
@@ -187,7 +187,7 @@ class InvalidEvidenceProvider:
                     )
                 ]
             return Diagnosis(
-                root_cause="模型声称已确认根因",
+                root_cause="结构合法但证据无效的主假设",
                 confidence=0.99,
                 hypotheses=[
                     Hypothesis(
@@ -214,6 +214,38 @@ class InvalidEvidenceProvider:
             self.plan_calls += 1
             raise AssertionError("无效证据不得进入修复规划")
         raise TypeError(schema)
+
+
+class MismatchedRootFieldsProvider(RuleBasedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.diagnosis_calls = 0
+        self.review_calls = 0
+        self.plan_calls = 0
+
+    async def structured(self, *, system, prompt, schema, metadata=None):
+        if schema is RemediationPlan:
+            self.plan_calls += 1
+            raise AssertionError("未绑定主假设的根因不得进入修复规划")
+        result = await super().structured(
+            system=system,
+            prompt=prompt,
+            schema=schema,
+            metadata=metadata,
+        )
+        if schema is Diagnosis:
+            self.diagnosis_calls += 1
+            primary = result.hypotheses[0].model_copy(update={"confidence": 0.05})
+            return result.model_copy(
+                update={
+                    "root_cause": "没有证据支持的数据库损坏",
+                    "confidence": 0.99,
+                    "hypotheses": [primary],
+                }
+            )
+        if schema is DiagnosisReview:
+            self.review_calls += 1
+        return result
 
 
 class FailedLogSimulator(RecordingSimulator):
@@ -392,6 +424,36 @@ async def test_invalid_model_evidence_escalates_without_planning_or_writes(mode:
     )
     assert record.diagnosis_review is not None
     assert record.diagnosis_review.missing_evidence
+
+
+@pytest.mark.asyncio
+async def test_unbound_root_cause_and_confidence_cannot_enter_planning() -> None:
+    provider = MismatchedRootFieldsProvider()
+    backend = RecordingSimulator()
+    agent = IncidentAgent(
+        provider=provider,
+        tools=ToolRegistry(backend),
+        auto_approve_max_risk=RiskLevel.CRITICAL,
+    )
+
+    record = await agent.start(make_alert())
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.reflection_rounds == 1
+    assert record.plan is None
+    assert provider.diagnosis_calls == 2
+    assert provider.review_calls == 1
+    assert provider.plan_calls == 0
+    assert record.diagnosis_review is not None
+    assert "顶层 root_cause 与有证据的主假设 statement 不一致" in (
+        record.diagnosis_review.missing_evidence
+    )
+    assert "顶层 confidence 与有证据的主假设 confidence 不一致" in (
+        record.diagnosis_review.missing_evidence
+    )
+    assert not {"restart_deployment", "rollback_deployment", "scale_deployment"}.intersection(
+        backend.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -784,11 +846,13 @@ def test_restart_is_rejected_when_it_preserves_a_faulty_rollout() -> None:
                         "revision": 5,
                         "replicas": 0,
                         "change_cause": "healthy-baseline",
+                        "health_status": "healthy",
                     },
                     {
                         "revision": 6,
                         "replicas": 1,
-                        "change_cause": "enable-every-third-inventory-failure",
+                        "change_cause": "routine-config-change",
+                        "health_status": "unhealthy",
                     },
                 ]
             }
@@ -844,6 +908,7 @@ def test_unknown_rollback_revision_is_rejected_in_favor_of_exact_prior() -> None
                         "revision": 11,
                         "replicas": 0,
                         "change_cause": "healthy-baseline",
+                        "health_status": "healthy",
                     },
                     {"revision": 12, "replicas": 1, "change_cause": "enable-failure"},
                 ]
@@ -934,6 +999,35 @@ def test_rollback_without_positive_health_marker_fails_closed() -> None:
     assert "没有可信健康标记" in feedback
 
 
+@pytest.mark.parametrize(
+    "revision",
+    [
+        {"change_cause": "unhealthy-release"},
+        {"change_cause": "unstable-config"},
+        {"change_cause": "not-healthy"},
+        {"change_cause": "healthy-baseline"},
+        {"health_status": "unhealthy", "change_cause": "healthy-baseline"},
+        {"health_status": "unknown"},
+        {"health_status": "HEALTHY"},
+        {"health_status": "stable"},
+        {},
+    ],
+)
+def test_revision_health_never_uses_free_text_or_unknown_values(
+    revision: dict,
+) -> None:
+    assert IncidentAgent._revision_is_known_healthy(revision) is False
+
+
+def test_exact_structured_health_status_overrides_misleading_free_text() -> None:
+    revision = {
+        "health_status": "healthy",
+        "change_cause": "unhealthy-release",
+    }
+
+    assert IncidentAgent._revision_is_known_healthy(revision) is True
+
+
 def test_unsorted_hypothesis_cannot_lend_evidence_to_root_cause() -> None:
     state = {
         "observations": {
@@ -986,6 +1080,82 @@ def test_unsorted_hypothesis_cannot_lend_evidence_to_root_cause() -> None:
 
     assert "诊断假设未按置信度从高到低排列" in issues
     assert "主假设至少需要两个独立且采集成功的证据来源" in issues
+
+
+@pytest.mark.parametrize(
+    ("root_cause", "confidence", "expected_issue", "unexpected_issue"),
+    [
+        (
+            "没有证据支持的另一个根因",
+            0.95,
+            "顶层 root_cause 与有证据的主假设 statement 不一致",
+            "顶层 confidence 与有证据的主假设 confidence 不一致",
+        ),
+        (
+            "有两条合法证据支持的根因",
+            0.99,
+            "顶层 confidence 与有证据的主假设 confidence 不一致",
+            "顶层 root_cause 与有证据的主假设 statement 不一致",
+        ),
+    ],
+)
+def test_root_cause_and_confidence_binding_rules_are_independent(
+    root_cause: str,
+    confidence: float,
+    expected_issue: str,
+    unexpected_issue: str,
+) -> None:
+    state = {
+        "observations": {
+            "evidence_catalog": {
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                },
+                "events": {
+                    "evidence_id": "events",
+                    "source": "kubernetes_events",
+                    "tool": "list_events",
+                    "success": True,
+                },
+            }
+        }
+    }
+    diagnosis = Diagnosis(
+        root_cause=root_cause,
+        confidence=confidence,
+        hypotheses=[
+            Hypothesis(
+                statement="有两条合法证据支持的根因",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="rollout",
+                        source="kubernetes_rollout",
+                        query="get_rollout_history",
+                        finding="发布历史支持根因",
+                    ),
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件支持根因",
+                    ),
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+
+    assert expected_issue in issues
+    assert unexpected_issue not in issues
+    assert "主假设至少需要两个独立且采集成功的证据来源" not in issues
 
 
 @pytest.mark.parametrize(

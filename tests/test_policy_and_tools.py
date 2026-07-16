@@ -136,3 +136,16 @@ def test_rule_provider_infers_bad_rollout_from_live_cluster_evidence() -> None:
     }
 
     assert RuleBasedProvider._infer_scenario(observations) == "bad_rollout"
+
+
+@pytest.mark.asyncio
+async def test_simulator_rollout_uses_structured_health_status() -> None:
+    backend = SimulatedKubernetesBackend(scenario="bad_rollout")
+
+    result = await backend.call("get_rollout_history", {"name": "order-service"})
+
+    assert result.success is True
+    assert [item["health_status"] for item in result.content["revisions"]] == [
+        "healthy",
+        "unhealthy",
+    ]

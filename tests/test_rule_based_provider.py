@@ -75,6 +75,8 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
     )
 
     assert "revision 12" in diagnosis.root_cause.lower()
+    assert diagnosis.root_cause == diagnosis.hypotheses[0].statement
+    assert diagnosis.confidence == diagnosis.hypotheses[0].confidence
     assert {item.source for item in diagnosis.hypotheses[0].evidence} == {
         "kubernetes_logs",
         "prometheus",

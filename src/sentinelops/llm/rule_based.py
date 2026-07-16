@@ -126,7 +126,6 @@ class RuleBasedProvider:
                 ),
             ]
             root_cause = "库存服务进程内的瞬态故障状态导致所有预留请求返回 HTTP 503"
-            hypothesis = "进程内异常状态而非发布变更导致库存服务不可用"
         elif scenario == "inventory_faulty_rollout":
             candidates = [
                 ("get_pod_logs", "logs", "库存服务日志记录了合成的预留超时"),
@@ -143,7 +142,6 @@ class RuleBasedProvider:
             root_cause = (
                 f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
             )
-            hypothesis = "最新的库存服务配置发布引入了 HTTP 503 错误"
         elif scenario == "bad_rollout":
             candidates = [
                 ("list_events", "events", "新 Pod 在发布后立即进入 CrashLoopBackOff"),
@@ -155,7 +153,6 @@ class RuleBasedProvider:
                 ("get_pod_logs", "logs", "Pod 日志显示发布后的启动配置错误"),
             ]
             root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
-            hypothesis = "最新一次发布引入了本次事故"
         else:
             candidates = [
                 ("get_pod_logs", "logs", "请求在获取数据库连接时失败"),
@@ -163,7 +160,6 @@ class RuleBasedProvider:
                 ("list_pods", "pods", "Pod 仍可运行但请求处理能力下降"),
             ]
             root_cause = "订单服务的数据库连接池已耗尽"
-            hypothesis = "订单服务耗尽了可用数据库连接"
 
         evidence = [
             reference
@@ -197,7 +193,7 @@ class RuleBasedProvider:
         return Diagnosis(
             root_cause=root_cause,
             confidence=0.94,
-            hypotheses=[Hypothesis(statement=hypothesis, confidence=0.94, evidence=evidence)],
+            hypotheses=[Hypothesis(statement=root_cause, confidence=0.94, evidence=evidence)],
             evidence_summary=[item.finding for item in evidence],
         )
 

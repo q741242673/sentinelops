@@ -10,9 +10,17 @@ def ns(**values):
     return SimpleNamespace(**values)
 
 
-def replica_set(revision: int, *, owner_uid: str = "deployment-uid"):
+def replica_set(
+    revision: int,
+    *,
+    owner_uid: str = "deployment-uid",
+    health_status: str | None = None,
+):
+    template_annotations = {"sentinelops.io/version": f"1.{revision}.0"}
+    if health_status is not None:
+        template_annotations["sentinelops.io/health-status"] = health_status
     template = ns(
-        metadata=ns(annotations={"sentinelops.io/version": f"1.{revision}.0"}),
+        metadata=ns(annotations=template_annotations),
         spec=ns(containers=[ns(name="order-service", image=f"order:{revision}")]),
     )
     return ns(
@@ -40,6 +48,23 @@ def test_owned_replica_sets_are_filtered_and_sorted() -> None:
         "order-service-2",
     ]
     assert KubernetesBackend._replica_set_summary(result[0])["change_cause"] is None
+    assert KubernetesBackend._replica_set_summary(result[0])["health_status"] == "unknown"
+
+
+def test_replica_set_health_status_is_a_controlled_value() -> None:
+    healthy = KubernetesBackend._replica_set_summary(
+        replica_set(1, health_status="healthy")
+    )
+    unhealthy = KubernetesBackend._replica_set_summary(
+        replica_set(2, health_status="unhealthy")
+    )
+    invalid = KubernetesBackend._replica_set_summary(
+        replica_set(3, health_status="not-healthy")
+    )
+
+    assert healthy["health_status"] == "healthy"
+    assert unhealthy["health_status"] == "unhealthy"
+    assert invalid["health_status"] == "unknown"
 
 
 def test_rollback_restores_target_template_with_resource_version_guard() -> None:
@@ -105,6 +130,9 @@ def test_demo_fault_injection_patches_failure_rate_and_waits_for_rollout() -> No
     assert result["fault_active"] is True
     assert result["revision"] == 5
     body = backend.apps.patch_namespaced_deployment.call_args.args[2]
+    assert body["spec"]["template"]["metadata"]["annotations"][
+        "sentinelops.io/health-status"
+    ] == "unhealthy"
     assert body["spec"]["template"]["spec"]["containers"][0]["env"] == [
         {"name": "FAIL_EVERY", "value": "3"}
     ]
@@ -139,6 +167,9 @@ def test_reset_demo_baseline_sets_known_healthy_config() -> None:
     template = body["spec"]["template"]
     assert template["metadata"]["annotations"]["sentinelops.io/change-cause"] == (
         "healthy-baseline"
+    )
+    assert template["metadata"]["annotations"]["sentinelops.io/health-status"] == (
+        "healthy"
     )
     assert template["spec"]["containers"][0]["env"] == [
         {"name": "FAIL_EVERY", "value": "0"}

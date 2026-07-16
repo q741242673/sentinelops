@@ -29,6 +29,7 @@ spec:
       annotations:
         sentinelops.io/version: "1.0.0"
         sentinelops.io/change-cause: "healthy-baseline"
+        sentinelops.io/health-status: "healthy"
     spec:
       containers:
         - name: order-service

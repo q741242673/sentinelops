@@ -168,11 +168,15 @@ class KubernetesBackend:
         annotations = replica_set.metadata.annotations or {}
         template_annotations = replica_set.spec.template.metadata.annotations or {}
         containers = replica_set.spec.template.spec.containers or []
+        health_status = template_annotations.get("sentinelops.io/health-status")
+        if health_status not in {"healthy", "unhealthy"}:
+            health_status = "unknown"
         return {
             "name": replica_set.metadata.name,
             "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
             "images": [container.image for container in containers],
             "change_cause": template_annotations.get("sentinelops.io/change-cause"),
+            "health_status": health_status,
             "git_commit": template_annotations.get("sentinelops.io/git-commit"),
             "repository": template_annotations.get("sentinelops.io/repository"),
             "source_path": template_annotations.get("sentinelops.io/source-path"),
@@ -225,6 +229,7 @@ class KubernetesBackend:
                             "sentinelops.io/change-cause": (
                                 "enable-every-third-inventory-failure"
                             ),
+                            "sentinelops.io/health-status": "unhealthy",
                             "sentinelops.io/fault-injected-at": injected_at,
                         }
                     },
@@ -298,6 +303,7 @@ class KubernetesBackend:
                     "metadata": {
                         "annotations": {
                             "sentinelops.io/change-cause": "healthy-baseline",
+                            "sentinelops.io/health-status": "healthy",
                             "sentinelops.io/baseline-restored-at": restored_at,
                         }
                     },

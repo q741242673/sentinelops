@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -534,7 +535,8 @@ class IncidentAgent:
                 "的 evidence_id，并原样复制该目录项的 source 和 tool 到 source、query；"
                 "不得引用失败、缺失或不存在的证据。"
                 "主假设必须至少引用两个独立且成功的 source，不能只靠模型自报置信度。"
-                "hypotheses 必须按置信度从高到低排列，第一项必须是 root_cause 对应的主假设。"
+                "hypotheses 必须按置信度从高到低排列；第一项是主假设，其 statement 必须与"
+                "root_cause 完全一致，其 confidence 必须与顶层 confidence 完全一致。"
                 "contradictions 只能填写真正反驳对应假设的证据；证据缺失或某类变更未发生，"
                 "只能影响与其直接相关的假设，不能机械视为其他假设的矛盾。"
                 "用于排除低置信度备选假设的反证必须保留在该备选假设中，不能把它写成主假设"
@@ -555,6 +557,8 @@ class IncidentAgent:
                         "你是技术内容本地化助手。必须把所有面向用户的文字字段翻译成简体中文，"
                         "不得修改事实、置信度、evidence_id、source、query、"
                         "supports_hypothesis、技术标识符、Kubernetes 资源名或工具名。"
+                        "翻译后 root_cause 必须与 hypotheses 第一项的 statement 完全一致，"
+                        "两者 confidence 也必须完全一致。"
                         "只返回符合指定结构的数据。"
                     ),
                     prompt=json.dumps(
@@ -821,7 +825,7 @@ class IncidentAgent:
         if primary is None:
             return True
         return (
-            diagnosis.confidence < self.diagnosis_confidence_threshold
+            primary.confidence < self.diagnosis_confidence_threshold
             or bool(self._diagnosis_contradictions(diagnosis))
             or any(not evidence.supports_hypothesis for evidence in primary.evidence)
         )
@@ -859,6 +863,15 @@ class IncidentAgent:
             return ["诊断没有主假设，无法验证证据"]
 
         issues: list[str] = []
+        if diagnosis.root_cause.strip() != primary.statement.strip():
+            issues.append("顶层 root_cause 与有证据的主假设 statement 不一致")
+        if not math.isclose(
+            diagnosis.confidence,
+            primary.confidence,
+            rel_tol=0,
+            abs_tol=1e-6,
+        ):
+            issues.append("顶层 confidence 与有证据的主假设 confidence 不一致")
         confidences = [hypothesis.confidence for hypothesis in diagnosis.hypotheses]
         if confidences != sorted(confidences, reverse=True):
             issues.append("诊断假设未按置信度从高到低排列")
@@ -1298,10 +1311,9 @@ class IncidentAgent:
                 )
             return None
 
-        change_cause = str(current.get("change_cause") or "").lower()
-        fault_markers = {"failure", "fault", "error", "broken", "timeout"}
-        if action.tool_name == "restart_deployment" and any(
-            marker in change_cause for marker in fault_markers
+        if (
+            action.tool_name == "restart_deployment"
+            and current.get("health_status") == "unhealthy"
         ):
             return (
                 f"restart_deployment 会保留可疑 revision {current_revision} "
@@ -1328,16 +1340,7 @@ class IncidentAgent:
 
     @staticmethod
     def _revision_is_known_healthy(revision: dict[str, Any]) -> bool:
-        if revision.get("healthy") is True:
-            return True
-        status = str(revision.get("status") or "").lower()
-        if status in {"stable", "healthy", "succeeded"}:
-            return True
-        if status in {"failed", "error", "broken"}:
-            return False
-        change_cause = str(revision.get("change_cause") or "").lower()
-        healthy_markers = {"healthy", "stable", "baseline"}
-        return any(marker in change_cause for marker in healthy_markers)
+        return revision.get("health_status") == "healthy"
 
     async def _prepare_approval(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
