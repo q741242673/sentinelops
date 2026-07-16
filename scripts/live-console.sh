@@ -41,8 +41,28 @@ wait_for_url() {
 start_port_forward() {
   local resource="$1"
   local ports="$2"
-  kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
-    port-forward "${resource}" "${ports}" >/dev/null 2>&1 &
+  (
+    child_pid=""
+
+    stop_port_forward() {
+      trap - EXIT INT TERM
+      if [[ -n "${child_pid}" ]]; then
+        kill "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
+      fi
+      exit 0
+    }
+
+    trap stop_port_forward EXIT INT TERM
+    while true; do
+      kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+        port-forward "${resource}" "${ports}" >/dev/null 2>&1 &
+      child_pid=$!
+      wait "${child_pid}" || true
+      child_pid=""
+      sleep 1
+    done
+  ) &
   PORT_FORWARD_PIDS="${PORT_FORWARD_PIDS} $!"
 }
 
