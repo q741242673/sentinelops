@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+import httpx
+import pytest
+
+from sentinelops.config import Settings
+from sentinelops.demo import (
+    _post_with_transport_retry,
+    _transient_fault_metric_is_active,
+    live_demo_alert,
+)
+
+
+def test_transient_fault_metric_requires_active_gauge() -> None:
+    inactive = (
+        '# HELP sentinelops_transient_runtime_fault Runtime fault\n'
+        'sentinelops_transient_runtime_fault{service="inventory-service"} 0.0\n'
+    )
+    active = inactive.replace(" 0.0", " 1.0")
+
+    assert _transient_fault_metric_is_active(inactive) is False
+    assert _transient_fault_metric_is_active(active) is True
+
+
+@pytest.mark.asyncio
+async def test_transient_fault_post_retries_port_forward_disconnect() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response",
+                request=request,
+            )
+        return httpx.Response(200, json={"fault_active": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await _post_with_transport_retry(client, "http://inventory.test/fault")
+
+    assert response.json() == {"fault_active": True}
+    assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_live_demo_alert_uses_prometheus_and_tempo_context() -> None:
+    trace_id = "0123456789abcdef0123456789abcdef"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/checkout":
+            return httpx.Response(502, json={"trace_id": trace_id})
+        if request.url.path == "/api/v1/alerts":
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "alerts": [
+                            {
+                                "state": "firing",
+                                "labels": {
+                                    "alertname": "HighInventoryErrorRate",
+                                    "namespace": "sentinelops-demo",
+                                    "service": "inventory-service",
+                                    "severity": "critical",
+                                },
+                                "annotations": {"summary": "Inventory SLO exceeded"},
+                            }
+                        ]
+                    }
+                },
+            )
+        if request.url.path == f"/api/traces/{trace_id}":
+            return httpx.Response(200, json={"batches": [{"scopeSpans": []}]})
+        return httpx.Response(404)
+
+    settings = Settings(
+        tool_backend="kubernetes",
+        demo_order_url="http://order.test",
+        prometheus_url="http://prometheus.test",
+        tempo_url="http://tempo.test",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        alert = await live_demo_alert(settings, client=client)
+
+    assert alert.service == "inventory-service"
+    assert alert.summary == "Inventory SLO exceeded"
+    assert alert.labels["trace_id"] == trace_id

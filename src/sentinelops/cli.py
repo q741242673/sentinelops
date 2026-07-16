@@ -8,19 +8,19 @@ import uvicorn
 
 from sentinelops.config import Settings, get_settings
 from sentinelops.domain import Alert, IncidentStatus
+from sentinelops.lab_profiles import build_simulated_lab_agent
 from sentinelops.runtime import build_agent
 
 
 async def run_demo(scenario: str, approve: bool) -> None:
     settings = Settings(tool_backend="simulator", model_provider="rule_based")
-    agent = build_agent(settings, scenario=scenario)
+    agent = build_simulated_lab_agent(settings, scenario=scenario)
     alert = Alert(
         name="HighOrderServiceErrorRate",
         namespace=settings.kubernetes_namespace,
         service="order-service",
         severity="critical",
         summary="Order service error rate exceeded the 5% SLO threshold",
-        labels={"scenario": scenario},
     )
     await run_incident(agent, alert, approve=approve)
 

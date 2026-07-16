@@ -5,6 +5,7 @@ from typing import Any
 from sentinelops.config import Settings
 from sentinelops.domain import RiskLevel, ToolResult
 from sentinelops.tools.base import CompositeBackend, ToolBackend, ToolSpec
+from sentinelops.tools.change import GitChangeBackend
 from sentinelops.tools.kubernetes import KubernetesBackend
 from sentinelops.tools.observability import ObservabilityBackend
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
@@ -76,6 +77,15 @@ OBSERVABILITY_TOOL_SPECS = [
     ),
 ]
 
+CHANGE_TOOL_SPECS = [
+    ToolSpec(
+        name="get_change_evidence",
+        description="Correlate Kubernetes rollout revisions with verified Git commits",
+        risk=RiskLevel.READ_ONLY,
+        input_schema={"required": ["service"]},
+    )
+]
+
 
 class ToolRegistry:
     def __init__(self, backend: ToolBackend, specs: list[ToolSpec] | None = None) -> None:
@@ -102,14 +112,16 @@ class ToolRegistry:
         return await self.backend.call(name, arguments)
 
 
-def build_tool_registry(settings: Settings, *, scenario: str = "bad_rollout") -> ToolRegistry:
+def build_tool_registry(settings: Settings) -> ToolRegistry:
     if settings.tool_backend == "simulator":
-        return ToolRegistry(SimulatedKubernetesBackend(scenario=scenario))
-
-    kubernetes = KubernetesBackend(namespace=settings.kubernetes_namespace)
+        kubernetes: ToolBackend = SimulatedKubernetesBackend()
+    else:
+        kubernetes = KubernetesBackend(namespace=settings.kubernetes_namespace)
     specs = list(KUBERNETES_TOOL_SPECS)
     routes: dict[str, ToolBackend] = {spec.name: kubernetes for spec in KUBERNETES_TOOL_SPECS}
-    if settings.prometheus_url or settings.loki_url or settings.tempo_url:
+    if settings.tool_backend == "kubernetes" and (
+        settings.prometheus_url or settings.loki_url or settings.tempo_url
+    ):
         observability = ObservabilityBackend(
             prometheus_url=settings.prometheus_url,
             loki_url=settings.loki_url,
@@ -125,4 +137,13 @@ def build_tool_registry(settings: Settings, *, scenario: str = "bad_rollout") ->
             if configured[spec.name]:
                 specs.append(spec)
                 routes[spec.name] = observability
+    if settings.change_repository_path:
+        changes = GitChangeBackend(
+            settings.change_repository_path,
+            kubernetes,
+            history_hours=settings.change_history_hours,
+            history_limit=settings.change_history_limit,
+        )
+        specs.extend(CHANGE_TOOL_SPECS)
+        routes["get_change_evidence"] = changes
     return ToolRegistry(CompositeBackend(routes), specs)

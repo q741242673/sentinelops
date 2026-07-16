@@ -1,51 +1,151 @@
 # SentinelOps
 
-Model-agnostic Kubernetes incident diagnosis and remediation agent with evidence-based
-reasoning, human approval, allowlisted tools, resumable execution, and automated evaluation.
+一个能处理 Kubernetes 微服务告警的 AI 事故响应 Agent。
 
-SentinelOps is intentionally more than a chat UI. Given an alert, it collects bounded
-Kubernetes context, produces a diagnosis tied to evidence, proposes a reversible action,
-pauses for approval when risk exceeds policy, executes through a constrained tool registry,
-and verifies recovery before generating a postmortem.
+[![持续集成](https://github.com/q741242673/sentinelops/actions/workflows/ci.yml/badge.svg)](https://github.com/q741242673/sentinelops/actions/workflows/ci.yml)
 
-> Status: runnable v0.1. The local Incident Console and offline simulator work without a
-> Kubernetes cluster or model API key. The real kind, Prometheus, Loki, Tempo, and DeepSeek
-> golden path is verified in GitHub Actions.
+收到告警后，SentinelOps 不会马上让模型猜答案。它先去查 Kubernetes、监控指标、日志、调用链和代码变更，再根据查到的内容决定下一步：自动修复、等待人工批准，或者因为证据不足而停止操作。
 
-## Why this repository exists
+> 当前版本已经在本地 kind 集群中跑通告警、调查、审批、修复和验证，适合演示和继续开发。接入公司的生产集群前，还需要补上数据持久化、多副本运行、Webhook 鉴权和企业权限管理等能力。
 
-Many agent demos stop at a plausible answer. Incident response needs stronger guarantees:
+## 它解决什么问题
 
-- conclusions must point to evidence;
-- model output cannot bypass tool allowlists;
-- mutating actions need risk classification and approval;
-- an interrupted process must resume rather than restart its reasoning;
-- remediation is not successful until recovery criteria pass;
-- behavior should be measured on repeatable fault scenarios.
+微服务报警后，值班人员通常要在多个系统之间来回切换：
 
-## Architecture
+- 去 Kubernetes 看 Pod 是否健康、最近有没有发布；
+- 去 Prometheus 看错误率和请求量；
+- 去 Loki 搜错误日志；
+- 去 Tempo 找出错的调用链；
+- 去 Git 核对最近改了什么；
+- 最后再决定是重启、回滚，还是继续排查。
+
+SentinelOps 把这套过程连在一起。大模型负责分析，但不能直接控制集群；能不能修改集群、要不要人工审批、修复后算不算恢复，最后都由后端程序判断。
+
+## 一次告警是怎么处理的
 
 ```mermaid
 flowchart LR
-    A[Alert] --> B[Context collector]
-    B --> C[Diagnosis]
-    C --> D[Remediation planner]
-    D --> E[Policy engine]
-    E -->|high risk| F[Human approval]
-    E -->|allowed| G[Tool registry]
-    F --> G
-    G --> H[Kubernetes or simulator]
-    H --> I[Recovery verifier]
-    I --> J[Postmortem]
+    A["Alertmanager 推送告警"] --> B["收集集群和监控证据"]
+    B --> C["Agent 分析可能原因"]
+    C --> D{"证据够不够"}
+    D -->|"不够"| E["继续补查只读信息"]
+    E --> C
+    D -->|"仍然不够"| F["停止写操作，交给人工"]
+    D -->|"足够"| G["生成修复方案"]
+    G --> H{"操作风险高不高"}
+    H -->|"需要审批"| I["等待值班人员确认"]
+    H -->|"允许自动执行"| J["调用受限工具修复"]
+    I --> J
+    J --> K["重新检查 Pod、测试请求、错误率、告警和新调用链"]
+    K --> L["生成事故报告"]
 ```
 
-The graph uses LangGraph checkpoints and interrupts. Models implement one internal provider
-contract; tools implement one backend contract. Neither the agent nodes nor policy engine know
-which model vendor or cluster backend is active.
+简单说，就是下面 7 步：
 
-## Quick start
+1. Alertmanager 把告警推给 SentinelOps。
+2. SentinelOps 查询 Kubernetes、Prometheus、Loki、Tempo 和 Git。
+3. Agent 根据查到的内容分析根因，每个结论都要能指向证据。
+4. 如果证据不够，只继续查询，不修改集群；达到设定的补查次数后仍不够，就停止并交给人工。
+5. 如果证据足够，Agent 只能从提前允许的修复工具里选择动作。
+6. 回滚、扩容等高风险操作必须由人批准；低风险操作是否自动执行由服务端策略决定。
+7. 执行后重新检查 Pod、测试请求、错误率、告警和新调用链。只有这些检查都通过，事故才会被标记为已恢复。
 
-Requirements: Python 3.11+.
+## 整体结构
+
+```mermaid
+flowchart TB
+    UI["React 事故控制台"] <-->|"接口请求 + 后端实时推送（SSE）"| API["FastAPI 后端"]
+    AM["Prometheus / Alertmanager"] -->|"Webhook"| API
+    API --> AGENT["LangGraph Agent"]
+    AGENT --> READ["只读证据工具"]
+    READ --> K8S["Kubernetes"]
+    READ --> PROM["Prometheus"]
+    READ --> LOKI["Loki"]
+    READ --> TEMPO["Tempo"]
+    READ --> GIT["Git 变更记录"]
+    AGENT --> POLICY["风险检查和人工审批"]
+    POLICY --> WRITE["受限的集群操作"]
+    WRITE --> K8S
+    K8S --> VERIFY["恢复检查"]
+    PROM --> VERIFY
+    TEMPO --> VERIFY
+    VERIFY --> API
+```
+
+项目分成四块：
+
+- **前端控制台**：用 React 和 TypeScript 编写，实时显示 Agent 正在做什么、查了哪些证据、为什么暂停、最终是否恢复。
+- **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
+- **Agent 核心**：用 LangGraph 安排调查和修复步骤。当前后端进程可以暂停等待审批，批准后接着执行；后端一旦重启，内存中的进度会丢失，所以接入生产环境前还要增加数据库。
+- **集群与监控环境**：本地使用 kind 运行微服务、Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector。
+
+## 通用 Agent 和演示环境是分开的
+
+仓库把通用 Agent 和故障演示代码分开维护。演示代码负责制造问题，Agent 仍然按正常流程调查，不能提前读取“标准答案”。
+
+### 通用 Agent 核心
+
+这部分不知道“演示场景答案”，也不会看到某个标签就直接决定重启或回滚。它只处理通用问题：
+
+- 当前有哪些证据；
+- 哪个原因最可信；
+- 是否还有矛盾；
+- 什么操作风险更低；
+- 是否需要人工审批；
+- 修复后是否恢复。
+
+告警标签只能用来描述和定位告警，不能提高权限，也不能绕过审批。
+
+### Demo Lab
+
+Demo Lab 只负责做出可重复的本地故障，例如发布一个有问题的版本，或者打开一个只存在于进程内存中的故障开关。每次演示都会先恢复健康基线、清理旧告警，再注入新故障，避免上一轮状态影响下一轮。
+
+每次点击演示，后端会创建一个只对本轮有效的标记（代码里叫 Profile），并把它绑定到接下来出现的那条告警。演示结束或失败后，这个标记就会失效。外部伪造告警标签不能启用演示流程，也不能获得自动修复权限。
+
+## 网页里可以演示什么
+
+启动完整本地环境后，控制台提供三条流程：
+
+| 场景 | 会发生什么 | 预期结果 |
+|---|---|---|
+| 人工审批 | 发布一个会让库存请求间歇性失败的新版本 | Agent 找到故障版本并提出回滚，停在审批页面等待人工确认 |
+| 自动修复 | 在库存服务进程中打开一个重启即可清除的故障 | Agent 确认证据后自动滚动重启，并检查服务是否恢复 |
+| 复杂调查 | 制造一个需要继续查日志、指标和代码变更的故障 | Agent 会继续补查；证据足够就给出方案，仍有冲突就停止写操作并交给人工 |
+
+网页不是写死的动画。它通过 SSE 接收后端进度，会显示：
+
+- 当前执行到哪个步骤；
+- 调用了哪个查询工具；
+- 找到了哪些证据；
+- Agent 给出的根因和置信度；
+- 是否进行了补查；
+- 为什么需要人工审批；
+- 实际执行了什么集群操作；
+- 用什么结果证明服务已经恢复。
+
+## 大模型能做什么，不能做什么
+
+SentinelOps 给大模型加了几条硬限制：
+
+1. **没有证据就不能下结论**：根因必须能对应到实际查询结果。
+2. **证据不足就不写集群**：达到设定的补查次数后仍不确定，就交给人工处理。
+3. **模型不能随便调用命令**：系统没有把 Shell 交给模型，只开放少量提前定义好的工具。
+4. **模型不能给自己提权**：审批规则由服务端控制，告警标签和模型回答都不能改变权限。
+5. **高风险操作必须有人确认**：回滚和扩容默认停在人工审批门。
+6. **模型不能宣布自己修好了**：恢复结果由 Pod 状态、测试请求、错误率、告警和新调用链一起判断。
+
+## 快速运行：不需要 Kubernetes 和模型 Key
+
+适合先确认项目能跑起来。
+
+第一次使用先下载仓库：
+
+```bash
+git clone https://github.com/q741242673/sentinelops.git
+cd sentinelops
+```
+
+命令行演示只需要 Python 3.11+：
 
 ```bash
 python3 -m venv .venv
@@ -54,37 +154,123 @@ python -m pip install -e ".[dev]"
 sentinelops demo --scenario bad_rollout --approve
 ```
 
-The command prints the record before approval, resumes the same graph thread, performs a
-simulated rollback, verifies the new health snapshot, and prints the final postmortem.
+这条命令使用本地模拟数据，不会连接 Kubernetes，也不会调用收费模型。流程仍会先停在审批节点；`--approve` 会模拟值班人员点击同意，然后继续执行模拟回滚并输出事故报告。
 
-### Local Incident Console
-
-The portfolio demo includes a local operations console that visualizes the complete Agent graph,
-evidence-backed diagnosis, allowlisted remediation, approval gate, and recovery audit trail.
-Node.js 22+ is required in addition to Python.
+启动本地网页：
 
 ```bash
 make console
 ```
 
-Open `http://127.0.0.1:5173`. The console creates a deterministic incident on first load, pauses
-at the high-risk rollback, and resumes the same LangGraph thread when you approve it. The browser
-is local-only; FastAPI remains the Agent control plane so the UI operates real incident state
-instead of static mock data.
+网页还需要 Node.js 22+。第一次运行时，脚本会自动安装 `web` 目录的前端依赖。不带额外配置时，后端使用模拟工具和固定规则，不会连接 Kubernetes 或收费模型。
 
-Other deterministic scenario:
+打开 <http://127.0.0.1:5173>。
+
+## 完整运行：kind + 监控系统 + 大模型
+
+要求：
+
+- Python 3.11+
+- Node.js 22+
+- Docker
+- kind
+- kubectl
+- 一个兼容 OpenAI 请求格式的模型服务，以及它的地址、模型名称和 API Key
+
+启动：
 
 ```bash
-sentinelops demo --scenario db_pool_exhaustion --approve
+SENTINELOPS_MODEL_PROVIDER=openai_compatible \
+SENTINELOPS_MODEL_NAME=your-model-name \
+SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1 \
+SENTINELOPS_MODEL_API_KEY=replace-me \
+make console-live
 ```
 
-Run the API:
+脚本会自动完成这些事情：
+
+1. 创建或复用本地 kind 集群；
+2. 部署订单服务和库存服务；
+3. 部署 Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector；
+4. 启动持续测试流量；
+5. 启动 FastAPI 后端和 React 前端。
+
+打开 <http://127.0.0.1:5173>，选择一个场景开始即可。
+
+停止网页后，默认保留 kind 集群，方便下次快速启动。彻底删除环境：
+
+```bash
+make console-live-down
+```
+
+## 更换模型
+
+Agent 不绑定某一家模型供应商。模型服务的请求格式需要兼容 OpenAI 的 `/chat/completions` 接口，并能按照要求返回 JSON；DeepSeek、OpenAI、vLLM 或其他满足这个条件的服务都可以接入。
+
+如果单独运行后端，可以把模型配置保存到 `.env`：
+
+```bash
+cp .env.example .env
+```
+
+填写：
+
+```dotenv
+SENTINELOPS_MODEL_PROVIDER=openai_compatible
+SENTINELOPS_MODEL_NAME=your-model-name
+SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1
+SENTINELOPS_MODEL_API_KEY=replace-me
+```
+
+运行 `make console-live` 时，请像上一节那样在命令前传入这四个变量；这样无论换哪一家服务，启动脚本都不会猜测你想用哪个模型。
+
+`rule_based` 是给本地离线测试和 CI 使用的固定规则实现，不应该当作生产环境里的大模型。
+
+## 连接已有 Kubernetes 集群
+
+本地运行时读取当前 kubeconfig；部署到 Pod 中时使用 ServiceAccount。
+
+```dotenv
+SENTINELOPS_TOOL_BACKEND=kubernetes
+SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
+```
+
+示例 RBAC：
+
+```bash
+kubectl apply -f deploy/rbac.yaml
+```
+
+请在接入生产集群前检查并缩小权限范围。当前工具支持读取 Pod、事件、日志和发布历史，以及滚动重启、回滚和扩缩容。模型本身拿不到任意 Shell、Secret 或特权 Pod 权限。
+
+## 配置监控和代码变更证据
+
+```dotenv
+SENTINELOPS_PROMETHEUS_URL=http://127.0.0.1:9090
+SENTINELOPS_LOKI_URL=http://127.0.0.1:3100
+SENTINELOPS_TEMPO_URL=http://127.0.0.1:3200
+SENTINELOPS_CHANGE_REPOSITORY_PATH=/absolute/path/to/sentinelops
+SENTINELOPS_DIAGNOSIS_CONFIDENCE_THRESHOLD=0.8
+SENTINELOPS_MAX_REFLECTION_ROUNDS=1
+```
+
+`SENTINELOPS_MAX_REFLECTION_ROUNDS` 控制最多补查几轮，默认是 1，可设置为 0～3。所有查询都有数量和时间范围限制。模型只能选择“还想查哪一类证据”，不能自己提交 Shell、文件路径、PromQL 或 LogQL 让系统直接执行。
+
+演示环境会把 Git commit 写进 Kubernetes Deployment 的注解。后端读取当前版本和上一个版本的注解，再到配置好的仓库中核对这次提交改了什么，因此不会只凭告警文字猜测代码变更。
+
+## 单独运行后端
 
 ```bash
 sentinelops serve
 ```
 
-Create an incident:
+- API：<http://127.0.0.1:8000>
+- API 文档：<http://127.0.0.1:8000/docs>
+- Alertmanager Webhook：`POST http://127.0.0.1:8000/api/v1/webhooks/alertmanager`
+
+直接运行这条命令时，默认使用模拟工具和 `rule_based` 固定规则，方便离线检查。要连接 Kubernetes、监控系统和大模型，请使用上面的环境变量，或直接运行 `make console-live`。
+
+创建事故：
 
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/incidents \
@@ -94,272 +280,88 @@ curl -sS http://127.0.0.1:8000/api/v1/incidents \
     "namespace": "sentinelops-demo",
     "service": "order-service",
     "severity": "critical",
-    "summary": "Order service error rate exceeded the SLO"
+    "summary": "订单服务错误率超过阈值"
   }'
 ```
 
-Approve the returned incident ID:
+批准修复：
 
 ```bash
 curl -sS http://127.0.0.1:8000/api/v1/incidents/INCIDENT_ID/approval \
   -H 'content-type: application/json' \
-  -d '{"approved": true, "note": "Approved by on-call engineer"}'
+  -d '{"approved": true, "note": "值班人员确认回滚"}'
 ```
 
-Interactive API docs are available at `http://127.0.0.1:8000/docs`.
+## 测试和验收
 
-## Use a model API
-
-Copy the example configuration and fill in any OpenAI-compatible endpoint:
+日常检查：
 
 ```bash
-cp .env.example .env
+make test
+make lint
+npm run build --prefix web
 ```
 
-```dotenv
-SENTINELOPS_MODEL_PROVIDER=openai_compatible
-SENTINELOPS_MODEL_NAME=your-model-name
-SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1
-SENTINELOPS_MODEL_API_KEY=replace-me
-```
-
-The provider adapter asks for JSON matching Pydantic-generated schemas. DeepSeek, OpenAI,
-vLLM and compatible gateways can be configured without changing graph code. Native provider
-adapters can be added by implementing `LLMProvider.structured` and registering the adapter in
-`llm/registry.py`.
-
-## Connect a Kubernetes cluster
-
-Set:
-
-```dotenv
-SENTINELOPS_TOOL_BACKEND=kubernetes
-SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
-```
-
-Locally, the adapter loads the current kubeconfig. In a Pod, it uses the mounted ServiceAccount.
-Apply the example namespace-scoped role after reviewing it:
-
-```bash
-kubectl apply -f deploy/rbac.yaml
-```
-
-The live adapter supports bounded reads, rolling restart, scaling, and revision rollback.
-Rollback resolves an owned ReplicaSet by `deployment.kubernetes.io/revision`, restores its Pod
-template through a resource-version-guarded Deployment update, and then waits for every matching
-Pod and the workload availability signal to recover. In GitOps-managed production environments,
-replace this adapter with an Argo Rollouts or Flux MCP tool so Git remains the source of truth.
-
-## Real kind fault lab
-
-The repository includes a real Kubernetes end-to-end scenario. It creates a disposable `kind`
-cluster, deploys a healthy NGINX-backed `order-service`, injects a broken Deployment revision,
-waits until the new Pod reaches `CrashLoopBackOff`, and runs SentinelOps against the Kubernetes
-API. After approval, SentinelOps restores revision 1 and verifies the Pods recover.
-
-Requirements: Docker, `kind`, and `kubectl`.
+kind 故障测试：
 
 ```bash
 make kind-e2e
 ```
 
-To keep the cluster for inspection:
-
-```bash
-SENTINELOPS_KEEP_KIND_CLUSTER=true make kind-e2e
-kubectl get pods,rs,deploy -n sentinelops-demo
-make kind-down
-```
-
-The same scenario runs in GitHub Actions on every push and pull request.
-
-## Observability evidence
-
-SentinelOps can enrich Kubernetes evidence with read-only Prometheus, Loki, and Tempo queries.
-Configure only the backends that are available:
-
-```dotenv
-SENTINELOPS_PROMETHEUS_URL=http://127.0.0.1:9090
-SENTINELOPS_LOKI_URL=http://127.0.0.1:3100
-SENTINELOPS_TEMPO_URL=http://127.0.0.1:3200
-SENTINELOPS_OBSERVABILITY_TIMEOUT_SECONDS=10
-```
-
-When configured, live investigations automatically collect a bounded HTTP error-rate query and
-recent error logs for the alerted service. A Tempo trace is fetched only when the alert includes
-a `trace_id` label. All three tools are read-only and apply hard limits:
-
-| Tool | Boundary |
-|---|---|
-| `query_prometheus` | instant query, 1,000-character maximum |
-| `search_loki` | backward range query, maximum 200 entries |
-| `get_trace` | validated 16-64 character hexadecimal trace ID |
-
-The HTTP client uses explicit configured base URLs, a maximum 60-second timeout, and ignores
-ambient proxy variables so internal telemetry is not accidentally routed through an external
-proxy.
-
-### In-cluster telemetry lab
-
-The repository also ships a reproducible telemetry lab: two instrumented FastAPI services,
-Prometheus, Loki, Tempo, and an OpenTelemetry Collector, all running inside a disposable `kind`
-cluster. The inventory service fails every third reservation, producing correlated success and
-failure metrics, structured OTLP logs, and distributed traces.
-
-Run the complete acceptance test:
+Prometheus、Loki、Tempo 连通性测试：
 
 ```bash
 make observability-e2e
 ```
 
-The test builds one model-neutral demo-service image, generates twelve checkout requests, and
-uses SentinelOps' production observability adapters to prove that all three signals are
-queryable. It fails unless Prometheus returns request samples, Loki returns checkout logs, and
-Tempo returns spans for a trace ID produced by the request.
-
-To keep the lab running for exploration:
-
-```bash
-SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER=true make observability-e2e
-kubectl get pods -n sentinelops-demo
-make observability-down
-```
-
-### Live incident golden path
-
-The telemetry lab also exercises the complete incident loop rather than stopping after a
-successful query:
-
-```mermaid
-sequenceDiagram
-    participant P as Prometheus
-    participant A as SentinelOps
-    participant O as Operator
-    participant K as Kubernetes
-    P->>A: HighInventoryErrorRate firing
-    A->>K: Read pods, logs, and rollout history
-    A->>P: Query request error rate
-    A->>A: Correlate Loki logs and Tempo trace
-    A->>O: Propose revision 1 rollback
-    O->>A: Approve
-    A->>K: Roll back inventory-service
-    A->>P: Verify request error rate below 1%
-```
-
-Run it with:
+完整的“告警 → 人工审批 → 回滚 → 恢复验证”测试：
 
 ```bash
 make golden-path-e2e
 ```
 
-The command starts with a healthy inventory revision, rolls out a configuration that fails every
-third reservation, waits for the real Prometheus alert to fire, and supplies its labels plus a
-failed trace ID to SentinelOps. The agent collects Kubernetes, Prometheus, Loki, and Tempo
-evidence, pauses on its high-risk rollback, resumes after approval, and continuously checks the
-10-second request error rate. The test passes only after the alert clears and six fresh checkout
-requests all return HTTP 200.
+GitHub Actions 会运行后端测试、前端构建、离线评估、kind 端到端测试和监控系统连通性测试。测试数量会随功能变化，以 [GitHub Actions](https://github.com/q741242673/sentinelops/actions) 的最新结果为准。
 
-CI uses the deterministic `rule_based` provider so this acceptance test needs no model key. To
-exercise the same infrastructure path with DeepSeek or another OpenAI-compatible endpoint, set
-the model variables before running the command:
-
-```bash
-SENTINELOPS_MODEL_PROVIDER=openai_compatible \
-SENTINELOPS_MODEL_NAME=your-model-name \
-SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1 \
-SENTINELOPS_MODEL_API_KEY=replace-me \
-make golden-path-e2e
-```
-
-The `deepseek-e2e` GitHub Actions workflow runs this complete path against the real
-`deepseek-chat` API. It is deliberately `workflow_dispatch` only, so pull requests and pushes do
-not consume model credits. Configure a repository Actions secret named `DEEPSEEK_API_KEY`, then
-start it from the Actions page or with:
-
-```bash
-gh workflow run deepseek-e2e.yml
-```
-
-The secret is injected only into the final incident-loop step. A successful run proves that the
-model used live Kubernetes, Prometheus, Loki, and Tempo evidence to select an allowlisted action,
-paused for approval, rolled the deployment back, and verified traffic and alert recovery.
-
-## MCP server
-
-Install the optional extra and start the stdio server:
-
-```bash
-python -m pip install -e ".[mcp]"
-sentinelops-mcp
-```
-
-The MCP server exposes focused Kubernetes and configured observability tools, while the Agent
-host remains responsible for approval and policy. This separation prevents a tool server from
-silently granting itself automation authority.
-
-## Safety model
-
-| Risk | Example | Default behavior |
-|---|---|---|
-| Read-only | logs, pods, events | automatic |
-| Low | bounded metadata operation | automatic |
-| Medium | restart deployment | approval required |
-| High | rollback or scale | approval required |
-| Permanently denied | arbitrary exec, secrets, privileged Pod | rejected |
-
-The model never receives a shell tool. Every call goes through an allowlist and required
-argument validation. RBAC is the final infrastructure boundary, not a replacement for host-side
-policy.
-
-## Evaluation
-
-```bash
-python evals/run.py
-```
-
-The first suite checks two incidents end-to-end and records:
-
-- root-cause correctness;
-- recovery success;
-- mutating tool count;
-- end-to-end duration.
-
-The next evaluation milestone adds request-level SLI fixtures, model cost/latency telemetry, and
-trace-level graders.
-
-## Repository map
+## 项目目录
 
 ```text
 src/sentinelops/
-├── agent/          # graph, state, policy, interrupt/resume
-├── llm/            # provider-neutral contract and adapters
-├── tools/          # allowlist, simulator, Kubernetes and observability backends
-├── api.py          # FastAPI endpoints
-├── mcp_server.py   # optional MCP facade
-└── runtime.py      # dependency wiring
-evals/              # repeatable incident evaluation
-deploy/             # namespace-scoped RBAC
-tests/              # graph, policy and tool-boundary tests
+├── agent/          # Agent 执行流程、质量检查和风险策略
+├── llm/            # 大模型接口和不同服务的适配代码
+├── tools/          # Kubernetes、监控和 Git 查询工具
+├── api.py          # FastAPI 接口、告警接收和实时进度
+├── demo.py         # Demo Lab 的故障注入与环境恢复
+├── lab_profiles.py # 三种演示流程的服务端绑定规则
+└── runtime.py      # 生产 Agent 的组装入口
+web/                # React + TypeScript 事故控制台
+demo/               # 本地微服务和测试流量
+deploy/             # Kubernetes、RBAC 和监控配置
+evals/              # 可重复运行的 Agent 评估
+tests/              # 单元测试和安全边界测试
 ```
 
-## Roadmap
+## 当前完成度
 
-- [x] Provider-neutral model gateway
-- [x] LangGraph diagnosis-to-remediation workflow
-- [x] Human approval and checkpoint resume
-- [x] Tool allowlist and risk policy
-- [x] Offline Kubernetes incident simulator
-- [x] Kubernetes API and MCP adapters
-- [x] REST API and CI evaluation
-- [x] Disposable `kind` fault lab
-- [x] Prometheus, Loki and Tempo MCP query adapters
-- [x] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
-- [x] Firing Prometheus alert to approved rollback and request-SLI recovery loop
-- [ ] PostgreSQL checkpointer and event store
-- [ ] OpenTelemetry spans for model and tool calls
-- [ ] Web incident command center
-- [ ] Multi-model benchmark report
+已经完成：
 
-## License
+- 可替换的大模型接口；
+- 告警到调查、审批、执行、验证和报告的完整流程；
+- Kubernetes、Prometheus、Loki、Tempo 和 Git 证据采集；
+- 人工审批、自动修复和复杂调查三种本地演示；
+- React 实时事故控制台；
+- kind、监控系统和 GitHub Actions 端到端测试；
+- 通用 Agent 核心与 Demo Lab 分开维护。
+
+接入生产环境前还需要：
+
+- 用 PostgreSQL 等数据库保存事故和执行记录；
+- 支持后端多副本和任务接管；
+- 给 Alertmanager Webhook 增加身份认证和签名校验；
+- 接入企业 Secret 管理和更细的 RBAC；
+- 增加不可篡改的审计记录、限流和灾难恢复方案。
+
+现在它已经能在本地 Kubernetes 和监控环境中完成一整次事故处理，但还不适合未经评估就直接接管生产集群。
+
+## 开源协议
 
 Apache-2.0

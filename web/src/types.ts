@@ -5,7 +5,8 @@ export type IncidentStatus =
   | "remediating"
   | "resolved"
   | "failed"
-  | "rejected";
+  | "rejected"
+  | "escalated";
 
 export interface Alert {
   name: string;
@@ -37,6 +38,26 @@ export interface Diagnosis {
   evidence_summary: string[];
 }
 
+export interface DiagnosisReview {
+  sufficient: boolean;
+  confidence: number;
+  contradictions: string[];
+  missing_evidence: string[];
+  follow_up_queries: Array<{ source: string; reason: string }>;
+}
+
+export interface ChangeEvidence {
+  repository?: string;
+  correlation_status?: string;
+  correlation_summary?: string;
+  current_rollout?: Record<string, unknown> | null;
+  previous_rollout?: Record<string, unknown> | null;
+  current_commit?: Record<string, unknown> | null;
+  previous_commit?: Record<string, unknown> | null;
+  changed_files?: string[];
+  recent_commits?: Array<Record<string, unknown>>;
+}
+
 export interface RemediationAction {
   tool_name: string;
   arguments: Record<string, unknown>;
@@ -59,11 +80,29 @@ export interface TimelineEvent {
   created_at: string;
 }
 
+export interface ExecutionStep {
+  id: string;
+  parent_id: string | null;
+  kind: "graph" | "tool" | "policy" | "verification";
+  title: string;
+  detail: string;
+  status: "pending" | "running" | "completed" | "failed" | "blocked" | "skipped";
+  iteration: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  data: Record<string, unknown>;
+}
+
 export interface Incident {
   id: string;
   alert: Alert;
+  execution_profile_id: string;
   status: IncidentStatus;
   diagnosis: Diagnosis | null;
+  diagnosis_review: DiagnosisReview | null;
+  reflection_rounds: number;
+  change_evidence: ChangeEvidence | null;
   plan: RemediationPlan | null;
   approval: unknown | null;
   execution_results: Array<{
@@ -74,6 +113,8 @@ export interface Incident {
     duration_ms: number;
   }>;
   timeline: TimelineEvent[];
+  execution_trace: ExecutionStep[];
+  active_step_id: string | null;
   postmortem: string | null;
   created_at: string;
   updated_at: string;
@@ -86,4 +127,25 @@ export interface RuntimeInfo {
   model_name: string;
   namespace: string;
   approval_mode: string;
+  alert_ingestion: string;
+}
+
+export interface DemoFaultResult {
+  deployment?: string;
+  service?: string;
+  fault_active: boolean;
+  already_active?: boolean;
+  revision?: number | null;
+  failure_every?: string;
+  fault_type?: string;
+}
+
+export interface DemoFaultJob {
+  id: string;
+  scenario: "bad_rollout" | "transient_runtime_fault" | "ambiguous_change_fault";
+  status: "injecting" | "active" | "failed";
+  phase: "resetting_baseline" | "injecting_fault" | "waiting_for_alert" | "incident_started";
+  incident_id: string | null;
+  result: DemoFaultResult | null;
+  error: string | null;
 }

@@ -7,7 +7,9 @@ from pydantic import BaseModel
 
 from sentinelops.domain import (
     Diagnosis,
+    DiagnosisReview,
     Evidence,
+    FollowUpQuery,
     Hypothesis,
     RemediationAction,
     RemediationPlan,
@@ -40,19 +42,52 @@ class RuleBasedProvider:
 
         if schema is Diagnosis:
             return self._diagnose(scenario, observations)  # type: ignore[return-value]
+        if schema is DiagnosisReview:
+            return self._review(payload)  # type: ignore[return-value]
         if schema is RemediationPlan:
             return self._plan(scenario, payload)  # type: ignore[return-value]
         raise TypeError(f"RuleBasedProvider does not support schema {schema.__name__}")
 
     @staticmethod
+    def _review(payload: dict[str, Any]) -> DiagnosisReview:
+        preferred = ["git_changes", "kubernetes_logs", "prometheus_errors"]
+        available = set(payload.get("available_sources", []))
+        reasons = {
+            "git_changes": "核对发布 revision 与 Git 提交的关联",
+            "kubernetes_logs": "补充服务日志以验证错误模式",
+            "prometheus_errors": "补充实时请求错误率",
+        }
+        queries = [
+            FollowUpQuery(source=source, reason=reasons[source])  # type: ignore[arg-type]
+            for source in preferred
+            if source in available
+        ]
+        return DiagnosisReview(
+            sufficient=False,
+            confidence=float(payload.get("diagnosis", {}).get("confidence", 0)),
+            missing_evidence=["当前诊断置信度不足，需要补充独立证据"],
+            follow_up_queries=queries,
+        )
+
+    @staticmethod
     def _infer_scenario(observations: dict[str, Any]) -> str:
-        declared = observations.get("scenario")
-        if declared in {"bad_rollout", "db_pool_exhaustion", "inventory_faulty_rollout"}:
+        declared = observations.get("metrics", {}).get("scenario")
+        if declared in {
+            "bad_rollout",
+            "db_pool_exhaustion",
+            "inventory_faulty_rollout",
+            "transient_runtime_fault",
+        }:
             return declared
 
         pods = observations.get("pods", {}).get("items", [])
         logs = "\n".join(observations.get("logs", {}).get("lines", [])).lower()
         all_evidence = json.dumps(observations, ensure_ascii=False).lower()
+        if (
+            "transient_runtime_fault_enabled" in all_evidence
+            or "reason=transient_runtime_fault" in all_evidence
+        ):
+            return "transient_runtime_fault"
         if "inventory_reservation_failed" in all_evidence or "synthetic_timeout" in all_evidence:
             return "inventory_faulty_rollout"
         has_unhealthy_rollout_pod = any(
@@ -68,69 +103,110 @@ class RuleBasedProvider:
         return "db_pool_exhaustion"
 
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
-        if scenario == "inventory_faulty_rollout":
+        current_revision, _ = self._rollout_revisions(observations)
+        if scenario == "transient_runtime_fault":
             evidence = [
                 Evidence(
                     source="prometheus",
                     query="query_prometheus",
-                    finding="Inventory request metrics contain HTTP 503 responses",
+                    finding="Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
                     raw=observations.get("prometheus", {}),
                 ),
                 Evidence(
                     source="loki",
                     query="search_loki",
-                    finding="Inventory logs report synthetic reservation timeouts",
+                    finding="Loki 日志显示 transient_runtime_fault 已启用且需要重启清除",
+                    raw=observations.get("loki", {}),
+                ),
+                Evidence(
+                    source="kubernetes.rollout",
+                    query="get_rollout_history",
+                    finding="Kubernetes 发布历史没有出现与本次故障对应的新 revision",
+                    raw=observations.get("rollout", {}),
+                ),
+            ]
+            root_cause = "库存服务进程内的瞬态故障状态导致所有预留请求返回 HTTP 503"
+            hypothesis = "进程内异常状态而非发布变更导致库存服务不可用"
+        elif scenario == "inventory_faulty_rollout":
+            evidence = [
+                Evidence(
+                    source="prometheus",
+                    query="query_prometheus",
+                    finding="库存服务请求指标中出现 HTTP 503 响应",
+                    raw=observations.get("prometheus", {}),
+                ),
+                Evidence(
+                    source="loki",
+                    query="search_loki",
+                    finding="库存服务日志记录了合成的预留超时",
                     raw=observations.get("loki", {}),
                 ),
                 Evidence(
                     source="tempo",
                     query="get_trace",
-                    finding="The failed checkout trace crosses the inventory service",
+                    finding="失败的结账链路经过库存服务并在此发生错误",
                     raw=observations.get("trace", {}),
                 ),
                 Evidence(
                     source="kubernetes.rollout",
                     query="get_rollout_history",
-                    finding="The error-producing configuration is deployment revision 2",
+                    finding=f"产生错误的配置来自 Deployment revision {current_revision}",
                     raw=observations.get("rollout", {}),
                 ),
             ]
-            root_cause = "Inventory deployment revision 2 enabled a synthetic reservation failure"
-            hypothesis = "The latest inventory configuration rollout introduced the 503 errors"
+            root_cause = (
+                f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
+            )
+            hypothesis = "最新的库存服务配置发布引入了 HTTP 503 错误"
         elif scenario == "bad_rollout":
             evidence = [
                 Evidence(
                     source="kubernetes.events",
                     query="list_events",
-                    finding="New pods entered CrashLoopBackOff immediately after rollout",
+                    finding="新 Pod 在发布后立即进入 CrashLoopBackOff",
                     raw=observations.get("events", {}),
                 ),
                 Evidence(
                     source="kubernetes.rollout",
                     query="get_rollout_history",
-                    finding="Error spike started after deployment revision 2",
+                    finding=f"错误峰值从 Deployment revision {current_revision} 发布后开始",
                     raw=observations.get("rollout", {}),
                 ),
             ]
-            root_cause = "Deployment revision 2 contains a broken application image"
-            hypothesis = "The latest rollout introduced the incident"
+            root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
+            hypothesis = "最新一次发布引入了本次事故"
         else:
             evidence = [
                 Evidence(
                     source="kubernetes.logs",
                     query="get_pod_logs",
-                    finding="Requests fail while acquiring database connections",
+                    finding="请求在获取数据库连接时失败",
                     raw=observations.get("logs", {}),
                 ),
                 Evidence(
                     source="metrics",
                     query="get_service_metrics",
-                    finding="Database connection pool utilization reached 100%",
+                    finding="数据库连接池利用率达到 100%",
                     raw=observations.get("metrics", {}),
                 ),
             ]
-            root_cause = "Database connection pool exhaustion in the order service"
-            hypothesis = "The order service exhausted its database connection pool"
+            root_cause = "订单服务的数据库连接池已耗尽"
+            hypothesis = "订单服务耗尽了可用数据库连接"
+
+        changes = observations.get("changes", {})
+        if changes.get("correlation_status") in {
+            "verified",
+            "no_code_change",
+            "current_commit_verified",
+        }:
+            evidence.append(
+                Evidence(
+                    source="git.change",
+                    query="get_change_evidence",
+                    finding=str(changes.get("correlation_summary")),
+                    raw=changes,
+                )
+            )
 
         return Diagnosis(
             root_cause=root_cause,
@@ -140,24 +216,39 @@ class RuleBasedProvider:
         )
 
     def _plan(self, scenario: str, payload: dict[str, Any]) -> RemediationPlan:
-        if scenario == "inventory_faulty_rollout":
+        current_revision, previous_revision = self._rollout_revisions(
+            payload.get("observations", {})
+        )
+        if scenario == "transient_runtime_fault":
+            service = payload["alert"]["service"]
+            action = RemediationAction(
+                tool_name="restart_deployment",
+                arguments={"name": service},
+                rationale="故障仅存在于进程内存中，滚动重启可以清除异常状态且不改变期望配置",
+                expected_outcome="新 Pod 启动后库存预留和结账请求恢复成功",
+                risk=RiskLevel.MEDIUM,
+            )
+        elif scenario == "inventory_faulty_rollout":
             service = payload["alert"]["service"]
             action = RemediationAction(
                 tool_name="rollback_deployment",
-                arguments={"name": service, "revision": 1},
+                arguments={"name": service, "revision": previous_revision},
                 rationale=(
-                    "Revision 2 introduced inventory 503 responses while revision 1 was healthy"
+                    f"revision {current_revision} 引入库存服务 HTTP 503，"
+                    f"而 revision {previous_revision} 已知健康"
                 ),
-                expected_outcome="Inventory 503 responses stop and checkout traffic recovers",
+                expected_outcome="库存服务不再返回 HTTP 503，结账流量恢复",
                 risk=RiskLevel.HIGH,
             )
         elif scenario == "bad_rollout":
             action = RemediationAction(
                 tool_name="rollback_deployment",
-                arguments={"name": "order-service", "revision": 1},
-                rationale="The incident correlates with revision 2 and its pods are unhealthy",
+                arguments={"name": "order-service", "revision": previous_revision},
+                rationale=(
+                    f"事故与 revision {current_revision} 强相关，并且该版本的 Pod 不健康"
+                ),
                 expected_outcome=(
-                    "Revision 1 becomes available and the error rate returns to baseline"
+                    f"revision {previous_revision} 恢复可用，错误率回到基线"
                 ),
                 risk=RiskLevel.HIGH,
             )
@@ -165,15 +256,30 @@ class RuleBasedProvider:
             action = RemediationAction(
                 tool_name="restart_deployment",
                 arguments={"name": "order-service"},
-                rationale="Recycle leaked database connections while preserving desired state",
+                rationale="在保留期望状态的同时回收泄漏的数据库连接",
                 expected_outcome=(
-                    "Connection pool utilization and request errors return to baseline"
+                    "连接池利用率和请求错误率回到基线"
                 ),
                 risk=RiskLevel.MEDIUM,
             )
         return RemediationPlan(
-            summary=f"Remediate {payload['diagnosis']['root_cause']}",
+            summary=f"修复：{payload['diagnosis']['root_cause']}",
             actions=[action],
-            rollback="Stop automation and restore the previous deployment revision",
-            verification=["Available replicas equal desired replicas", "Error rate is below 1%"],
+            rollback="停止自动化并恢复到之前的 Deployment revision",
+            verification=["可用副本数等于期望副本数", "请求错误率低于 1%"],
         )
+
+    @staticmethod
+    def _rollout_revisions(observations: dict[str, Any]) -> tuple[int, int]:
+        revision_numbers = sorted(
+            {
+                int(item["revision"])
+                for item in observations.get("rollout", {}).get("revisions", [])
+                if str(item.get("revision", "")).isdigit()
+            }
+        )
+        if not revision_numbers:
+            return 2, 1
+        current = revision_numbers[-1]
+        previous = revision_numbers[-2] if len(revision_numbers) > 1 else max(current - 1, 1)
+        return current, previous

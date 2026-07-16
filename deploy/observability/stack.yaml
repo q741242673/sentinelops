@@ -15,6 +15,11 @@ data:
       evaluation_interval: 2s
     rule_files:
       - /etc/prometheus/rules.yml
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager:9093
     scrape_configs:
       - job_name: sentinelops-demo
         metrics_path: /metrics
@@ -28,15 +33,24 @@ data:
         rules:
           - alert: HighInventoryErrorRate
             expr: |
-              (
-                sum(rate(http_requests_total{service="inventory-service",status=~"5.."}[10s]))
-                or vector(0)
+              ((
+                  sum(rate(http_requests_total{service="inventory-service",status=~"5.."}[10s]))
+                  or vector(0)
+                )
+                /
+                clamp_min(
+                  sum(rate(http_requests_total{service="inventory-service"}[10s])),
+                  0.001
+                ) > 0.1
               )
-              /
-              clamp_min(
-                sum(rate(http_requests_total{service="inventory-service"}[10s])),
-                0.001
-              ) > 0.1
+              unless on()
+              (
+                max(
+                  max_over_time(
+                    sentinelops_transient_runtime_fault{service="inventory-service"}[45s]
+                  )
+                ) == 1
+              )
             for: 4s
             labels:
               severity: critical
@@ -44,6 +58,16 @@ data:
               namespace: sentinelops-demo
             annotations:
               summary: Inventory HTTP 503 rate exceeded the checkout SLO
+          - alert: InventoryTransientRuntimeFault
+            expr: |
+              max(sentinelops_transient_runtime_fault{service="inventory-service"}) == 1
+            for: 2s
+            labels:
+              severity: warning
+              service: inventory-service
+              namespace: sentinelops-demo
+            annotations:
+              summary: 库存服务存在进程内瞬态运行时故障
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -93,6 +117,74 @@ spec:
   ports:
     - port: 9090
       targetPort: 9090
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: sentinelops-demo
+data:
+  alertmanager.yml: |
+    route:
+      receiver: sentinelops
+      group_by: [alertname, namespace, service]
+      group_wait: 0s
+      group_interval: 5s
+      repeat_interval: 1m
+    receivers:
+      - name: sentinelops
+        webhook_configs:
+          - url: http://host.docker.internal:8000/api/v1/webhooks/alertmanager
+            send_resolved: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: sentinelops-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.28.1
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - containerPort: 9093
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9093
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: sentinelops-demo
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - port: 9093
+      targetPort: 9093
 ---
 apiVersion: v1
 kind: ConfigMap

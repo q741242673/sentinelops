@@ -16,6 +16,7 @@ class IncidentStatus(StrEnum):
     RESOLVED = "resolved"
     FAILED = "failed"
     REJECTED = "rejected"
+    ESCALATED = "escalated"
 
 
 class RiskLevel(StrEnum):
@@ -67,6 +68,29 @@ class Diagnosis(BaseModel):
     evidence_summary: list[str]
 
 
+class FollowUpQuery(BaseModel):
+    source: Literal[
+        "kubernetes_pods",
+        "kubernetes_events",
+        "kubernetes_logs",
+        "kubernetes_rollout",
+        "prometheus_errors",
+        "prometheus_latency",
+        "loki_errors",
+        "tempo_trace",
+        "git_changes",
+    ]
+    reason: str
+
+
+class DiagnosisReview(BaseModel):
+    sufficient: bool
+    confidence: float = Field(ge=0, le=1)
+    contradictions: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    follow_up_queries: list[FollowUpQuery] = Field(default_factory=list, max_length=4)
+
+
 class RemediationAction(BaseModel):
     tool_name: str
     arguments: dict[str, Any]
@@ -103,15 +127,35 @@ class TimelineEvent(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ExecutionStep(BaseModel):
+    id: str
+    parent_id: str | None = None
+    kind: Literal["graph", "tool", "policy", "verification"] = "graph"
+    title: str
+    detail: str = ""
+    status: Literal["pending", "running", "completed", "failed", "blocked", "skipped"]
+    iteration: int = 1
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: float | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class IncidentRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     alert: Alert
+    execution_profile_id: str = "production-default"
     status: IncidentStatus = IncidentStatus.RECEIVED
     diagnosis: Diagnosis | None = None
+    diagnosis_review: DiagnosisReview | None = None
+    reflection_rounds: int = 0
+    change_evidence: dict[str, Any] | None = None
     plan: RemediationPlan | None = None
     approval: ApprovalRequest | None = None
     execution_results: list[ToolResult] = Field(default_factory=list)
     timeline: list[TimelineEvent] = Field(default_factory=list)
+    execution_trace: list[ExecutionStep] = Field(default_factory=list)
+    active_step_id: str | None = None
     postmortem: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
