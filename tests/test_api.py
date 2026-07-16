@@ -37,6 +37,10 @@ async def test_api_incident_approval_flow() -> None:
         assert demo.status_code == 201
         assert demo.json()["status"] == "awaiting_approval"
 
+        fault = await client.post("/api/v1/demo/faults")
+        assert fault.status_code == 200
+        assert fault.json()["fault_active"] is True
+
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
             json={"approved": True, "note": "approved in API test"},

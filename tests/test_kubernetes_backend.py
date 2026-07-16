@@ -69,3 +69,42 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
         "sentinelops-demo",
         deployment,
     )
+
+
+def test_demo_fault_injection_patches_failure_rate_and_waits_for_rollout() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    container = ns(name="inventory-service", env=[ns(name="FAIL_EVERY", value="0")])
+    deployment = ns(
+        metadata=ns(generation=4),
+        spec=ns(template=ns(spec=ns(containers=[container]))),
+    )
+    updated = ns(metadata=ns(generation=5))
+    status = ns(
+        spec=ns(replicas=1),
+        status=ns(
+            observed_generation=5,
+            replicas=1,
+            updated_replicas=1,
+            ready_replicas=1,
+            available_replicas=1,
+        ),
+    )
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.patch_namespaced_deployment.return_value = updated
+    backend.apps.read_namespaced_deployment_status.return_value = status
+    backend._tool_get_rollout_history = Mock(  # type: ignore[method-assign]
+        return_value={"revisions": [{"revision": 5, "replicas": 1}]}
+    )
+
+    result = backend._tool_inject_demo_fault(
+        {"name": "inventory-service", "timeout_seconds": 1}
+    )
+
+    assert result["fault_active"] is True
+    assert result["revision"] == 5
+    body = backend.apps.patch_namespaced_deployment.call_args.args[2]
+    assert body["spec"]["template"]["spec"]["containers"][0]["env"] == [
+        {"name": "FAIL_EVERY", "value": "3"}
+    ]

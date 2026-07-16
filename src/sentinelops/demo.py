@@ -7,6 +7,7 @@ import httpx
 
 from sentinelops.config import Settings
 from sentinelops.domain import Alert
+from sentinelops.tools.kubernetes import KubernetesBackend
 
 
 def simulated_demo_alert(settings: Settings) -> Alert:
@@ -20,13 +21,18 @@ def simulated_demo_alert(settings: Settings) -> Alert:
     )
 
 
-async def _find_failed_trace(client: httpx.AsyncClient, order_url: str) -> str:
-    for _ in range(30):
+async def _find_failed_trace(
+    client: httpx.AsyncClient,
+    order_url: str,
+    timeout_seconds: float,
+) -> str:
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
         response = await client.post(f"{order_url.rstrip('/')}/checkout")
         payload = response.json()
         if response.status_code == 502 and payload.get("trace_id"):
             return str(payload["trace_id"])
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.25)
     raise RuntimeError("Live demo traffic did not produce a failed checkout trace")
 
 
@@ -87,7 +93,11 @@ async def live_demo_alert(
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=5, trust_env=False)
     try:
-        trace_id = await _find_failed_trace(client, settings.demo_order_url)
+        trace_id = await _find_failed_trace(
+            client,
+            settings.demo_order_url,
+            settings.demo_alert_timeout_seconds,
+        )
         firing_alert, _ = await asyncio.gather(
             _wait_for_firing_alert(
                 client,
@@ -124,3 +134,25 @@ async def build_demo_alert(settings: Settings) -> Alert:
     if settings.tool_backend == "simulator":
         return simulated_demo_alert(settings)
     return await live_demo_alert(settings)
+
+
+async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
+    if settings.tool_backend == "simulator":
+        return {
+            "deployment": "order-service",
+            "fault_active": True,
+            "already_active": False,
+            "revision": 2,
+            "failure_every": "simulated",
+        }
+    backend = KubernetesBackend(namespace=settings.kubernetes_namespace)
+    result = await backend.call(
+        "inject_demo_fault",
+        {
+            "name": "inventory-service",
+            "timeout_seconds": settings.demo_alert_timeout_seconds,
+        },
+    )
+    if not result.success:
+        raise RuntimeError(result.error or "Failed to inject the live demo fault")
+    return result.content

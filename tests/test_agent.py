@@ -228,3 +228,8 @@ def test_planning_diagnosis_drops_large_raw_evidence() -> None:
 
     assert "raw" not in compact["hypotheses"][0]["evidence"][0]
     assert compact["hypotheses"][0]["evidence"][0]["finding"] == "Trace failed"
+
+
+def test_chinese_output_detection() -> None:
+    assert IncidentAgent._contains_chinese("回滚 inventory-service") is True
+    assert IncidentAgent._contains_chinese("Rollback inventory-service") is False

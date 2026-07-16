@@ -181,6 +181,73 @@ class KubernetesBackend:
             "note": "Connect Prometheus MCP for request-level SLI metrics",
         }
 
+    def _tool_inject_demo_fault(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Inject the portfolio demo fault without exposing it as an Agent tool."""
+        name = arguments.get("name", "inventory-service")
+        timeout_seconds = float(arguments.get("timeout_seconds", 45))
+        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        containers = deployment.spec.template.spec.containers or []
+        container = next((item for item in containers if item.name == name), containers[0])
+        env = {item.name: item.value for item in (container.env or [])}
+        if env.get("FAIL_EVERY") not in {None, "0"}:
+            history = self._tool_get_rollout_history({"name": name})
+            active = [item for item in history["revisions"] if item["replicas"] > 0]
+            return {
+                "deployment": name,
+                "fault_active": True,
+                "already_active": True,
+                "revision": active[-1]["revision"] if active else None,
+                "failure_every": env.get("FAIL_EVERY"),
+            }
+
+        injected_at = datetime.now(UTC).isoformat()
+        body = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "sentinelops.io/change-cause": (
+                                "enable-every-third-inventory-failure"
+                            ),
+                            "sentinelops.io/fault-injected-at": injected_at,
+                        }
+                    },
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": name,
+                                "env": [{"name": "FAIL_EVERY", "value": "3"}],
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+        updated = self.apps.patch_namespaced_deployment(name, self.namespace, body)
+        target_generation = updated.metadata.generation
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            current = self.apps.read_namespaced_deployment_status(name, self.namespace)
+            desired = current.spec.replicas or 0
+            if (
+                (current.status.observed_generation or 0) >= target_generation
+                and (current.status.updated_replicas or 0) == desired
+                and (current.status.replicas or 0) == desired
+                and (current.status.ready_replicas or 0) == desired
+                and (current.status.available_replicas or 0) == desired
+            ):
+                history = self._tool_get_rollout_history({"name": name})
+                active = [item for item in history["revisions"] if item["replicas"] > 0]
+                return {
+                    "deployment": name,
+                    "fault_active": True,
+                    "already_active": False,
+                    "revision": active[-1]["revision"] if active else None,
+                    "failure_every": "3",
+                }
+            time.sleep(0.5)
+        raise RuntimeError(f"Timed out waiting for the injected fault rollout on {name}")
+
     def _tool_restart_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         body = {

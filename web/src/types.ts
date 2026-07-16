@@ -87,3 +87,11 @@ export interface RuntimeInfo {
   namespace: string;
   approval_mode: string;
 }
+
+export interface DemoFaultResult {
+  deployment: string;
+  fault_active: boolean;
+  already_active: boolean;
+  revision: number | null;
+  failure_every: string;
+}

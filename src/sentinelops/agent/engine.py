@@ -163,12 +163,31 @@ class IncidentAgent:
                 "Do not claim a root cause without citing observations. Evaluate Kubernetes "
                 "pods, logs, and rollout history together with every configured observability "
                 "source. When rollout history contains a causal change, cite that rollout "
-                "explicitly using a distinct evidence source."
+                "explicitly using a distinct evidence source. Write every human-facing text "
+                "field in Simplified Chinese, while preserving technical identifiers, queries, "
+                "tool names, and Kubernetes resource names."
             ),
             prompt=prompt,
             schema=Diagnosis,
             metadata={"incident_id": state["incident_id"], "node": "diagnose"},
         )
+        if not self._contains_chinese(diagnosis.root_cause):
+            diagnosis = await self.provider.structured(
+                system=(
+                    "你是技术内容本地化助手。必须把所有面向用户的文字字段翻译成简体中文，"
+                    "不得修改事实、置信度、查询语句、技术标识符、Kubernetes 资源名或工具名。"
+                    "只返回符合指定结构的数据。"
+                ),
+                prompt=json.dumps(
+                    self._compact_diagnosis(diagnosis.model_dump(mode="json")),
+                    ensure_ascii=False,
+                ),
+                schema=Diagnosis,
+                metadata={
+                    "incident_id": state["incident_id"],
+                    "node": "diagnose_localization",
+                },
+            )
         return {
             "diagnosis": diagnosis.model_dump(mode="json"),
             "timeline": [
@@ -203,7 +222,9 @@ class IncidentAgent:
             "Treat each available tool's declared risk as the minimum risk classification. "
             "When rollout history shows that the active revision introduced the fault and "
             "an earlier healthy revision exists, roll back to that exact healthy revision; "
-            "do not restart because a restart preserves the faulty image or configuration."
+            "do not restart because a restart preserves the faulty image or configuration. "
+            "Write every human-facing text field in Simplified Chinese, while preserving "
+            "technical identifiers, commands, and tool names."
         )
         plan: RemediationPlan | None = None
         for attempt in range(2):
@@ -256,6 +277,10 @@ class IncidentAgent:
                 for hypothesis in diagnosis.get("hypotheses", [])
             ],
         }
+
+    @staticmethod
+    def _contains_chinese(value: str) -> bool:
+        return any("\u4e00" <= character <= "\u9fff" for character in value)
 
     @staticmethod
     def _plan_feedback(
