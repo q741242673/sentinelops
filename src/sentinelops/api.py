@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +17,7 @@ from sentinelops.demo import (
     enrich_alert_with_failed_trace,
     inject_auto_demo_fault,
     inject_demo_fault,
+    reset_demo_environment,
 )
 from sentinelops.domain import Alert, IncidentRecord, IncidentStatus, TimelineEvent
 from sentinelops.runtime import build_agent
@@ -31,6 +32,7 @@ incident_records: dict[str, IncidentRecord] = {}
 alert_fingerprints: dict[str, str] = {}
 incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
+reflection_demo_armed = False
 
 
 class ApprovalDecision(BaseModel):
@@ -40,7 +42,11 @@ class ApprovalDecision(BaseModel):
 
 class DemoFaultJob(BaseModel):
     id: str
-    scenario: Literal["bad_rollout", "transient_runtime_fault"]
+    scenario: Literal[
+        "bad_rollout",
+        "transient_runtime_fault",
+        "ambiguous_change_fault",
+    ]
     status: Literal["injecting", "active", "failed"]
     result: dict[str, object] | None = None
     error: str | None = None
@@ -155,6 +161,7 @@ async def create_demo_incident() -> IncidentRecord:
 
 
 async def _run_demo_fault(job_id: str) -> None:
+    global reflection_demo_armed
     settings = get_settings()
     job = demo_fault_jobs[job_id]
     try:
@@ -167,6 +174,8 @@ async def _run_demo_fault(job_id: str) -> None:
             timeout=settings.demo_alert_timeout_seconds + 10,
         )
     except TimeoutError:
+        if job.scenario == "ambiguous_change_fault":
+            reflection_demo_armed = False
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
             update={
                 "status": "failed",
@@ -177,10 +186,18 @@ async def _run_demo_fault(job_id: str) -> None:
             }
         )
     except Exception as exc:
+        if job.scenario == "ambiguous_change_fault":
+            reflection_demo_armed = False
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
             update={"status": "failed", "error": str(exc)}
         )
     else:
+        if job.scenario == "ambiguous_change_fault":
+            result = {
+                **result,
+                "fault_type": "ambiguous_change_fault",
+                "investigation_mode": "bounded_reflection",
+            }
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
             update={"status": "active", "result": result}
         )
@@ -196,8 +213,29 @@ async def create_auto_demo_fault() -> DemoFaultJob:
     return _create_demo_fault_job("transient_runtime_fault")
 
 
+@app.post("/api/v1/demo/reflection-faults", response_model=DemoFaultJob, status_code=202)
+async def create_reflection_demo_fault() -> DemoFaultJob:
+    global reflection_demo_armed
+    reflection_demo_armed = True
+    return _create_demo_fault_job("ambiguous_change_fault")
+
+
+@app.post("/api/v1/demo/reset")
+async def reset_demo() -> dict[str, Any]:
+    global reflection_demo_armed
+    reflection_demo_armed = False
+    try:
+        return await reset_demo_environment(get_settings())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 def _create_demo_fault_job(
-    scenario: Literal["bad_rollout", "transient_runtime_fault"],
+    scenario: Literal[
+        "bad_rollout",
+        "transient_runtime_fault",
+        "ambiguous_change_fault",
+    ],
 ) -> DemoFaultJob:
     active_job = next(
         (
@@ -228,6 +266,7 @@ async def get_demo_fault(job_id: str) -> DemoFaultJob:
 
 @app.post("/api/v1/webhooks/alertmanager", status_code=202)
 async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str, object]:
+    global reflection_demo_armed
     accepted: list[dict[str, object]] = []
     for item in payload.alerts:
         fingerprint = _fingerprint(item)
@@ -239,6 +278,20 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
             continue
         if item.status != "firing":
             continue
+        if (
+            reflection_demo_armed
+            and item.labels.get("alertname") == "HighInventoryErrorRate"
+        ):
+            item = item.model_copy(
+                update={
+                    "labels": {
+                        **item.labels,
+                        "reflection_demo": "true",
+                        "demo_mode": "complex_investigation",
+                    }
+                }
+            )
+            reflection_demo_armed = False
         existing_id = alert_fingerprints.get(fingerprint)
         if existing_id:
             accepted.append(

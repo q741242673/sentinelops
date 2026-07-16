@@ -4,7 +4,28 @@ import httpx
 import pytest
 
 from sentinelops.config import Settings
-from sentinelops.demo import live_demo_alert
+from sentinelops.demo import _post_with_transport_retry, live_demo_alert
+
+
+@pytest.mark.asyncio
+async def test_transient_fault_post_retries_port_forward_disconnect() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response",
+                request=request,
+            )
+        return httpx.Response(200, json={"fault_active": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await _post_with_transport_retry(client, "http://inventory.test/fault")
+
+    assert response.json() == {"fault_active": True}
+    assert attempts == 3
 
 
 @pytest.mark.asyncio

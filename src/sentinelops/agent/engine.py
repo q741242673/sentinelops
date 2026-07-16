@@ -247,12 +247,16 @@ class IncidentAgent:
 
     async def _assess_diagnosis(self, state: IncidentState) -> dict[str, Any]:
         diagnosis = Diagnosis.model_validate(state["diagnosis"])
-        needs_reflection = self._diagnosis_requires_reflection(diagnosis)
+        needs_reflection = self._state_requires_reflection(state, diagnosis)
         rounds = state.get("reflection_rounds", 0)
         if not needs_reflection:
             review = DiagnosisReview(
                 sufficient=True,
                 confidence=diagnosis.confidence,
+                follow_up_queries=[
+                    FollowUpQuery.model_validate(item)
+                    for item in state.get("follow_up_queries", [])[:4]
+                ],
             )
         elif rounds >= self.max_reflection_rounds:
             review = DiagnosisReview(
@@ -260,6 +264,10 @@ class IncidentAgent:
                 confidence=diagnosis.confidence,
                 contradictions=self._diagnosis_contradictions(diagnosis),
                 missing_evidence=["补查预算已耗尽，现有证据不足以安全执行修复"],
+                follow_up_queries=[
+                    FollowUpQuery.model_validate(item)
+                    for item in state.get("follow_up_queries", [])[:4]
+                ],
             )
         else:
             review = await self.provider.structured(
@@ -322,7 +330,7 @@ class IncidentAgent:
 
     def _route_after_assessment(self, state: IncidentState) -> str:
         diagnosis = Diagnosis.model_validate(state["diagnosis"])
-        if not self._diagnosis_requires_reflection(diagnosis):
+        if not self._state_requires_reflection(state, diagnosis):
             return "plan"
         if state.get("reflection_rounds", 0) >= self.max_reflection_rounds:
             return "escalate"
@@ -395,6 +403,17 @@ class IncidentAgent:
                 for evidence in hypothesis.evidence
             )
         )
+
+    def _state_requires_reflection(
+        self,
+        state: IncidentState,
+        diagnosis: Diagnosis,
+    ) -> bool:
+        force_demo_round = (
+            state["alert"].get("labels", {}).get("reflection_demo") == "true"
+            and state.get("reflection_rounds", 0) == 0
+        )
+        return force_demo_round or self._diagnosis_requires_reflection(diagnosis)
 
     @staticmethod
     def _diagnosis_contradictions(diagnosis: Diagnosis) -> list[str]:
@@ -990,6 +1009,9 @@ class IncidentAgent:
                 state["diagnosis_review"]
             )
         record.reflection_rounds = int(state.get("reflection_rounds", 0))
+        changes = state.get("observations", {}).get("changes")
+        if isinstance(changes, dict):
+            record.change_evidence = changes
         if state.get("plan"):
             record.plan = RemediationPlan.model_validate(state["plan"])
         elif state.get("status") == IncidentStatus.ESCALATED.value:

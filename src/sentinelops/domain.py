@@ -134,6 +134,7 @@ class IncidentRecord(BaseModel):
     diagnosis: Diagnosis | None = None
     diagnosis_review: DiagnosisReview | None = None
     reflection_rounds: int = 0
+    change_evidence: dict[str, Any] | None = None
     plan: RemediationPlan | None = None
     approval: ApprovalRequest | None = None
     execution_results: list[ToolResult] = Field(default_factory=list)

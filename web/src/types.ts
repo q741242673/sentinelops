@@ -46,6 +46,18 @@ export interface DiagnosisReview {
   follow_up_queries: Array<{ source: string; reason: string }>;
 }
 
+export interface ChangeEvidence {
+  repository?: string;
+  correlation_status?: string;
+  correlation_summary?: string;
+  current_rollout?: Record<string, unknown> | null;
+  previous_rollout?: Record<string, unknown> | null;
+  current_commit?: Record<string, unknown> | null;
+  previous_commit?: Record<string, unknown> | null;
+  changed_files?: string[];
+  recent_commits?: Array<Record<string, unknown>>;
+}
+
 export interface RemediationAction {
   tool_name: string;
   arguments: Record<string, unknown>;
@@ -75,6 +87,7 @@ export interface Incident {
   diagnosis: Diagnosis | null;
   diagnosis_review: DiagnosisReview | null;
   reflection_rounds: number;
+  change_evidence: ChangeEvidence | null;
   plan: RemediationPlan | null;
   approval: unknown | null;
   execution_results: Array<{
@@ -112,7 +125,7 @@ export interface DemoFaultResult {
 
 export interface DemoFaultJob {
   id: string;
-  scenario: "bad_rollout" | "transient_runtime_fault";
+  scenario: "bad_rollout" | "transient_runtime_fault" | "ambiguous_change_fault";
   status: "injecting" | "active" | "failed";
   result: DemoFaultResult | null;
   error: string | null;

@@ -89,15 +89,20 @@ SENTINELOPS_MODEL_API_KEY=replace-me make console-live
 ```
 
 This mode creates a healthy kind cluster and deploys Prometheus, Alertmanager, Loki, Tempo,
-OpenTelemetry Collector and the demo services. The Chinese console offers two real workflows:
+OpenTelemetry Collector and the demo services. The Chinese console offers three real workflows:
 
 - **人工审批** injects a faulty rollout. Prometheus fires `HighInventoryErrorRate`; DeepSeek
   diagnoses it in Simplified Chinese and proposes a high-risk rollback that pauses for approval.
 - **自动修复** injects an in-memory runtime fault. Prometheus fires
   `InventoryTransientRuntimeFault`; DeepSeek diagnoses it in Simplified Chinese and the scoped
   demo policy automatically authorizes a medium-risk rolling restart without a human click.
+- **复杂调查** injects an ambiguous configuration rollout. The first diagnosis passes through a
+  bounded reflection round, the Agent selects at most four predefined read-only follow-ups, and
+  the console displays verified Git SHA versus Kubernetes revision correlation. If evidence still
+  conflicts, the graph escalates without a cluster write and offers an explicit operator-only
+  button to restore the demo baseline.
 
-Both workflows enter through Alertmanager, collect Kubernetes, Prometheus, Loki, and Tempo
+All workflows enter through Alertmanager, collect Kubernetes, Prometheus, Loki, and Tempo
 evidence, and use deterministic recovery verification rather than asking the model whether its
 own action succeeded. The provider remains replaceable through the existing model variables. The
 cluster is retained when the console stops so subsequent starts can reuse the node image. Remove

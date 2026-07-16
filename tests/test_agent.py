@@ -150,6 +150,24 @@ async def test_high_confidence_diagnosis_skips_reflection_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complex_demo_forces_one_visible_reflection_round() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    alert = make_alert().model_copy(
+        update={"labels": {"reflection_demo": "true"}}
+    )
+
+    record = await agent.start(alert)
+
+    assert record.status == IncidentStatus.AWAITING_APPROVAL
+    assert record.reflection_rounds == 1
+    assert any(event.type == "investigation.reflection_requested" for event in record.timeline)
+    assert any(event.type == "evidence.supplemented" for event in record.timeline)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scenario", ["bad_rollout", "db_pool_exhaustion"])
 async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
     settings = Settings(tool_backend="simulator", model_provider="rule_based")

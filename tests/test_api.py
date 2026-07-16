@@ -57,6 +57,15 @@ async def test_api_incident_approval_flow() -> None:
         assert auto_fault.status_code == 202
         assert auto_fault.json()["scenario"] == "transient_runtime_fault"
 
+        reflection_fault = await client.post("/api/v1/demo/reflection-faults")
+        assert reflection_fault.status_code == 202
+        assert reflection_fault.json()["scenario"] == "ambiguous_change_fault"
+        api_module.reflection_demo_armed = False
+
+        reset = await client.post("/api/v1/demo/reset")
+        assert reset.status_code == 200
+        assert reset.json()["baseline_restored"] is True
+
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
             json={"approved": True, "note": "approved in API test"},
@@ -89,6 +98,7 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
 ) -> None:
     api_module.alert_fingerprints.clear()
     api_module.incident_records.clear()
+    api_module.reflection_demo_armed = True
     monkeypatch.setattr(api_module, "_schedule_investigation", lambda *_: None)
     payload = {
         "status": "firing",
@@ -128,5 +138,7 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
         "incident_id": incident_id,
     }
     assert api_module.incident_records[incident_id].alert.labels["source"] == "alertmanager"
+    assert api_module.incident_records[incident_id].alert.labels["reflection_demo"] == "true"
+    assert api_module.reflection_demo_armed is False
     assert resolved.json()["accepted"][0]["status"] == "resolved"
     assert "demo-fingerprint" not in api_module.alert_fingerprints

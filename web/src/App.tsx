@@ -55,10 +55,20 @@ const TOOL_LABELS: Record<string, string> = {
   scale_deployment: "调整副本数",
 };
 
-type DemoMode = "manual" | "auto";
+type DemoMode = "manual" | "auto" | "reflection";
 
 function shortId(id: string): string {
   return id.slice(0, 8).toUpperCase();
+}
+
+function recordValue(record: Record<string, unknown> | null | undefined, key: string): string {
+  const value = record?.[key];
+  return value === null || value === undefined ? "—" : String(value);
+}
+
+function shortSha(record: Record<string, unknown> | null | undefined): string {
+  const sha = recordValue(record, "sha");
+  return sha === "—" ? sha : sha.slice(0, 10);
 }
 
 function timeLabel(value: string): string {
@@ -82,6 +92,15 @@ function sourceLabel(source: string): string {
     "kubernetes.events": "Kubernetes 事件",
     "kubernetes.logs": "Kubernetes 日志",
     "git.change": "Git 变更记录",
+    git_changes: "Git 变更记录",
+    kubernetes_pods: "Kubernetes Pods",
+    kubernetes_events: "Kubernetes 事件",
+    kubernetes_logs: "Kubernetes 日志",
+    kubernetes_rollout: "Kubernetes 发布历史",
+    prometheus_errors: "Prometheus 错误率",
+    prometheus_latency: "Prometheus 延迟",
+    loki_errors: "Loki 错误日志",
+    tempo_trace: "Tempo 链路",
   };
   return labels[source.toLowerCase()] ?? source;
 }
@@ -203,12 +222,18 @@ function DemoRunbook({
     ["approval.decided", "approval.auto_approved"].includes(event.type)
   ) ?? false;
   const autoMode = mode === "auto";
+  const reflectionMode = mode === "reflection";
+  const title = autoMode
+    ? "无人值守自动修复"
+    : reflectionMode
+      ? "复杂变更调查"
+      : "人工审批安全修复";
   return (
     <section className="demo-runbook">
       <div className="demo-runbook-head">
         <div>
           <span className="section-kicker">本地真实演示</span>
-          <h2>{autoMode ? "无人值守自动修复" : "人工审批安全修复"}</h2>
+          <h2>{title}</h2>
         </div>
         <span className="demo-mode"><i />{liveMode ? "真实 kind 集群" : "Simulator 模式"}</span>
       </div>
@@ -216,8 +241,8 @@ function DemoRunbook({
         <button
           type="button"
           role="tab"
-          aria-selected={!autoMode}
-          className={!autoMode ? "active" : ""}
+          aria-selected={mode === "manual"}
+          className={mode === "manual" ? "active" : ""}
           onClick={() => onModeChange("manual")}
           disabled={faultBusy || actionBusy}
         >
@@ -233,21 +258,31 @@ function DemoRunbook({
         >
           <strong>自动修复</strong><span>中风险重启由策略自动授权</span>
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={reflectionMode}
+          className={reflectionMode ? "active reflection" : ""}
+          onClick={() => onModeChange("reflection")}
+          disabled={faultBusy || actionBusy}
+        >
+          <strong>复杂调查</strong><span>低置信度反思 + Git 变更关联</span>
+        </button>
       </div>
       <div className="demo-steps">
         <article className={faultReady ? "complete" : "active"}>
           <span className="demo-step-number">1</span>
           <div>
-            <strong>{autoMode ? "注入进程内瞬态故障" : "注入错误发布"}</strong>
-            <p>{autoMode ? "模拟只能通过重启清除的内存状态异常" : "让 inventory-service 每 3 次请求失败 1 次"}</p>
+            <strong>{autoMode ? "注入进程内瞬态故障" : reflectionMode ? "注入歧义配置发布" : "注入错误发布"}</strong>
+            <p>{autoMode ? "模拟只能通过重启清除的内存状态异常" : reflectionMode ? "制造真实 503，同时让 Git 证据证明本次并非代码变更" : "让 inventory-service 每 3 次请求失败 1 次"}</p>
           </div>
           <button type="button" onClick={onInject} disabled={faultBusy || actionBusy}>
-            {faultBusy ? "正在注入…" : faultReady ? "再次运行" : autoMode ? "启动自动修复演示" : "注入真实故障"}
+            {faultBusy ? "正在注入…" : faultReady ? "再次运行" : autoMode ? "启动自动修复演示" : reflectionMode ? "启动复杂调查" : "注入真实故障"}
           </button>
         </article>
         <article className={investigated ? "complete" : faultReady ? "active" : ""}>
           <span className="demo-step-number">2</span>
-          <div><strong>自动发现与中文诊断</strong><p>Alertmanager 推送后，DeepSeek 自动关联全部证据</p></div>
+          <div><strong>{reflectionMode ? "反思并定向补充证据" : "自动发现与中文诊断"}</strong><p>{reflectionMode ? "首轮诊断触发质量门，Agent 再查日志、指标、rollout 与 Git" : "Alertmanager 推送后，DeepSeek 自动关联全部证据"}</p></div>
           {liveMode ? (
             <span className="demo-step-state">
               {investigated ? "Agent 已自动启动" : faultReady ? "等待 Alertmanager 推送" : "注入后无需手动点击"}
@@ -261,11 +296,11 @@ function DemoRunbook({
         <article className={approved ? "complete" : incident?.status === "awaiting_approval" ? "active" : ""}>
           <span className="demo-step-number">3</span>
           <div>
-            <strong>{autoMode ? "策略授权并自动验证" : "人工批准并验证"}</strong>
-            <p>{autoMode ? "策略自动批准 Deployment 重启并验证恢复" : "检查回滚版本，批准后自动验证错误率"}</p>
+            <strong>{autoMode ? "策略授权并自动验证" : reflectionMode ? "质量门最终决策" : "人工批准并验证"}</strong>
+            <p>{autoMode ? "策略自动批准 Deployment 重启并验证恢复" : reflectionMode ? "证据充分才进入审批；仍有矛盾则停止写操作并升级人工" : "检查回滚版本，批准后自动验证错误率"}</p>
           </div>
           <span className="demo-step-state">
-            {incident?.status === "resolved" ? "修复完成" : incident?.status === "awaiting_approval" ? "请在右侧批准" : approved ? "已自动授权，正在修复" : "等待调查结果"}
+            {incident?.status === "resolved" ? "修复完成" : incident?.status === "escalated" ? "证据仍冲突，已安全升级" : incident?.status === "awaiting_approval" ? "请在右侧批准" : approved ? "已自动授权，正在修复" : "等待调查结果"}
           </span>
         </article>
       </div>
@@ -285,6 +320,7 @@ function App() {
   const [faultReady, setFaultReady] = useState<Record<DemoMode, boolean>>({
     manual: false,
     auto: false,
+    reflection: false,
   });
   const [demoMessage, setDemoMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -296,7 +332,8 @@ function App() {
         setSelectedId(next[0].id);
         if (next[0].alert.labels.source === "alertmanager") {
           setDemoMessage("Alertmanager 已自动发现告警，Agent 正在后台采集证据并调查根因。 ");
-          if (next[0].alert.labels.auto_remediation === "true") setDemoMode("auto");
+          if (next[0].alert.labels.reflection_demo === "true") setDemoMode("reflection");
+          else if (next[0].alert.labels.auto_remediation === "true") setDemoMode("auto");
         }
       }
       return next;
@@ -348,7 +385,19 @@ function App() {
   const requestErrorRate = verification?.data.request_error_rate;
   const liveMode = runtime?.tool_backend === "kubernetes";
   const selectedIsAuto = selected?.alert.labels.auto_remediation === "true";
-  const demoIncident = selected && selectedIsAuto === (demoMode === "auto") ? selected : null;
+  const selectedMode: DemoMode = selected?.alert.labels.reflection_demo === "true"
+    ? "reflection"
+    : selectedIsAuto
+      ? "auto"
+      : "manual";
+  const demoIncident = selected && selectedMode === demoMode ? selected : null;
+  const changeEvidence = selected?.change_evidence;
+  const changeStatusLabels: Record<string, string> = {
+    verified: "已验证代码变更",
+    no_code_change: "已验证：无代码变更",
+    current_commit_verified: "当前提交已验证",
+    temporal_candidates: "仅时间候选，未建立因果",
+  };
 
   async function injectFault() {
     setFaultBusy(true);
@@ -357,7 +406,9 @@ function App() {
     try {
       let job = demoMode === "auto"
         ? await api.injectAutoDemoFault()
-        : await api.injectDemoFault();
+        : demoMode === "reflection"
+          ? await api.injectReflectionDemoFault()
+          : await api.injectDemoFault();
       setDemoMessage("故障注入任务已提交，正在等待 Kubernetes 完成滚动更新…");
       const deadline = Date.now() + 70_000;
       while (job.status === "injecting" && Date.now() < deadline) {
@@ -375,6 +426,8 @@ function App() {
       setDemoMessage(
         demoMode === "auto"
           ? "瞬态故障已激活。接下来无需操作：Alertmanager 会启动 DeepSeek，安全策略将自动授权重启并验证恢复。"
+          : demoMode === "reflection"
+            ? `复杂故障已注入：revision ${result.revision ?? "—"}。Agent 将强制经过一轮诊断质量反思，并核对 Git 与 rollout。`
           : result.already_active
             ? `故障已经存在：revision ${result.revision ?? "—"}，正在等待 Alertmanager 自动推送。`
             : `故障已注入：revision ${result.revision ?? "—"}。接下来无需点击，Alertmanager 会自动启动 Agent。`,
@@ -420,6 +473,20 @@ function App() {
       );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "审批操作失败");
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function resetDemoBaseline() {
+    setActionBusy(true);
+    setError(null);
+    try {
+      await api.resetDemoEnvironment();
+      setFaultReady({ manual: false, auto: false, reflection: false });
+      setDemoMessage("演示环境已由运维人员显式恢复到健康基线，可以开始下一轮演示。");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "无法恢复演示环境");
     } finally {
       setActionBusy(false);
     }
@@ -557,8 +624,8 @@ function App() {
               <article><span>关联证据</span><strong>{evidence.length}</strong><small>跨系统关联的数据源</small></article>
               <article>
                 <span>安全模式</span>
-                <strong>{selectedIsAuto ? "策略自动授权" : "人工审批门"}</strong>
-                <small>{selectedIsAuto ? "中风险操作按策略自动执行" : "高风险操作不会自动执行"}</small>
+                <strong>{selectedMode === "reflection" ? "反思质量门" : selectedIsAuto ? "策略自动授权" : "人工审批门"}</strong>
+                <small>{selectedMode === "reflection" ? `${selected.reflection_rounds} 轮定向补查后再规划` : selectedIsAuto ? "中风险操作按策略自动执行" : "高风险操作不会自动执行"}</small>
               </article>
             </section>
 
@@ -597,6 +664,45 @@ function App() {
                     <p>{selected.diagnosis?.hypotheses[0]?.statement ?? "等待模型分析"}</p>
                   </div>
                 </article>
+
+                {(selected.reflection_rounds > 0 || changeEvidence) && (
+                  <section className="panel investigation-panel">
+                    <div className="section-heading">
+                      <div><span className="section-kicker">可审计推理</span><h2>反思循环与 Git 变更关联</h2></div>
+                      <span className="reflection-badge">{selected.reflection_rounds} 轮补查</span>
+                    </div>
+                    <div className="reflection-summary">
+                      <div><span>诊断质量门</span><strong>{selected.diagnosis_review?.sufficient ? "补查后证据充分" : "仍需人工判断"}</strong></div>
+                      <div><span>关联结论</span><strong>{changeStatusLabels[changeEvidence?.correlation_status ?? ""] ?? "等待 Git 证据"}</strong></div>
+                    </div>
+                    {changeEvidence && (
+                      <div className="change-correlation">
+                        <div className="change-line">
+                          <span>上一 revision</span>
+                          <code>r{recordValue(changeEvidence.previous_rollout, "revision")} · {shortSha(changeEvidence.previous_commit)}</code>
+                        </div>
+                        <div className="change-arrow">→</div>
+                        <div className="change-line current">
+                          <span>当前 revision</span>
+                          <code>r{recordValue(changeEvidence.current_rollout, "revision")} · {shortSha(changeEvidence.current_commit)}</code>
+                        </div>
+                        <p>{changeEvidence.correlation_summary}</p>
+                        <div className="changed-files">
+                          <span>变更文件</span>
+                          <code>{changeEvidence.changed_files?.length ? changeEvidence.changed_files.join(", ") : "无代码文件变化（配置级 rollout）"}</code>
+                        </div>
+                      </div>
+                    )}
+                    {!!selected.diagnosis_review?.follow_up_queries.length && (
+                      <div className="follow-up-list">
+                        <span>定向补查</span>
+                        {selected.diagnosis_review.follow_up_queries.map((query) => (
+                          <p key={query.source}><i>↳</i><strong>{sourceLabel(query.source)}</strong>{query.reason}</p>
+                        ))}
+                      </div>
+                    )}
+                  </section>
+                )}
 
                 <section className="panel evidence-panel">
                   <div className="section-heading">
@@ -653,7 +759,14 @@ function App() {
                     </div>
                   )}
                   {selected.status === "rejected" && <div className="rejected-card">自动化流程已被运维人员终止。</div>}
-                  {selected.status === "escalated" && <div className="rejected-card">证据不足，未执行任何集群写操作。</div>}
+                  {selected.status === "escalated" && (
+                    <div className="rejected-card escalated-card">
+                      <span>证据不足，Agent 未执行任何集群写操作。</span>
+                      <button type="button" onClick={resetDemoBaseline} disabled={actionBusy}>
+                        {actionBusy ? "正在恢复…" : "运维接管：恢复演示基线"}
+                      </button>
+                    </div>
+                  )}
                 </section>
               </aside>
             </div>

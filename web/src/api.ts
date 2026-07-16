@@ -39,8 +39,16 @@ export const api = {
     request<DemoFaultJob>("/api/v1/demo/auto-faults", {
       method: "POST",
     }),
+  injectReflectionDemoFault: () =>
+    request<DemoFaultJob>("/api/v1/demo/reflection-faults", {
+      method: "POST",
+    }),
   getDemoFaultJob: (jobId: string) =>
     request<DemoFaultJob>(`/api/v1/demo/faults/${jobId}`),
+  resetDemoEnvironment: () =>
+    request<{ baseline_restored: boolean }>("/api/v1/demo/reset", {
+      method: "POST",
+    }),
   decideIncident: (incidentId: string, approved: boolean) =>
     request<Incident>(`/api/v1/incidents/${incidentId}/approval`, {
       method: "POST",

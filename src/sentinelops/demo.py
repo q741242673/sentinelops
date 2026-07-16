@@ -187,8 +187,86 @@ async def inject_auto_demo_fault(settings: Settings) -> dict[str, Any]:
     if not settings.demo_inventory_url:
         raise RuntimeError("SENTINELOPS_DEMO_INVENTORY_URL is required for the auto demo")
     async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
-        response = await client.post(
-            f"{settings.demo_inventory_url.rstrip('/')}/demo/transient-fault"
-        )
+        try:
+            response = await _post_with_transport_retry(
+                client,
+                f"{settings.demo_inventory_url.rstrip('/')}/demo/transient-fault",
+            )
+        except httpx.TransportError as exc:
+            raise RuntimeError(
+                "连接 inventory-service 失败；本地 port-forward 已重试 5 次，"
+                "请稍后再次启动演示"
+            ) from exc
         response.raise_for_status()
         return dict(response.json())
+
+
+async def reset_demo_environment(settings: Settings) -> dict[str, Any]:
+    """Explicit operator cleanup after a deliberately escalated demo incident."""
+    if settings.tool_backend == "simulator":
+        return {"deployment": "inventory-service", "baseline_restored": True}
+    backend = KubernetesBackend(namespace=settings.kubernetes_namespace)
+    history = await backend.call("get_rollout_history", {"name": "inventory-service"})
+    if not history.success:
+        raise RuntimeError(history.error or "Could not inspect demo rollout history")
+    revisions = history.content.get("revisions", [])
+    active = [
+        item
+        for item in revisions
+        if (item.get("replicas") or 0) > 0 or (item.get("ready_replicas") or 0) > 0
+    ]
+    if not active:
+        raise RuntimeError("No active inventory-service revision was found")
+    current = max(active, key=lambda item: int(item.get("revision", 0)))
+    previous = [
+        item
+        for item in revisions
+        if int(item.get("revision", 0)) < int(current.get("revision", 0))
+    ]
+    if not previous:
+        raise RuntimeError("No prior inventory-service revision was found")
+    target = max(previous, key=lambda item: int(item.get("revision", 0)))
+    rollback = await backend.call(
+        "rollback_deployment",
+        {"name": "inventory-service", "revision": int(target["revision"])},
+    )
+    if not rollback.success:
+        raise RuntimeError(rollback.error or "Could not restore the demo baseline")
+
+    for _ in range(60):
+        metrics, pods = await asyncio.gather(
+            backend.call("get_service_metrics", {"name": "inventory-service"}),
+            backend.call("list_pods", {"label_selector": "app=inventory-service"}),
+        )
+        pod_items = pods.content.get("items", [])
+        if (
+            metrics.success
+            and metrics.content.get("availability") == 1
+            and pods.success
+            and pod_items
+            and all(item.get("ready") for item in pod_items)
+        ):
+            return {
+                "deployment": "inventory-service",
+                "baseline_restored": True,
+                "source_revision": int(target["revision"]),
+            }
+        await asyncio.sleep(0.5)
+    raise RuntimeError("Timed out waiting for the restored demo baseline")
+
+
+async def _post_with_transport_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    attempts: int = 5,
+) -> httpx.Response:
+    """Retry only transient transport failures caused by local port-forward churn."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await client.post(url)
+        except httpx.TransportError:
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(0.4 * attempt)
+    raise AssertionError("unreachable")
