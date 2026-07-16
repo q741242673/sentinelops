@@ -6,6 +6,11 @@ from sentinelops.agent import IncidentAgent
 from sentinelops.config import Settings
 from sentinelops.domain import (
     Alert,
+    Diagnosis,
+    DiagnosisReview,
+    Evidence,
+    FollowUpQuery,
+    Hypothesis,
     IncidentStatus,
     RemediationAction,
     RemediationPlan,
@@ -19,6 +24,72 @@ from sentinelops.tools.registry import KUBERNETES_TOOL_SPECS, ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
 
+class ReflectionProvider:
+    name = "reflection_test"
+
+    def __init__(self, *, recover_confidence: bool) -> None:
+        self.recover_confidence = recover_confidence
+        self.diagnosis_calls = 0
+        self.review_calls = 0
+        self.plan_calls = 0
+        self.fallback = RuleBasedProvider()
+
+    async def structured(self, *, system, prompt, schema, metadata=None):
+        if schema is Diagnosis:
+            self.diagnosis_calls += 1
+            confidence = 0.95 if self.recover_confidence and self.diagnosis_calls > 1 else 0.55
+            return Diagnosis(
+                root_cause="最新发布可能导致服务启动失败",
+                confidence=confidence,
+                hypotheses=[
+                    Hypothesis(
+                        statement="最新发布引入错误配置",
+                        confidence=confidence,
+                        evidence=[
+                            Evidence(
+                                source="kubernetes.rollout",
+                                query="get_rollout_history",
+                                finding="故障与 revision 2 同时出现",
+                            )
+                        ],
+                    )
+                ],
+                evidence_summary=["故障与 revision 2 同时出现"],
+            )
+        if schema is DiagnosisReview:
+            self.review_calls += 1
+            return DiagnosisReview(
+                sufficient=False,
+                confidence=0.55,
+                missing_evidence=["缺少目标 Pod 的最新日志"],
+                follow_up_queries=[
+                    FollowUpQuery(
+                        source="kubernetes_logs",
+                        reason="补充日志验证配置错误",
+                    )
+                ],
+            )
+        if schema is RemediationPlan:
+            self.plan_calls += 1
+            return await self.fallback.structured(
+                system=system,
+                prompt=prompt,
+                schema=schema,
+                metadata=metadata,
+            )
+        raise TypeError(schema)
+
+
+class RecordingSimulator(SimulatedKubernetesBackend):
+    def __init__(self) -> None:
+        super().__init__(scenario="bad_rollout")
+        self.calls: list[str] = []
+
+    async def call(self, name, arguments) -> ToolResult:
+        self.calls.append(name)
+        return await super().call(name, arguments)
+
+
 def make_alert() -> Alert:
     return Alert(
         name="HighErrorRate",
@@ -27,6 +98,55 @@ def make_alert() -> Alert:
         severity="critical",
         summary="Error rate exceeded SLO",
     )
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_diagnosis_collects_one_bounded_follow_up_round() -> None:
+    provider = ReflectionProvider(recover_confidence=True)
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=provider, tools=ToolRegistry(backend))
+
+    record = await agent.start(make_alert())
+
+    assert record.status == IncidentStatus.AWAITING_APPROVAL
+    assert record.reflection_rounds == 1
+    assert provider.diagnosis_calls == 2
+    assert provider.review_calls == 1
+    assert provider.plan_calls == 1
+    assert backend.calls.count("get_pod_logs") == 2
+    assert any(event.type == "investigation.reflection_requested" for event in record.timeline)
+    assert any(event.type == "evidence.supplemented" for event in record.timeline)
+
+
+@pytest.mark.asyncio
+async def test_persistently_weak_diagnosis_escalates_without_cluster_write() -> None:
+    provider = ReflectionProvider(recover_confidence=False)
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=provider, tools=ToolRegistry(backend))
+
+    record = await agent.start(make_alert())
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.reflection_rounds == 1
+    assert record.plan is None
+    assert record.approval is None
+    assert record.execution_results == []
+    assert provider.plan_calls == 0
+    assert not {"restart_deployment", "rollback_deployment"}.intersection(backend.calls)
+    assert any(event.type == "investigation.escalated" for event in record.timeline)
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_diagnosis_skips_reflection_call() -> None:
+    provider = RuleBasedProvider()
+    agent = IncidentAgent(provider=provider, tools=ToolRegistry(SimulatedKubernetesBackend()))
+
+    record = await agent.start(make_alert())
+
+    assert record.status == IncidentStatus.AWAITING_APPROVAL
+    assert record.reflection_rounds == 0
+    assert record.diagnosis_review is not None
+    assert record.diagnosis_review.sufficient is True
 
 
 @pytest.mark.asyncio

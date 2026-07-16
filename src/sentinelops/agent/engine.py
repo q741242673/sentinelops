@@ -17,6 +17,8 @@ from sentinelops.domain import (
     Alert,
     ApprovalRequest,
     Diagnosis,
+    DiagnosisReview,
+    FollowUpQuery,
     IncidentRecord,
     IncidentStatus,
     RemediationAction,
@@ -41,6 +43,8 @@ class IncidentAgent:
         tools: ToolRegistry,
         auto_approve_max_risk: RiskLevel = RiskLevel.LOW,
         verification_probe_url: str | None = None,
+        diagnosis_confidence_threshold: float = 0.8,
+        max_reflection_rounds: int = 1,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -48,6 +52,8 @@ class IncidentAgent:
         self.verification_probe_url = (
             verification_probe_url.rstrip("/") if verification_probe_url else None
         )
+        self.diagnosis_confidence_threshold = diagnosis_confidence_threshold
+        self.max_reflection_rounds = max_reflection_rounds
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         self.records: dict[str, IncidentRecord] = {}
@@ -56,6 +62,9 @@ class IncidentAgent:
         builder = StateGraph(IncidentState)
         builder.add_node("collect_context", self._collect_context)
         builder.add_node("diagnose", self._diagnose)
+        builder.add_node("assess_diagnosis", self._assess_diagnosis)
+        builder.add_node("collect_follow_up", self._collect_follow_up)
+        builder.add_node("escalate", self._escalate)
         builder.add_node("plan", self._plan)
         builder.add_node("prepare_approval", self._prepare_approval)
         builder.add_node("human_gate", self._human_gate)
@@ -65,7 +74,14 @@ class IncidentAgent:
 
         builder.add_edge(START, "collect_context")
         builder.add_edge("collect_context", "diagnose")
-        builder.add_edge("diagnose", "plan")
+        builder.add_edge("diagnose", "assess_diagnosis")
+        builder.add_conditional_edges(
+            "assess_diagnosis",
+            self._route_after_assessment,
+            {"collect_follow_up": "collect_follow_up", "plan": "plan", "escalate": "escalate"},
+        )
+        builder.add_edge("collect_follow_up", "diagnose")
+        builder.add_edge("escalate", "postmortem")
         builder.add_edge("plan", "prepare_approval")
         builder.add_conditional_edges(
             "prepare_approval",
@@ -104,6 +120,7 @@ class IncidentAgent:
             "alert": alert.model_dump(mode="json"),
             "status": IncidentStatus.RECEIVED.value,
             "execution_results": [],
+            "reflection_rounds": 0,
             "timeline": timeline,
         }
         result = await self.graph.ainvoke(state, self._config(record.id))
@@ -164,6 +181,9 @@ class IncidentAgent:
         for key, (tool_name, arguments) in calls.items():
             result = await self.tools.call(tool_name, arguments)
             observations[key] = result.content if result.success else {"error": result.error}
+        if self.tools.has_tool("get_change_evidence"):
+            result = await self.tools.call("get_change_evidence", {"service": service})
+            observations["changes"] = result.content if result.success else {"error": result.error}
         observations["scenario"] = observations.get("metrics", {}).get("scenario", "live_cluster")
         return {
             "status": IncidentStatus.INVESTIGATING.value,
@@ -172,10 +192,17 @@ class IncidentAgent:
         }
 
     async def _diagnose(self, state: IncidentState) -> dict[str, Any]:
-        prompt = json.dumps(
-            {"alert": state["alert"], "observations": state["observations"]},
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "alert": state["alert"],
+            "observations": state["observations"],
+            "investigation_round": state.get("reflection_rounds", 0) + 1,
+        }
+        if state.get("diagnosis"):
+            payload["previous_diagnosis"] = self._compact_diagnosis(state["diagnosis"])
+            payload["instruction"] = (
+                "根据新增补查证据重新评估原假设，明确说明新证据支持或否定了什么。"
+            )
+        prompt = json.dumps(payload, ensure_ascii=False)
         diagnosis = await self.provider.structured(
             system=(
                 "你是一名以证据为依据的 Kubernetes 事故调查专家。没有观测证据时不得断言根因。"
@@ -213,15 +240,299 @@ class IncidentAgent:
                     "diagnosis.completed",
                     diagnosis.root_cause,
                     confidence=diagnosis.confidence,
+                    round=state.get("reflection_rounds", 0) + 1,
                 )
             ],
         }
+
+    async def _assess_diagnosis(self, state: IncidentState) -> dict[str, Any]:
+        diagnosis = Diagnosis.model_validate(state["diagnosis"])
+        needs_reflection = self._diagnosis_requires_reflection(diagnosis)
+        rounds = state.get("reflection_rounds", 0)
+        if not needs_reflection:
+            review = DiagnosisReview(
+                sufficient=True,
+                confidence=diagnosis.confidence,
+            )
+        elif rounds >= self.max_reflection_rounds:
+            review = DiagnosisReview(
+                sufficient=False,
+                confidence=diagnosis.confidence,
+                contradictions=self._diagnosis_contradictions(diagnosis),
+                missing_evidence=["补查预算已耗尽，现有证据不足以安全执行修复"],
+            )
+        else:
+            review = await self.provider.structured(
+                system=(
+                    "你是 Kubernetes 事故调查质量审查专家。诊断尚未通过确定性质量门。"
+                    "只能从给定的只读证据来源中选择最多 4 个定向补查意图，不能请求写操作、"
+                    "Shell、Secret 或任意文件路径。reason、contradictions 和 missing_evidence "
+                    "必须使用简体中文。"
+                ),
+                prompt=json.dumps(
+                    {
+                        "alert": state["alert"],
+                        "diagnosis": self._compact_diagnosis(state["diagnosis"]),
+                        "available_sources": self._available_follow_up_sources(state),
+                        "already_collected": sorted(state["observations"].keys()),
+                        "remaining_rounds": self.max_reflection_rounds - rounds,
+                    },
+                    ensure_ascii=False,
+                ),
+                schema=DiagnosisReview,
+                metadata={"incident_id": state["incident_id"], "node": "assess_diagnosis"},
+            )
+            review = review.model_copy(
+                update={
+                    "sufficient": False,
+                    "confidence": min(review.confidence, diagnosis.confidence),
+                    "contradictions": list(
+                        dict.fromkeys(
+                            [*self._diagnosis_contradictions(diagnosis), *review.contradictions]
+                        )
+                    ),
+                    "follow_up_queries": self._sanitize_follow_up_queries(
+                        review.follow_up_queries, state
+                    ),
+                }
+            )
+            if not review.follow_up_queries:
+                review = review.model_copy(
+                    update={
+                        "follow_up_queries": self._default_follow_up_queries(state),
+                    }
+                )
+        return {
+            "diagnosis_review": review.model_dump(mode="json"),
+            "follow_up_queries": [
+                query.model_dump(mode="json") for query in review.follow_up_queries
+            ],
+            "timeline": [
+                _event(
+                    "diagnosis.quality_assessed",
+                    "诊断证据充分，可以进入修复规划"
+                    if review.sufficient
+                    else "诊断证据不足，需要定向补查",
+                    confidence=review.confidence,
+                    sufficient=review.sufficient,
+                    missing_evidence=review.missing_evidence,
+                )
+            ],
+        }
+
+    def _route_after_assessment(self, state: IncidentState) -> str:
+        diagnosis = Diagnosis.model_validate(state["diagnosis"])
+        if not self._diagnosis_requires_reflection(diagnosis):
+            return "plan"
+        if state.get("reflection_rounds", 0) >= self.max_reflection_rounds:
+            return "escalate"
+        if not state.get("follow_up_queries"):
+            return "escalate"
+        return "collect_follow_up"
+
+    async def _collect_follow_up(self, state: IncidentState) -> dict[str, Any]:
+        service = state["alert"]["service"]
+        trace_id = state["alert"].get("labels", {}).get("trace_id")
+        round_number = state.get("reflection_rounds", 0) + 1
+        supplemental: dict[str, Any] = {}
+        events = [
+            _event(
+                "investigation.reflection_requested",
+                f"第 {round_number} 轮反思已请求定向补查",
+                sources=[item["source"] for item in state.get("follow_up_queries", [])],
+            )
+        ]
+        for item in state.get("follow_up_queries", [])[:4]:
+            source = item["source"]
+            call = self._follow_up_call(source, service, trace_id)
+            if call is None:
+                continue
+            tool_name, arguments = call
+            result = await self.tools.call(tool_name, arguments)
+            supplemental[source] = result.content if result.success else {"error": result.error}
+            events.append(
+                _event(
+                    "evidence.supplemented",
+                    f"变更专家已补充证据：{source}"
+                    if source == "git_changes"
+                    else f"已补充证据：{source}",
+                    source=source,
+                    tool=tool_name,
+                    success=result.success,
+                )
+            )
+        observations = dict(state["observations"])
+        prior = dict(observations.get("follow_up_evidence", {}))
+        observations["follow_up_evidence"] = {**prior, f"round_{round_number}": supplemental}
+        return {
+            "observations": observations,
+            "reflection_rounds": round_number,
+            "timeline": events,
+        }
+
+    async def _escalate(self, state: IncidentState) -> dict[str, Any]:
+        return {
+            "status": IncidentStatus.ESCALATED.value,
+            "plan": None,
+            "approval_request": None,
+            "timeline": [
+                _event(
+                    "investigation.escalated",
+                    "补查后证据仍不足，已停止自动修复并升级人工处理",
+                    reflection_rounds=state.get("reflection_rounds", 0),
+                    confidence=state.get("diagnosis", {}).get("confidence"),
+                )
+            ],
+        }
+
+    def _diagnosis_requires_reflection(self, diagnosis: Diagnosis) -> bool:
+        return (
+            diagnosis.confidence < self.diagnosis_confidence_threshold
+            or bool(self._diagnosis_contradictions(diagnosis))
+            or any(
+                not evidence.supports_hypothesis
+                for hypothesis in diagnosis.hypotheses
+                for evidence in hypothesis.evidence
+            )
+        )
+
+    @staticmethod
+    def _diagnosis_contradictions(diagnosis: Diagnosis) -> list[str]:
+        contradictions = [
+            contradiction
+            for hypothesis in diagnosis.hypotheses
+            for contradiction in hypothesis.contradictions
+            if contradiction
+        ]
+        contradictions.extend(
+            evidence.finding
+            for hypothesis in diagnosis.hypotheses
+            for evidence in hypothesis.evidence
+            if not evidence.supports_hypothesis and evidence.finding
+        )
+        return list(dict.fromkeys(contradictions))
+
+    def _available_follow_up_sources(self, state: IncidentState) -> list[str]:
+        available: list[str] = []
+        tool_sources = {
+            "list_pods": "kubernetes_pods",
+            "list_events": "kubernetes_events",
+            "get_pod_logs": "kubernetes_logs",
+            "get_rollout_history": "kubernetes_rollout",
+            "query_prometheus": "prometheus_errors",
+            "search_loki": "loki_errors",
+            "get_change_evidence": "git_changes",
+        }
+        for tool_name, source in tool_sources.items():
+            if self.tools.has_tool(tool_name):
+                available.append(source)
+        if self.tools.has_tool("query_prometheus"):
+            available.append("prometheus_latency")
+        trace_id = state["alert"].get("labels", {}).get("trace_id")
+        if trace_id and self.tools.has_tool("get_trace"):
+            available.append("tempo_trace")
+        return available
+
+    def _sanitize_follow_up_queries(
+        self,
+        queries: list[FollowUpQuery],
+        state: IncidentState,
+    ) -> list[FollowUpQuery]:
+        allowed = set(self._available_follow_up_sources(state))
+        sanitized: list[FollowUpQuery] = []
+        seen: set[str] = set()
+        for query in queries:
+            if query.source not in allowed or query.source in seen:
+                continue
+            seen.add(query.source)
+            sanitized.append(query)
+            if len(sanitized) == 4:
+                break
+        return sanitized
+
+    def _default_follow_up_queries(self, state: IncidentState) -> list[FollowUpQuery]:
+        reasons = {
+            "git_changes": "核对故障前后的部署版本与 Git 提交是否存在可验证关联",
+            "kubernetes_logs": "补充目标服务最近日志以验证错误模式",
+            "prometheus_errors": "补充目标服务的实时错误率证据",
+            "kubernetes_rollout": "重新核对当前与上一发布 revision",
+        }
+        available = set(self._available_follow_up_sources(state))
+        return [
+            FollowUpQuery(source=source, reason=reason)  # type: ignore[arg-type]
+            for source, reason in reasons.items()
+            if source in available
+        ][:4]
+
+    @staticmethod
+    def _follow_up_call(
+        source: str,
+        service: str,
+        trace_id: str | None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        service_label = json.dumps(service)
+        calls: dict[str, tuple[str, dict[str, Any]]] = {
+            "kubernetes_pods": ("list_pods", {"label_selector": f"app={service}"}),
+            "kubernetes_events": ("list_events", {}),
+            "kubernetes_logs": (
+                "get_pod_logs",
+                {"label_selector": f"app={service}", "tail_lines": 300},
+            ),
+            "kubernetes_rollout": ("get_rollout_history", {"name": service}),
+            "prometheus_errors": (
+                "query_prometheus",
+                {
+                    "query": (
+                        "(sum(rate(http_requests_total{"
+                        f'service={service_label},status=~"5.."'
+                        "}[5m])) or vector(0)) / clamp_min(sum(rate("
+                        "http_requests_total{"
+                        f"service={service_label}"
+                        "}[5m])), 0.001)"
+                    )
+                },
+            ),
+            "prometheus_latency": (
+                "query_prometheus",
+                {
+                    "query": (
+                        "histogram_quantile(0.95, sum by (le) (rate("
+                        "http_request_duration_seconds_bucket{"
+                        f"service={service_label}"
+                        "}[5m])))"
+                    )
+                },
+            ),
+            "loki_errors": (
+                "search_loki",
+                {
+                    "query": (
+                        f"{{service_name={service_label}}} "
+                        '|~ "(?i)(error|failed|fatal|timeout|exception)"'
+                    ),
+                    "limit": 100,
+                },
+            ),
+            "git_changes": ("get_change_evidence", {"service": service}),
+        }
+        if source == "tempo_trace" and trace_id:
+            return "get_trace", {"trace_id": trace_id}
+        return calls.get(source)
 
     async def _plan(self, state: IncidentState) -> dict[str, Any]:
         specs = {spec.name: spec for spec in self.tools.list_specs()}
         planning_observations = {
             key: state["observations"][key]
-            for key in ("pods", "events", "logs", "rollout", "metrics", "scenario")
+            for key in (
+                "pods",
+                "events",
+                "logs",
+                "rollout",
+                "metrics",
+                "changes",
+                "follow_up_evidence",
+                "scenario",
+            )
             if key in state["observations"]
         }
         payload = {
@@ -654,6 +965,7 @@ class IncidentAgent:
             IncidentStatus.RESOLVED.value: "已恢复",
             IncidentStatus.FAILED.value: "修复失败",
             IncidentStatus.REJECTED.value: "已拒绝",
+            IncidentStatus.ESCALATED.value: "已升级人工处理",
         }.get(status, status)
         report = (
             f"# 事故报告 {state['incident_id']}\n\n"
@@ -673,8 +985,15 @@ class IncidentAgent:
         record.status = IncidentStatus(state.get("status", record.status))
         if state.get("diagnosis"):
             record.diagnosis = Diagnosis.model_validate(state["diagnosis"])
+        if state.get("diagnosis_review"):
+            record.diagnosis_review = DiagnosisReview.model_validate(
+                state["diagnosis_review"]
+            )
+        record.reflection_rounds = int(state.get("reflection_rounds", 0))
         if state.get("plan"):
             record.plan = RemediationPlan.model_validate(state["plan"])
+        elif state.get("status") == IncidentStatus.ESCALATED.value:
+            record.plan = None
         if state.get("approval_request"):
             record.approval = ApprovalRequest.model_validate(state["approval_request"])
         record.execution_results = [

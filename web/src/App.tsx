@@ -11,6 +11,7 @@ const STATUS_LABELS: Record<Incident["status"], string> = {
   resolved: "已恢复",
   failed: "修复失败",
   rejected: "已拒绝",
+  escalated: "已升级人工",
 };
 
 const EVENT_LABELS: Record<string, string> = {
@@ -18,6 +19,10 @@ const EVENT_LABELS: Record<string, string> = {
   "incident.received": "收到告警",
   "context.collected": "完成证据采集",
   "diagnosis.completed": "定位根因",
+  "diagnosis.quality_assessed": "评估诊断质量",
+  "investigation.reflection_requested": "启动定向补查",
+  "evidence.supplemented": "补充只读证据",
+  "investigation.escalated": "升级人工处理",
   "remediation.planned": "生成修复方案",
   "approval.requested": "请求人工审批",
   "approval.auto_approved": "安全策略自动授权",
@@ -76,6 +81,7 @@ function sourceLabel(source: string): string {
     "kubernetes.rollout": "Kubernetes 发布记录",
     "kubernetes.events": "Kubernetes 事件",
     "kubernetes.logs": "Kubernetes 日志",
+    "git.change": "Git 变更记录",
   };
   return labels[source.toLowerCase()] ?? source;
 }
@@ -101,7 +107,7 @@ function stageState(incident: Incident, event: string, activeEvent?: string): st
   if (event === "approval.decided" && events.has("approval.auto_approved")) return "complete";
   if (events.has(event)) return "complete";
   if (activeEvent && events.has(activeEvent)) return "active";
-  if (incident.status === "failed" || incident.status === "rejected") return "stopped";
+  if (["failed", "rejected", "escalated"].includes(incident.status)) return "stopped";
   return "pending";
 }
 
@@ -622,7 +628,13 @@ function App() {
                         {selected.plan?.verification.map((item) => <p key={item}><i>✓</i>{item}</p>)}
                       </div>
                     </>
-                  ) : <p className="muted-copy">Agent 正在准备安全的修复方案。</p>}
+                  ) : (
+                    <p className="muted-copy">
+                      {selected.status === "escalated"
+                        ? "补查后证据仍不足，Agent 已停止自动修复并升级人工处理。"
+                        : "Agent 正在准备安全的修复方案。"}
+                    </p>
+                  )}
 
                   {selected.status === "awaiting_approval" && (
                     <div className="approval-gate">
@@ -641,6 +653,7 @@ function App() {
                     </div>
                   )}
                   {selected.status === "rejected" && <div className="rejected-card">自动化流程已被运维人员终止。</div>}
+                  {selected.status === "escalated" && <div className="rejected-card">证据不足，未执行任何集群写操作。</div>}
                 </section>
               </aside>
             </div>

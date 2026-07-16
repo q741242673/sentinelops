@@ -119,7 +119,7 @@ class KubernetesBackend:
         logs = self.core.read_namespaced_pod_log(
             name=name,
             namespace=self.namespace,
-            tail_lines=int(arguments.get("tail_lines", 200)),
+            tail_lines=min(max(int(arguments.get("tail_lines", 200)), 1), 500),
         )
         return {"pod": name, "lines": logs.splitlines()}
 
@@ -166,14 +166,16 @@ class KubernetesBackend:
     @staticmethod
     def _replica_set_summary(replica_set: Any) -> dict[str, Any]:
         annotations = replica_set.metadata.annotations or {}
+        template_annotations = replica_set.spec.template.metadata.annotations or {}
         containers = replica_set.spec.template.spec.containers or []
         return {
             "name": replica_set.metadata.name,
             "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
             "images": [container.image for container in containers],
-            "change_cause": (replica_set.spec.template.metadata.annotations or {}).get(
-                "sentinelops.io/change-cause"
-            ),
+            "change_cause": template_annotations.get("sentinelops.io/change-cause"),
+            "git_commit": template_annotations.get("sentinelops.io/git-commit"),
+            "repository": template_annotations.get("sentinelops.io/repository"),
+            "source_path": template_annotations.get("sentinelops.io/source-path"),
             "replicas": replica_set.status.replicas or 0,
             "ready_replicas": replica_set.status.ready_replicas or 0,
         }

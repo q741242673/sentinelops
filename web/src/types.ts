@@ -5,7 +5,8 @@ export type IncidentStatus =
   | "remediating"
   | "resolved"
   | "failed"
-  | "rejected";
+  | "rejected"
+  | "escalated";
 
 export interface Alert {
   name: string;
@@ -37,6 +38,14 @@ export interface Diagnosis {
   evidence_summary: string[];
 }
 
+export interface DiagnosisReview {
+  sufficient: boolean;
+  confidence: number;
+  contradictions: string[];
+  missing_evidence: string[];
+  follow_up_queries: Array<{ source: string; reason: string }>;
+}
+
 export interface RemediationAction {
   tool_name: string;
   arguments: Record<string, unknown>;
@@ -64,6 +73,8 @@ export interface Incident {
   alert: Alert;
   status: IncidentStatus;
   diagnosis: Diagnosis | null;
+  diagnosis_review: DiagnosisReview | null;
+  reflection_rounds: number;
   plan: RemediationPlan | null;
   approval: unknown | null;
   execution_results: Array<{

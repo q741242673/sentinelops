@@ -63,6 +63,13 @@ fi
 
 kubectl --context "${CONTEXT}" apply -f "${ROOT_DIR}/deploy/observability/stack.yaml"
 kubectl --context "${CONTEXT}" apply -f "${ROOT_DIR}/deploy/observability/services.yaml"
+GIT_COMMIT="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
+REPOSITORY="$(basename "${ROOT_DIR}")"
+for deployment in inventory-service order-service; do
+  kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+    patch "deployment/${deployment}" --type merge \
+    --patch "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"sentinelops.io/git-commit\":\"${GIT_COMMIT}\",\"sentinelops.io/repository\":\"${REPOSITORY}\",\"sentinelops.io/source-path\":\"demo/services\"}}}}}"
+done
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/prometheus
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \

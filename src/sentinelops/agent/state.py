@@ -10,6 +10,9 @@ class IncidentState(TypedDict, total=False):
     status: str
     observations: dict[str, Any]
     diagnosis: dict[str, Any]
+    diagnosis_review: dict[str, Any]
+    follow_up_queries: list[dict[str, Any]]
+    reflection_rounds: int
     plan: dict[str, Any]
     approval_request: dict[str, Any] | None
     approved: bool | None

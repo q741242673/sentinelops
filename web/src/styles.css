@@ -151,7 +151,7 @@ button.nav-item { cursor: pointer; }
 .incident-list-meta small { color: #53645e; font-size: 9px; }
 .mini-status { padding: 2px 5px; border-radius: 3px; color: var(--amber); background: rgba(243, 188, 104, 0.08); font-size: 7px; text-transform: uppercase; }
 .mini-status.resolved { color: var(--mint); background: rgba(126, 226, 184, 0.08); }
-.mini-status.rejected, .mini-status.failed { color: var(--red); }
+.mini-status.rejected, .mini-status.failed, .mini-status.escalated { color: var(--red); }
 
 .runtime-card { margin-top: 16px; padding: 13px; border: 1px solid #21362f; border-radius: 9px; background: rgba(10, 26, 21, 0.75); }
 .runtime-title { display: flex; align-items: center; gap: 8px; color: #9db2aa; font-size: 10px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
@@ -263,7 +263,7 @@ button.nav-item { cursor: pointer; }
 .eyebrow { display: flex; align-items: center; gap: 11px; margin-bottom: 12px; color: #5f756d; font-size: 9px; letter-spacing: 0.07em; }
 .status-pill { padding: 5px 8px; border: 1px solid rgba(243, 188, 104, 0.25); border-radius: 4px; color: var(--amber); background: rgba(243, 188, 104, 0.07); font-size: 8px; letter-spacing: 0.06em; text-transform: uppercase; }
 .status-pill.resolved { border-color: rgba(126, 226, 184, 0.25); color: var(--mint); background: rgba(126, 226, 184, 0.06); }
-.status-pill.rejected, .status-pill.failed { border-color: rgba(255, 118, 111, 0.25); color: var(--red); background: rgba(255, 118, 111, 0.06); }
+.status-pill.rejected, .status-pill.failed, .status-pill.escalated { border-color: rgba(255, 118, 111, 0.25); color: var(--red); background: rgba(255, 118, 111, 0.06); }
 .incident-hero h1 { margin: 0; color: #edf5f2; font-size: clamp(26px, 3vw, 38px); font-weight: 600; letter-spacing: -0.045em; }
 .incident-hero > div > p { max-width: 720px; margin: 10px 0 0; color: #81948d; font-size: 13px; line-height: 1.65; }
 .hero-context { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin-top: 16px; color: #5c7068; font-family: "SFMono-Regular", "Roboto Mono", Consolas, monospace; font-size: 9px; text-transform: uppercase; }

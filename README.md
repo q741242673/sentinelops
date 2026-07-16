@@ -29,7 +29,11 @@ Many agent demos stop at a plausible answer. Incident response needs stronger gu
 flowchart LR
     A[Alert] --> B[Context collector]
     B --> C[Diagnosis]
-    C --> D[Remediation planner]
+    C --> Q{Evidence quality gate}
+    Q -->|low confidence, budget remains| R[Bounded read-only follow-up]
+    R --> C
+    Q -->|still insufficient| X[Escalate without writes]
+    Q -->|sufficient| D[Remediation planner]
     D --> E[Policy engine]
     E -->|high risk| F[Human approval]
     E -->|allowed| G[Tool registry]
@@ -42,6 +46,12 @@ flowchart LR
 The graph uses LangGraph checkpoints and interrupts. Models implement one internal provider
 contract; tools implement one backend contract. Neither the agent nodes nor policy engine know
 which model vendor or cluster backend is active.
+
+The quality gate is deterministic: confidence below the configured threshold, contradictions,
+or evidence that rejects a hypothesis triggers at most one directed follow-up round by default.
+The model selects only a predefined evidence intent; application code builds the actual bounded
+Kubernetes, Prometheus, Loki, Tempo, or Git query. If the diagnosis remains weak, the graph ends
+in `escalated` and performs no mutating action.
 
 ## Quick start
 
@@ -220,6 +230,28 @@ The HTTP client uses explicit configured base URLs, a maximum 60-second timeout,
 ambient proxy variables so internal telemetry is not accidentally routed through an external
 proxy.
 
+### Adaptive investigation and change evidence
+
+Set a fixed repository root to add read-only rollout/Git correlation:
+
+```dotenv
+SENTINELOPS_CHANGE_REPOSITORY_PATH=/absolute/path/to/sentinelops
+SENTINELOPS_DIAGNOSIS_CONFIDENCE_THRESHOLD=0.8
+SENTINELOPS_MAX_REFLECTION_ROUNDS=1
+```
+
+`get_change_evidence` accepts only a validated Kubernetes service name. It reads the current and
+previous ReplicaSet annotations, accepts only full 40-character commit SHAs, verifies each commit
+exists in the configured worktree, and returns a bounded changed-file list. If those annotations
+are absent, it labels recent commits as temporal candidates rather than claiming causality. The
+live kind launcher stamps demo Deployment Pod templates with the current repository SHA, so the
+console can distinguish a code change from a configuration-only rollout.
+
+Low-confidence diagnoses can request no more than four predefined read-only evidence types per
+round. Model-provided shell commands, paths, refs, PromQL, and LogQL are never executed. The
+default one-round budget prevents unbounded agent loops and makes the fallback behavior easy to
+demonstrate in an interview: supplement evidence, reassess, then either plan safely or escalate.
+
 ### In-cluster telemetry lab
 
 The repository also ships a reproducible telemetry lab: two instrumented FastAPI services,
@@ -381,9 +413,11 @@ tests/              # graph, policy and tool-boundary tests
 - [x] Prometheus, Loki and Tempo MCP query adapters
 - [x] In-cluster Prometheus, Loki, Tempo and OTel Collector demo stack
 - [x] Firing Prometheus alert to approved rollback and request-SLI recovery loop
+- [x] Bounded low-confidence reflection and directed evidence collection
+- [x] Verified Kubernetes rollout to Git commit correlation
+- [x] Local web incident command center
 - [ ] PostgreSQL checkpointer and event store
 - [ ] OpenTelemetry spans for model and tool calls
-- [ ] Web incident command center
 - [ ] Multi-model benchmark report
 
 ## License

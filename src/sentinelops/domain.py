@@ -16,6 +16,7 @@ class IncidentStatus(StrEnum):
     RESOLVED = "resolved"
     FAILED = "failed"
     REJECTED = "rejected"
+    ESCALATED = "escalated"
 
 
 class RiskLevel(StrEnum):
@@ -67,6 +68,29 @@ class Diagnosis(BaseModel):
     evidence_summary: list[str]
 
 
+class FollowUpQuery(BaseModel):
+    source: Literal[
+        "kubernetes_pods",
+        "kubernetes_events",
+        "kubernetes_logs",
+        "kubernetes_rollout",
+        "prometheus_errors",
+        "prometheus_latency",
+        "loki_errors",
+        "tempo_trace",
+        "git_changes",
+    ]
+    reason: str
+
+
+class DiagnosisReview(BaseModel):
+    sufficient: bool
+    confidence: float = Field(ge=0, le=1)
+    contradictions: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    follow_up_queries: list[FollowUpQuery] = Field(default_factory=list, max_length=4)
+
+
 class RemediationAction(BaseModel):
     tool_name: str
     arguments: dict[str, Any]
@@ -108,6 +132,8 @@ class IncidentRecord(BaseModel):
     alert: Alert
     status: IncidentStatus = IncidentStatus.RECEIVED
     diagnosis: Diagnosis | None = None
+    diagnosis_review: DiagnosisReview | None = None
+    reflection_rounds: int = 0
     plan: RemediationPlan | None = None
     approval: ApprovalRequest | None = None
     execution_results: list[ToolResult] = Field(default_factory=list)

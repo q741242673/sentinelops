@@ -7,7 +7,9 @@ from pydantic import BaseModel
 
 from sentinelops.domain import (
     Diagnosis,
+    DiagnosisReview,
     Evidence,
+    FollowUpQuery,
     Hypothesis,
     RemediationAction,
     RemediationPlan,
@@ -42,9 +44,32 @@ class RuleBasedProvider:
 
         if schema is Diagnosis:
             return self._diagnose(scenario, observations)  # type: ignore[return-value]
+        if schema is DiagnosisReview:
+            return self._review(payload)  # type: ignore[return-value]
         if schema is RemediationPlan:
             return self._plan(scenario, payload)  # type: ignore[return-value]
         raise TypeError(f"RuleBasedProvider does not support schema {schema.__name__}")
+
+    @staticmethod
+    def _review(payload: dict[str, Any]) -> DiagnosisReview:
+        preferred = ["git_changes", "kubernetes_logs", "prometheus_errors"]
+        available = set(payload.get("available_sources", []))
+        reasons = {
+            "git_changes": "核对发布 revision 与 Git 提交的关联",
+            "kubernetes_logs": "补充服务日志以验证错误模式",
+            "prometheus_errors": "补充实时请求错误率",
+        }
+        queries = [
+            FollowUpQuery(source=source, reason=reasons[source])  # type: ignore[arg-type]
+            for source in preferred
+            if source in available
+        ]
+        return DiagnosisReview(
+            sufficient=False,
+            confidence=float(payload.get("diagnosis", {}).get("confidence", 0)),
+            missing_evidence=["当前诊断置信度不足，需要补充独立证据"],
+            follow_up_queries=queries,
+        )
 
     @staticmethod
     def _infer_scenario(observations: dict[str, Any]) -> str:
@@ -164,6 +189,21 @@ class RuleBasedProvider:
             ]
             root_cause = "订单服务的数据库连接池已耗尽"
             hypothesis = "订单服务耗尽了可用数据库连接"
+
+        changes = observations.get("changes", {})
+        if changes.get("correlation_status") in {
+            "verified",
+            "no_code_change",
+            "current_commit_verified",
+        }:
+            evidence.append(
+                Evidence(
+                    source="git.change",
+                    query="get_change_evidence",
+                    finding=str(changes.get("correlation_summary")),
+                    raw=changes,
+                )
+            )
 
         return Diagnosis(
             root_cause=root_cause,
