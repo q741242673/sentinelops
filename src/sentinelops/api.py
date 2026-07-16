@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -21,7 +22,7 @@ from sentinelops.demo import (
     inject_demo_fault,
     reset_demo_environment,
 )
-from sentinelops.domain import Alert, IncidentRecord, IncidentStatus, TimelineEvent
+from sentinelops.domain import Alert, ExecutionStep, IncidentRecord, IncidentStatus, TimelineEvent
 from sentinelops.runtime import build_agent
 
 app = FastAPI(
@@ -36,6 +37,7 @@ incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
 reflection_demo_armed = False
 incident_streams: dict[str, set[asyncio.Queue[str]]] = {}
+incident_feed_streams: set[asyncio.Queue[str]] = set()
 
 
 class ApprovalDecision(BaseModel):
@@ -111,7 +113,8 @@ def _alert_from_alertmanager(item: AlertmanagerAlert, fingerprint: str) -> Alert
 def _publish_incident(record: IncidentRecord) -> None:
     incident_records[record.id] = record
     payload = record.model_dump_json()
-    for queue in incident_streams.get(record.id, set()):
+    queues = [*incident_streams.get(record.id, set()), *incident_feed_streams]
+    for queue in queues:
         if queue.full():
             try:
                 queue.get_nowait()
@@ -128,6 +131,22 @@ async def _investigate_alert(incident_id: str, alert: Alert) -> None:
     incident_agents[incident_id] = agent
     try:
         alert = await enrich_alert_with_failed_trace(settings, alert)
+        current = incident_records[incident_id].model_copy(deep=True)
+        preflight = next(
+            (step for step in current.execution_trace if step.id == "enrich_trace:1"),
+            None,
+        )
+        if preflight:
+            completed_at = datetime.now(UTC)
+            preflight.status = "completed"
+            preflight.completed_at = completed_at
+            preflight.duration_ms = max(
+                0,
+                (completed_at - (preflight.started_at or completed_at)).total_seconds() * 1000,
+            )
+            preflight.detail = "已关联告警、失败请求和调用链上下文"
+            current.active_step_id = None
+            _publish_incident(current)
         _publish_incident(await agent.start(alert, incident_id=incident_id))
     except Exception as exc:
         current = incident_records[incident_id]
@@ -323,7 +342,7 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
         alert = _alert_from_alertmanager(item, fingerprint)
         placeholder = IncidentRecord(
             alert=alert,
-            status=IncidentStatus.RECEIVED,
+            status=IncidentStatus.INVESTIGATING,
             timeline=[
                 TimelineEvent(
                     type="alertmanager.received",
@@ -331,8 +350,29 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
                     data={"fingerprint": fingerprint},
                 )
             ],
+            execution_trace=[
+                ExecutionStep(
+                    id="incident_received:1",
+                    kind="graph",
+                    title="接收事故告警",
+                    detail=alert.summary,
+                    status="completed",
+                    started_at=datetime.now(UTC),
+                    completed_at=datetime.now(UTC),
+                    duration_ms=0,
+                ),
+                ExecutionStep(
+                    id="enrich_trace:1",
+                    kind="tool",
+                    title="关联告警与失败调用链",
+                    detail="正在从 Tempo 补齐触发告警的失败请求上下文",
+                    status="running",
+                    started_at=datetime.now(UTC),
+                ),
+            ],
+            active_step_id="enrich_trace:1",
         )
-        incident_records[placeholder.id] = placeholder
+        _publish_incident(placeholder)
         alert_fingerprints[fingerprint] = placeholder.id
         _schedule_investigation(placeholder.id, alert)
         accepted.append(
@@ -360,6 +400,33 @@ async def get_runtime() -> RuntimeInfo:
         model_name=settings.model_name,
         namespace=settings.kubernetes_namespace,
         approval_mode="risk_based",
+    )
+
+
+@app.get("/api/v1/incidents/events")
+async def stream_all_incidents() -> StreamingResponse:
+    async def events() -> AsyncIterator[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
+        incident_feed_streams.add(queue)
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"data: {payload}\n\n"
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            incident_feed_streams.discard(queue)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -397,8 +464,9 @@ async def stream_incident(incident_id: str) -> StreamingResponse:
         events(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
     )
 

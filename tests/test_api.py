@@ -140,6 +140,9 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
     }
     assert api_module.incident_records[incident_id].alert.labels["source"] == "alertmanager"
     assert api_module.incident_records[incident_id].alert.labels["reflection_demo"] == "true"
+    assert api_module.incident_records[incident_id].status == "investigating"
+    assert api_module.incident_records[incident_id].active_step_id == "enrich_trace:1"
+    assert api_module.incident_records[incident_id].execution_trace[-1].status == "running"
     assert api_module.reflection_demo_armed is False
     assert resolved.json()["accepted"][0]["status"] == "resolved"
     assert "demo-fingerprint" not in api_module.alert_fingerprints
@@ -155,11 +158,16 @@ async def test_publish_incident_notifies_live_stream_queue() -> None:
         )
     )
     queue: asyncio.Queue[str] = asyncio.Queue(maxsize=2)
+    feed_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=2)
     api_module.incident_streams[record.id] = {queue}
+    api_module.incident_feed_streams.add(feed_queue)
 
     api_module._publish_incident(record)
 
     payload = json.loads(await queue.get())
+    feed_payload = json.loads(await feed_queue.get())
     assert payload["id"] == record.id
+    assert feed_payload["id"] == record.id
     assert payload["execution_trace"] == []
     api_module.incident_streams.clear()
+    api_module.incident_feed_streams.clear()

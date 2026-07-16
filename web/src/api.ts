@@ -59,8 +59,13 @@ export const api = {
           : "已从 SentinelOps 本地控制台拒绝",
       }),
     }),
-  subscribeIncident: (incidentId: string, onUpdate: (incident: Incident) => void) => {
-    const source = new EventSource(`/api/v1/incidents/${incidentId}/events`);
+  subscribeIncidents: (
+    onUpdate: (incident: Incident) => void,
+    onConnectionChange?: (connected: boolean) => void,
+  ) => {
+    const source = new EventSource("/api/v1/incidents/events");
+    source.onopen = () => onConnectionChange?.(true);
+    source.onerror = () => onConnectionChange?.(false);
     source.onmessage = (event) => onUpdate(JSON.parse(event.data) as Incident);
     return () => source.close();
   },
