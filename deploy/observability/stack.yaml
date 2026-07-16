@@ -44,7 +44,13 @@ data:
                 ) > 0.1
               )
               unless on()
-              (max(sentinelops_transient_runtime_fault{service="inventory-service"}) == 1)
+              (
+                max(
+                  max_over_time(
+                    sentinelops_transient_runtime_fault{service="inventory-service"}[45s]
+                  )
+                ) == 1
+              )
             for: 4s
             labels:
               severity: critical
