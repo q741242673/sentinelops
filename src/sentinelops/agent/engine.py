@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
@@ -18,6 +21,7 @@ from sentinelops.domain import (
     ApprovalRequest,
     Diagnosis,
     DiagnosisReview,
+    ExecutionStep,
     FollowUpQuery,
     IncidentRecord,
     IncidentStatus,
@@ -29,6 +33,37 @@ from sentinelops.domain import (
 )
 from sentinelops.llm.base import LLMProvider
 from sentinelops.tools.registry import ToolRegistry
+
+ProgressCallback = Callable[[IncidentRecord], None]
+
+NODE_PRESENTATION = {
+    "collect_context": ("采集多源证据", "正在连接 Kubernetes 与可观测性数据源", "graph"),
+    "diagnose": ("Agent 正在分析", "正在根据已采集证据判断根因", "graph"),
+    "assess_diagnosis": ("评估诊断质量", "正在检查置信度、矛盾和缺失证据", "policy"),
+    "collect_follow_up": ("定向补充证据", "正在执行一轮受限的只读补查", "graph"),
+    "escalate": ("升级人工处理", "证据质量不足，正在停止自动修复", "policy"),
+    "plan": ("生成安全修复方案", "正在选择白名单内的可逆操作", "graph"),
+    "prepare_approval": ("评估操作风险", "正在根据策略决定是否需要人工批准", "policy"),
+    "human_gate": ("等待人工审批", "高风险操作必须由运维人员明确确认", "policy"),
+    "execute": ("执行修复操作", "正在通过白名单工具修改目标工作负载", "graph"),
+    "verify": ("验证服务恢复", "正在检查 Pod、流量、错误率、告警和 Trace", "verification"),
+    "postmortem": ("生成事故报告", "正在整理根因、动作与恢复证据", "graph"),
+}
+
+TOOL_PRESENTATION = {
+    "list_pods": "读取 Pod 健康状态",
+    "list_events": "读取 Kubernetes 事件",
+    "get_pod_logs": "读取目标 Pod 日志",
+    "get_rollout_history": "读取发布历史",
+    "get_service_metrics": "读取工作负载指标",
+    "query_prometheus": "查询 Prometheus 指标",
+    "search_loki": "检索 Loki 错误日志",
+    "get_trace": "读取 Tempo 调用链",
+    "get_change_evidence": "关联 Git 与 Rollout 变更",
+    "restart_deployment": "重启 Deployment",
+    "rollback_deployment": "回滚 Deployment",
+    "scale_deployment": "调整 Deployment 副本数",
+}
 
 
 def _event(event_type: str, message: str, **data: Any) -> dict[str, Any]:
@@ -45,6 +80,7 @@ class IncidentAgent:
         verification_probe_url: str | None = None,
         diagnosis_confidence_threshold: float = 0.8,
         max_reflection_rounds: int = 1,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -54,23 +90,36 @@ class IncidentAgent:
         )
         self.diagnosis_confidence_threshold = diagnosis_confidence_threshold
         self.max_reflection_rounds = max_reflection_rounds
+        self.progress_callback = progress_callback
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         self.records: dict[str, IncidentRecord] = {}
 
     def _build_graph(self):
         builder = StateGraph(IncidentState)
-        builder.add_node("collect_context", self._collect_context)
-        builder.add_node("diagnose", self._diagnose)
-        builder.add_node("assess_diagnosis", self._assess_diagnosis)
-        builder.add_node("collect_follow_up", self._collect_follow_up)
-        builder.add_node("escalate", self._escalate)
-        builder.add_node("plan", self._plan)
-        builder.add_node("prepare_approval", self._prepare_approval)
-        builder.add_node("human_gate", self._human_gate)
-        builder.add_node("execute", self._execute)
-        builder.add_node("verify", self._verify)
-        builder.add_node("postmortem", self._postmortem)
+        builder.add_node(
+            "collect_context",
+            self._traced_node("collect_context", self._collect_context),
+        )
+        builder.add_node("diagnose", self._traced_node("diagnose", self._diagnose))
+        builder.add_node(
+            "assess_diagnosis",
+            self._traced_node("assess_diagnosis", self._assess_diagnosis),
+        )
+        builder.add_node(
+            "collect_follow_up",
+            self._traced_node("collect_follow_up", self._collect_follow_up),
+        )
+        builder.add_node("escalate", self._traced_node("escalate", self._escalate))
+        builder.add_node("plan", self._traced_node("plan", self._plan))
+        builder.add_node(
+            "prepare_approval",
+            self._traced_node("prepare_approval", self._prepare_approval),
+        )
+        builder.add_node("human_gate", self._traced_node("human_gate", self._human_gate))
+        builder.add_node("execute", self._traced_node("execute", self._execute))
+        builder.add_node("verify", self._traced_node("verify", self._verify))
+        builder.add_node("postmortem", self._traced_node("postmortem", self._postmortem))
 
         builder.add_edge(START, "collect_context")
         builder.add_edge("collect_context", "diagnose")
@@ -123,8 +172,24 @@ class IncidentAgent:
             "reflection_rounds": 0,
             "timeline": timeline,
         }
+        record.timeline = [TimelineEvent.model_validate(item) for item in timeline]
+        record.execution_trace = [
+            ExecutionStep(
+                id="incident_received:1",
+                kind="graph",
+                title="接收事故告警",
+                detail=alert.summary,
+                status="completed",
+                started_at=record.created_at,
+                completed_at=record.created_at,
+                duration_ms=0,
+            )
+        ]
+        self._publish(record)
         result = await self.graph.ainvoke(state, self._config(record.id))
-        return self._sync_record(record.id, result)
+        record = self._sync_record(record.id, result)
+        self._publish(record)
+        return record
 
     async def resume(self, incident_id: str, *, approved: bool, note: str = "") -> IncidentRecord:
         if incident_id not in self.records:
@@ -133,7 +198,9 @@ class IncidentAgent:
             Command(resume={"approved": approved, "note": note}),
             self._config(incident_id),
         )
-        return self._sync_record(incident_id, result)
+        record = self._sync_record(incident_id, result)
+        self._publish(record)
+        return record
 
     def get(self, incident_id: str) -> IncidentRecord:
         return self.records[incident_id]
@@ -141,6 +208,189 @@ class IncidentAgent:
     @staticmethod
     def _config(incident_id: str) -> dict[str, Any]:
         return {"configurable": {"thread_id": incident_id}}
+
+    def _traced_node(self, name: str, function: Callable[..., Any]):
+        async def traced(state: IncidentState) -> dict[str, Any]:
+            step_id = self._node_step_id(name, state)
+            title, detail, kind = NODE_PRESENTATION[name]
+            started = time.perf_counter()
+            self._upsert_step(
+                state["incident_id"],
+                ExecutionStep(
+                    id=step_id,
+                    kind=kind,
+                    title=title,
+                    detail=detail,
+                    status="running",
+                    iteration=self._node_iteration(name, state),
+                    started_at=datetime.now(UTC),
+                ),
+                active_step_id=step_id,
+            )
+            try:
+                output = await function(state)
+            except GraphInterrupt:
+                step = next(
+                    item
+                    for item in self.records[state["incident_id"]].execution_trace
+                    if item.id == step_id
+                )
+                step.detail = "已暂停执行，等待运维人员明确批准或拒绝"
+                self._publish(self.records[state["incident_id"]])
+                raise
+            except Exception as exc:
+                self._finish_step(
+                    state["incident_id"],
+                    step_id,
+                    status="failed",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    detail=f"执行失败：{exc}",
+                )
+                raise
+            self._apply_progress_update(state["incident_id"], output)
+            final_status = (
+                "blocked"
+                if name == "human_gate" and not output.get("approved")
+                else "completed"
+            )
+            self._finish_step(
+                state["incident_id"],
+                step_id,
+                status=final_status,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+            return output
+
+        return traced
+
+    @staticmethod
+    def _node_iteration(name: str, state: IncidentState) -> int:
+        if name in {"diagnose", "assess_diagnosis", "collect_follow_up"}:
+            return state.get("reflection_rounds", 0) + 1
+        return 1
+
+    def _node_step_id(self, name: str, state: IncidentState) -> str:
+        return f"{name}:{self._node_iteration(name, state)}"
+
+    def _publish(self, record: IncidentRecord) -> None:
+        record.updated_at = datetime.now(UTC)
+        if self.progress_callback:
+            self.progress_callback(record.model_copy(deep=True))
+
+    def _upsert_step(
+        self,
+        incident_id: str,
+        step: ExecutionStep,
+        *,
+        active_step_id: str | None,
+    ) -> None:
+        record = self.records[incident_id]
+        existing = next(
+            (index for index, item in enumerate(record.execution_trace) if item.id == step.id),
+            None,
+        )
+        if existing is None:
+            record.execution_trace.append(step)
+        else:
+            record.execution_trace[existing] = step
+        record.active_step_id = active_step_id
+        if record.status == IncidentStatus.RECEIVED and step.id != "incident_received:1":
+            record.status = IncidentStatus.INVESTIGATING
+        self._publish(record)
+
+    def _finish_step(
+        self,
+        incident_id: str,
+        step_id: str,
+        *,
+        status: str,
+        duration_ms: float,
+        detail: str | None = None,
+        parent_active_step_id: str | None = None,
+    ) -> None:
+        record = self.records[incident_id]
+        step = next(item for item in record.execution_trace if item.id == step_id)
+        step.status = status  # type: ignore[assignment]
+        step.completed_at = datetime.now(UTC)
+        step.duration_ms = duration_ms
+        if detail:
+            step.detail = detail
+        record.active_step_id = parent_active_step_id
+        self._publish(record)
+
+    def _apply_progress_update(self, incident_id: str, output: dict[str, Any]) -> None:
+        record = self.records[incident_id]
+        if output.get("status"):
+            record.status = IncidentStatus(output["status"])
+        if output.get("diagnosis"):
+            record.diagnosis = Diagnosis.model_validate(output["diagnosis"])
+        if output.get("diagnosis_review"):
+            record.diagnosis_review = DiagnosisReview.model_validate(
+                output["diagnosis_review"]
+            )
+        if "reflection_rounds" in output:
+            record.reflection_rounds = int(output["reflection_rounds"])
+        observations = output.get("observations") or {}
+        if isinstance(observations.get("changes"), dict):
+            record.change_evidence = observations["changes"]
+        if output.get("plan"):
+            record.plan = RemediationPlan.model_validate(output["plan"])
+        if "approval_request" in output:
+            record.approval = (
+                ApprovalRequest.model_validate(output["approval_request"])
+                if output["approval_request"]
+                else None
+            )
+        record.execution_results.extend(
+            ToolResult.model_validate(item) for item in output.get("execution_results", [])
+        )
+        record.timeline.extend(
+            TimelineEvent.model_validate(item) for item in output.get("timeline", [])
+        )
+        if output.get("postmortem"):
+            record.postmortem = output["postmortem"]
+
+    async def _call_tool_traced(
+        self,
+        state: IncidentState,
+        *,
+        parent_name: str,
+        key: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        parent_id = self._node_step_id(parent_name, state)
+        step_id = f"{parent_id}:tool:{key}"
+        started = time.perf_counter()
+        self._upsert_step(
+            state["incident_id"],
+            ExecutionStep(
+                id=step_id,
+                parent_id=parent_id,
+                kind="tool",
+                title=TOOL_PRESENTATION.get(tool_name, tool_name),
+                detail=(
+                    f"调用只读工具 {tool_name}"
+                    if parent_name != "execute"
+                    else f"调用 {tool_name}"
+                ),
+                status="running",
+                iteration=self._node_iteration(parent_name, state),
+                started_at=datetime.now(UTC),
+                data={"tool_name": tool_name, "arguments": arguments},
+            ),
+            active_step_id=step_id,
+        )
+        result = await self.tools.call(tool_name, arguments)
+        self._finish_step(
+            state["incident_id"],
+            step_id,
+            status="completed" if result.success else "failed",
+            duration_ms=(time.perf_counter() - started) * 1000,
+            detail="证据读取完成" if result.success else f"调用失败：{result.error}",
+            parent_active_step_id=parent_id,
+        )
+        return result
 
     async def _collect_context(self, state: IncidentState) -> dict[str, Any]:
         service = state["alert"]["service"]
@@ -179,10 +429,22 @@ class IncidentAgent:
             calls["trace"] = ("get_trace", {"trace_id": trace_id})
         observations: dict[str, Any] = {}
         for key, (tool_name, arguments) in calls.items():
-            result = await self.tools.call(tool_name, arguments)
+            result = await self._call_tool_traced(
+                state,
+                parent_name="collect_context",
+                key=key,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
             observations[key] = result.content if result.success else {"error": result.error}
         if self.tools.has_tool("get_change_evidence"):
-            result = await self.tools.call("get_change_evidence", {"service": service})
+            result = await self._call_tool_traced(
+                state,
+                parent_name="collect_context",
+                key="changes",
+                tool_name="get_change_evidence",
+                arguments={"service": service},
+            )
             observations["changes"] = result.content if result.success else {"error": result.error}
         observations["scenario"] = observations.get("metrics", {}).get("scenario", "live_cluster")
         return {
@@ -356,7 +618,13 @@ class IncidentAgent:
             if call is None:
                 continue
             tool_name, arguments = call
-            result = await self.tools.call(tool_name, arguments)
+            result = await self._call_tool_traced(
+                state,
+                parent_name="collect_follow_up",
+                key=source,
+                tool_name=tool_name,
+                arguments=arguments,
+            )
             supplemental[source] = result.content if result.success else {"error": result.error}
             events.append(
                 _event(
@@ -790,7 +1058,13 @@ class IncidentAgent:
     async def _execute(self, state: IncidentState) -> dict[str, Any]:
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         self.policy.validate(action)
-        result = await self.tools.call(action.tool_name, action.arguments)
+        result = await self._call_tool_traced(
+            state,
+            parent_name="execute",
+            key=action.tool_name,
+            tool_name=action.tool_name,
+            arguments=action.arguments,
+        )
         return {
             "status": (
                 IncidentStatus.REMEDIATING.value if result.success else IncidentStatus.FAILED.value

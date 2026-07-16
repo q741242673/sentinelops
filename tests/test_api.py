@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -142,3 +143,23 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
     assert api_module.reflection_demo_armed is False
     assert resolved.json()["accepted"][0]["status"] == "resolved"
     assert "demo-fingerprint" not in api_module.alert_fingerprints
+
+
+@pytest.mark.asyncio
+async def test_publish_incident_notifies_live_stream_queue() -> None:
+    record = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="HighErrorRate",
+            service="order-service",
+            summary="test stream",
+        )
+    )
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=2)
+    api_module.incident_streams[record.id] = {queue}
+
+    api_module._publish_incident(record)
+
+    payload = json.loads(await queue.get())
+    assert payload["id"] == record.id
+    assert payload["execution_trace"] == []
+    api_module.incident_streams.clear()

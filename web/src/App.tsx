@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api } from "./api";
-import type { Evidence, Incident, RuntimeInfo, TimelineEvent } from "./types";
+import type { Evidence, ExecutionStep, Incident, RuntimeInfo, TimelineEvent } from "./types";
 
 const STATUS_LABELS: Record<Incident["status"], string> = {
   received: "已接收",
@@ -31,15 +31,6 @@ const EVENT_LABELS: Record<string, string> = {
   "recovery.verified": "确认服务恢复",
   "postmortem.generated": "生成事故报告",
 };
-
-const FLOW_STAGES = [
-  { label: "检测", event: "incident.received" },
-  { label: "取证", event: "context.collected" },
-  { label: "诊断", event: "diagnosis.completed" },
-  { label: "审批", event: "approval.decided", activeEvent: "approval.requested" },
-  { label: "修复", event: "action.executed" },
-  { label: "验证", event: "recovery.verified" },
-];
 
 const RISK_LABELS = {
   read_only: "只读",
@@ -121,15 +112,6 @@ function alertSummary(summary: string): string {
   return summary;
 }
 
-function stageState(incident: Incident, event: string, activeEvent?: string): string {
-  const events = new Set(incident.timeline.map((item) => item.type));
-  if (event === "approval.decided" && events.has("approval.auto_approved")) return "complete";
-  if (events.has(event)) return "complete";
-  if (activeEvent && events.has(activeEvent)) return "active";
-  if (["failed", "rejected", "escalated"].includes(incident.status)) return "stopped";
-  return "pending";
-}
-
 function IncidentListItem({
   incident,
   selected,
@@ -191,6 +173,129 @@ function TimelineItem({ event, last }: { event: TimelineEvent; last: boolean }) 
         <span>{translatedMessages[event.message] ?? event.message}</span>
       </div>
     </li>
+  );
+}
+
+const FUTURE_STEPS = [
+  ["collect_context", "采集多源证据"],
+  ["diagnose", "Agent 正在分析"],
+  ["assess_diagnosis", "评估诊断质量"],
+  ["plan", "生成安全修复方案"],
+  ["prepare_approval", "评估操作风险"],
+  ["human_gate", "等待人工审批"],
+  ["execute", "执行修复操作"],
+  ["verify", "验证服务恢复"],
+  ["postmortem", "生成事故报告"],
+] as const;
+
+const STEP_STATUS_LABELS: Record<ExecutionStep["status"], string> = {
+  pending: "等待中",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
+  blocked: "已阻止",
+  skipped: "已跳过",
+};
+
+function durationLabel(duration: number | null): string {
+  if (duration === null) return "";
+  return duration < 1_000 ? `${Math.round(duration)}ms` : `${(duration / 1_000).toFixed(1)}s`;
+}
+
+function ExecutionFlow({ incident }: { incident: Incident }) {
+  const [expandedId, setExpandedId] = useState<string | null>(incident.active_step_id);
+  useEffect(() => {
+    if (incident.active_step_id) setExpandedId(incident.active_step_id);
+  }, [incident.active_step_id]);
+
+  const roots = incident.execution_trace.filter((step) => !step.parent_id);
+  const terminal = ["resolved", "failed", "rejected", "escalated"].includes(incident.status);
+  const existingNames = new Set(roots.map((step) => step.id.split(":")[0]));
+  const pending: ExecutionStep[] = terminal
+    ? []
+    : FUTURE_STEPS.filter(([id]) => !existingNames.has(id)).map(([id, title]) => ({
+        id: `pending:${id}`,
+        parent_id: null,
+        kind: "graph",
+        title,
+        detail: "等待前置步骤完成",
+        status: "pending",
+        iteration: 1,
+        started_at: null,
+        completed_at: null,
+        duration_ms: null,
+        data: {},
+      }));
+  const steps = [...roots, ...pending];
+  const active = incident.execution_trace.find((step) => step.id === incident.active_step_id);
+  const writeCount = incident.execution_results.length;
+  const headline = active?.title
+    ?? (incident.status === "resolved"
+      ? "恢复验证已经通过"
+      : incident.status === "escalated"
+        ? "证据不足，已停止自动修复"
+        : incident.status === "awaiting_approval"
+          ? "等待运维人员批准"
+          : STATUS_LABELS[incident.status]);
+
+  return (
+    <section className="execution-console" aria-label="Agent 实时执行流">
+      <div className={`execution-now ${active ? "live" : incident.status}`}>
+        <div className="execution-pulse" aria-hidden="true" />
+        <div>
+          <span>当前正在发生</span>
+          <strong>{headline}</strong>
+          <p>{active?.detail ?? `当前状态：${STATUS_LABELS[incident.status]}`}</p>
+        </div>
+        <div className="execution-safety">
+          <span>集群写操作</span>
+          <strong>{writeCount} 次</strong>
+          <small>{writeCount ? "所有操作均已记录" : "当前未修改集群"}</small>
+        </div>
+      </div>
+
+      <div className="execution-card">
+        <div className="section-heading compact">
+          <div><span className="section-kicker">实时状态</span><h2>Agent 内部执行流</h2></div>
+          <span className="stream-label"><i /> 实时事件已连接</span>
+        </div>
+        <div className="execution-list">
+          {steps.map((step, index) => {
+            const children = incident.execution_trace.filter((item) => item.parent_id === step.id);
+            const expanded = expandedId === step.id || step.status === "running";
+            return (
+              <article className={`execution-step ${step.status}`} key={step.id}>
+                <div className="execution-rail" aria-hidden="true">
+                  <span>{step.status === "completed" ? "✓" : index + 1}</span>
+                  {index < steps.length - 1 && <i />}
+                </div>
+                <button type="button" className="execution-step-main" onClick={() => setExpandedId(expanded ? null : step.id)}>
+                  <span className="step-copy">
+                    <strong>{step.title}{step.iteration > 1 ? ` · 第 ${step.iteration} 轮` : ""}</strong>
+                    <small>{step.detail}</small>
+                  </span>
+                  <span className="step-meta">
+                    {step.duration_ms !== null && <small>{durationLabel(step.duration_ms)}</small>}
+                    <b>{STEP_STATUS_LABELS[step.status]}</b>
+                  </span>
+                </button>
+                {expanded && children.length > 0 && (
+                  <div className="tool-trace-list">
+                    {children.map((child) => (
+                      <div className={`tool-trace ${child.status}`} key={child.id}>
+                        <span>{child.status === "completed" ? "✓" : child.status === "running" ? "…" : "!"}</span>
+                        <div><strong>{child.title}</strong><small>{child.detail}</small></div>
+                        <code>{durationLabel(child.duration_ms)}</code>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -282,7 +387,7 @@ function DemoRunbook({
         </article>
         <article className={investigated ? "complete" : faultReady ? "active" : ""}>
           <span className="demo-step-number">2</span>
-          <div><strong>{reflectionMode ? "反思并定向补充证据" : "自动发现与中文诊断"}</strong><p>{reflectionMode ? "首轮诊断触发质量门，Agent 再查日志、指标、rollout 与 Git" : "Alertmanager 推送后，DeepSeek 自动关联全部证据"}</p></div>
+          <div><strong>{reflectionMode ? "反思并定向补充证据" : "自动发现与中文诊断"}</strong><p>{reflectionMode ? "首轮诊断触发质量门，Agent 再查日志、指标、rollout 与 Git" : "Alertmanager 推送后，Agent 自动关联全部证据"}</p></div>
           {liveMode ? (
             <span className="demo-step-state">
               {investigated ? "Agent 已自动启动" : faultReady ? "等待 Alertmanager 推送" : "注入后无需手动点击"}
@@ -375,6 +480,18 @@ function App() {
     };
   }, [loadIncidents]);
 
+  useEffect(() => {
+    if (!selectedId) return undefined;
+    return api.subscribeIncident(selectedId, (updated) => {
+      setIncidents((current) => {
+        const exists = current.some((item) => item.id === updated.id);
+        return exists
+          ? current.map((item) => (item.id === updated.id ? updated : item))
+          : [updated, ...current];
+      });
+    });
+  }, [selectedId]);
+
   const selected = incidents.find((item) => item.id === selectedId) ?? incidents[0] ?? null;
   const evidence = useMemo(
     () => selected?.diagnosis?.hypotheses.flatMap((hypothesis) => hypothesis.evidence) ?? [],
@@ -425,7 +542,7 @@ function App() {
       setFaultReady((current) => ({ ...current, [demoMode]: true }));
       setDemoMessage(
         demoMode === "auto"
-          ? "瞬态故障已激活。接下来无需操作：Alertmanager 会启动 DeepSeek，安全策略将自动授权重启并验证恢复。"
+          ? "瞬态故障已激活。接下来无需操作：Agent 将自动分析，安全策略会授权重启并验证恢复。"
           : demoMode === "reflection"
             ? `复杂故障已注入：revision ${result.revision ?? "—"}。Agent 将强制经过一轮诊断质量反思，并核对 Git 与 rollout。`
           : result.already_active
@@ -442,7 +559,7 @@ function App() {
   async function createIncident() {
     setActionBusy(true);
     setError(null);
-    setDemoMessage("正在等待真实 502 请求、Prometheus 告警和 Tempo Trace，然后交给 DeepSeek 调查…");
+    setDemoMessage("正在等待真实 502 请求、Prometheus 告警和 Tempo Trace，然后交给 Agent 调查…");
     try {
       const incident = await api.createDemoIncident();
       setIncidents((current) => [incident, ...current]);
@@ -538,8 +655,8 @@ function App() {
           <div className="runtime-title"><span className="live-dot" /> {liveMode ? "真实 kind 集群" : "本地控制面"}</div>
           <dl>
             <div><dt>工具后端</dt><dd>{runtime?.tool_backend ?? "—"}</dd></div>
-            <div><dt>模型</dt><dd>{runtime?.model_name ?? "—"}</dd></div>
-            <div><dt>模型协议</dt><dd>{runtime?.model_provider ?? "—"}</dd></div>
+            <div><dt>推理引擎</dt><dd>已连接</dd></div>
+            <div><dt>执行模式</dt><dd>Agent 工作流</dd></div>
             <div><dt>命名空间</dt><dd>{runtime?.namespace ?? "—"}</dd></div>
             <div><dt>告警入口</dt><dd>{runtime?.alert_ingestion ?? "—"}</dd></div>
           </dl>
@@ -620,7 +737,7 @@ function App() {
 
             <section className="stat-grid" aria-label="事故摘要">
               <article><span>严重程度</span><strong className="critical-text">严重</strong><small>检测到 SLO 违约</small></article>
-              <article><span>AI 置信度</span><strong>{Math.round((selected.diagnosis?.confidence ?? 0) * 100)}%</strong><small>基于多源证据的诊断</small></article>
+              <article><span>诊断置信度</span><strong>{Math.round((selected.diagnosis?.confidence ?? 0) * 100)}%</strong><small>Agent 基于多源证据计算</small></article>
               <article><span>关联证据</span><strong>{evidence.length}</strong><small>跨系统关联的数据源</small></article>
               <article>
                 <span>安全模式</span>
@@ -629,39 +746,19 @@ function App() {
               </article>
             </section>
 
-            <section className="flow-card">
-              <div className="section-heading compact">
-                <div><span className="section-kicker">AGENT 执行过程</span><h2>事故响应状态图</h2></div>
-                <span className="graph-engine">LangGraph · 支持检查点恢复</span>
-              </div>
-              <div className="flow-stages">
-                {FLOW_STAGES.map((stage, index) => {
-                  const state = stageState(selected, stage.event, stage.activeEvent);
-                  return (
-                    <div className={`flow-stage ${state}`} key={stage.label}>
-                      <div className="stage-track">
-                        <span className="stage-node">{state === "complete" ? "✓" : index + 1}</span>
-                        {index < FLOW_STAGES.length - 1 && <span className="stage-line" />}
-                      </div>
-                      <strong>{stage.label === "审批" && selectedIsAuto ? "自动授权" : stage.label}</strong>
-                      <span>{state === "complete" ? "完成" : state === "active" ? "等待中" : "排队中"}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
+            <ExecutionFlow incident={selected} />
 
             <div className="content-grid">
               <section className="diagnosis-column">
                 <article className="panel diagnosis-panel">
                   <div className="section-heading">
-                    <div><span className="section-kicker">模型输出</span><h2>根因分析</h2></div>
+                    <div><span className="section-kicker">Agent 输出</span><h2>根因分析</h2></div>
                     <span className="confidence-ring">{Math.round((selected.diagnosis?.confidence ?? 0) * 100)}<small>%</small></span>
                   </div>
                   <blockquote>{selected.diagnosis?.root_cause ?? "正在采集诊断证据…"}</blockquote>
                   <div className="hypothesis-row">
                     <span>主要假设</span>
-                    <p>{selected.diagnosis?.hypotheses[0]?.statement ?? "等待模型分析"}</p>
+                    <p>{selected.diagnosis?.hypotheses[0]?.statement ?? "等待 Agent 分析"}</p>
                   </div>
                 </article>
 

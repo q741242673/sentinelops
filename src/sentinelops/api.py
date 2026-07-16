@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from sentinelops import __version__
@@ -33,6 +35,7 @@ alert_fingerprints: dict[str, str] = {}
 incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
 reflection_demo_armed = False
+incident_streams: dict[str, set[asyncio.Queue[str]]] = {}
 
 
 class ApprovalDecision(BaseModel):
@@ -105,29 +108,44 @@ def _alert_from_alertmanager(item: AlertmanagerAlert, fingerprint: str) -> Alert
     )
 
 
+def _publish_incident(record: IncidentRecord) -> None:
+    incident_records[record.id] = record
+    payload = record.model_dump_json()
+    for queue in incident_streams.get(record.id, set()):
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        queue.put_nowait(payload)
+
+
 async def _investigate_alert(incident_id: str, alert: Alert) -> None:
     settings = get_settings()
     if alert.labels.get("auto_remediation") == "true":
         settings = settings.model_copy(update={"auto_approve_max_risk": "medium"})
-    agent = build_agent(settings)
+    agent = build_agent(settings, progress_callback=_publish_incident)
     incident_agents[incident_id] = agent
     try:
         alert = await enrich_alert_with_failed_trace(settings, alert)
-        incident_records[incident_id] = await agent.start(alert, incident_id=incident_id)
+        _publish_incident(await agent.start(alert, incident_id=incident_id))
     except Exception as exc:
         current = incident_records[incident_id]
-        incident_records[incident_id] = current.model_copy(
-            update={
-                "status": IncidentStatus.FAILED,
-                "timeline": [
-                    *current.timeline,
-                    TimelineEvent(
-                        type="automation.failed",
-                        message="自动调查失败",
-                        data={"error": str(exc)},
-                    ),
-                ],
-            }
+        _publish_incident(
+            current.model_copy(
+                update={
+                    "status": IncidentStatus.FAILED,
+                    "active_step_id": None,
+                    "timeline": [
+                        *current.timeline,
+                        TimelineEvent(
+                            type="automation.failed",
+                            message="自动调查失败",
+                            data={"error": str(exc)},
+                        ),
+                    ],
+                }
+            )
         )
 
 
@@ -144,10 +162,10 @@ async def health() -> dict[str, str]:
 
 @app.post("/api/v1/incidents", response_model=IncidentRecord, status_code=201)
 async def create_incident(alert: Alert) -> IncidentRecord:
-    incident_agent = build_agent()
+    incident_agent = build_agent(progress_callback=_publish_incident)
     record = await incident_agent.start(alert)
     incident_agents[record.id] = incident_agent
-    incident_records[record.id] = record
+    _publish_incident(record)
     return record
 
 
@@ -353,6 +371,38 @@ async def get_incident(incident_id: str) -> IncidentRecord:
         raise HTTPException(status_code=404, detail="Incident not found") from exc
 
 
+@app.get("/api/v1/incidents/{incident_id}/events")
+async def stream_incident(incident_id: str) -> StreamingResponse:
+    if incident_id not in incident_records:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    async def events() -> AsyncIterator[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=20)
+        subscribers = incident_streams.setdefault(incident_id, set())
+        subscribers.add(queue)
+        try:
+            yield f"data: {incident_records[incident_id].model_dump_json()}\n\n"
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"data: {payload}\n\n"
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            subscribers.discard(queue)
+            if not subscribers:
+                incident_streams.pop(incident_id, None)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/v1/incidents/{incident_id}/approval", response_model=IncidentRecord)
 async def decide_incident(incident_id: str, decision: ApprovalDecision) -> IncidentRecord:
     try:
@@ -361,7 +411,7 @@ async def decide_incident(incident_id: str, decision: ApprovalDecision) -> Incid
             approved=decision.approved,
             note=decision.note,
         )
-        incident_records[incident_id] = record
+        _publish_incident(record)
         return record
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Incident not found") from exc

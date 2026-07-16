@@ -73,6 +73,12 @@ The portfolio demo includes a local operations console that visualizes the compl
 evidence-backed diagnosis, allowlisted remediation, approval gate, and recovery audit trail.
 Node.js 22+ is required in addition to Python.
 
+The console receives a live server-sent execution stream. Graph nodes and bounded tool calls are
+shown as they start and finish, including nested Kubernetes, Prometheus, Loki, Tempo, and Git
+reads, duration, quality-gate branches, approval pauses, mutating actions, and verification. UI
+copy stays provider-neutral (`Agent 正在分析`) so changing the configured model does not change
+the product narrative.
+
 ```bash
 make console
 ```

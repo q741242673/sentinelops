@@ -127,6 +127,20 @@ class TimelineEvent(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ExecutionStep(BaseModel):
+    id: str
+    parent_id: str | None = None
+    kind: Literal["graph", "tool", "policy", "verification"] = "graph"
+    title: str
+    detail: str = ""
+    status: Literal["pending", "running", "completed", "failed", "blocked", "skipped"]
+    iteration: int = 1
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    duration_ms: float | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class IncidentRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     alert: Alert
@@ -139,6 +153,8 @@ class IncidentRecord(BaseModel):
     approval: ApprovalRequest | None = None
     execution_results: list[ToolResult] = Field(default_factory=list)
     timeline: list[TimelineEvent] = Field(default_factory=list)
+    execution_trace: list[ExecutionStep] = Field(default_factory=list)
+    active_step_id: str | None = None
     postmortem: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

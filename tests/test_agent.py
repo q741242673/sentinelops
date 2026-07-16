@@ -150,6 +150,40 @@ async def test_high_confidence_diagnosis_skips_reflection_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_progress_callback_exposes_live_graph_and_tool_steps() -> None:
+    snapshots = []
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+        progress_callback=lambda record: snapshots.append(record),
+    )
+
+    record = await agent.start(make_alert())
+
+    assert record.status == IncidentStatus.AWAITING_APPROVAL
+    assert any(
+        snapshot.active_step_id == "collect_context:1:tool:pods"
+        for snapshot in snapshots
+    )
+    assert any(
+        snapshot.active_step_id == "diagnose:1"
+        and next(
+            step for step in snapshot.execution_trace if step.id == "diagnose:1"
+        ).title
+        == "Agent 正在分析"
+        for snapshot in snapshots
+    )
+    assert snapshots[-1].active_step_id == "human_gate:1"
+    visible_trace = " ".join(
+        f"{step.title} {step.detail}"
+        for snapshot in snapshots
+        for step in snapshot.execution_trace
+    ).lower()
+    assert "deepseek" not in visible_trace
+    assert "openai" not in visible_trace
+
+
+@pytest.mark.asyncio
 async def test_complex_demo_forces_one_visible_reflection_round() -> None:
     agent = IncidentAgent(
         provider=RuleBasedProvider(),

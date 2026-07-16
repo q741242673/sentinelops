@@ -80,6 +80,20 @@ export interface TimelineEvent {
   created_at: string;
 }
 
+export interface ExecutionStep {
+  id: string;
+  parent_id: string | null;
+  kind: "graph" | "tool" | "policy" | "verification";
+  title: string;
+  detail: string;
+  status: "pending" | "running" | "completed" | "failed" | "blocked" | "skipped";
+  iteration: number;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  data: Record<string, unknown>;
+}
+
 export interface Incident {
   id: string;
   alert: Alert;
@@ -98,6 +112,8 @@ export interface Incident {
     duration_ms: number;
   }>;
   timeline: TimelineEvent[];
+  execution_trace: ExecutionStep[];
+  active_step_id: string | null;
   postmortem: string | null;
   created_at: string;
   updated_at: string;
