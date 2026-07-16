@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import httpx
@@ -186,19 +187,34 @@ async def inject_auto_demo_fault(settings: Settings) -> dict[str, Any]:
         }
     if not settings.demo_inventory_url:
         raise RuntimeError("SENTINELOPS_DEMO_INVENTORY_URL is required for the auto demo")
-    async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
-        try:
-            response = await _post_with_transport_retry(
-                client,
-                f"{settings.demo_inventory_url.rstrip('/')}/demo/transient-fault",
-            )
-        except httpx.TransportError as exc:
-            raise RuntimeError(
-                "连接 inventory-service 失败；本地 port-forward 已重试 5 次，"
-                "请稍后再次启动演示"
-            ) from exc
-        response.raise_for_status()
-        return dict(response.json())
+    base_url = settings.demo_inventory_url.rstrip("/")
+    last_result: dict[str, Any] | None = None
+    for attempt in range(1, 9):
+        async with httpx.AsyncClient(
+            timeout=5,
+            trust_env=False,
+            headers={"Connection": "close"},
+        ) as client:
+            try:
+                response = await _post_with_transport_retry(
+                    client,
+                    f"{base_url}/demo/transient-fault",
+                )
+                response.raise_for_status()
+                last_result = dict(response.json())
+                metrics = await client.get(f"{base_url}/metrics")
+                metrics.raise_for_status()
+            except httpx.TransportError:
+                if attempt == 8:
+                    break
+            else:
+                if _transient_fault_metric_is_active(metrics.text):
+                    return last_result
+        await asyncio.sleep(0.4 * attempt)
+    raise RuntimeError(
+        "inventory-service 接受了故障请求，但当前活动 Pod 未暴露瞬态故障指标；"
+        "已停止演示，避免把旧 Pod 的响应误判为注入成功"
+    )
 
 
 async def reset_demo_environment(settings: Settings) -> dict[str, Any]:
@@ -206,53 +222,58 @@ async def reset_demo_environment(settings: Settings) -> dict[str, Any]:
     if settings.tool_backend == "simulator":
         return {"deployment": "inventory-service", "baseline_restored": True}
     backend = KubernetesBackend(namespace=settings.kubernetes_namespace)
-    history = await backend.call("get_rollout_history", {"name": "inventory-service"})
-    if not history.success:
-        raise RuntimeError(history.error or "Could not inspect demo rollout history")
-    revisions = history.content.get("revisions", [])
-    active = [
-        item
-        for item in revisions
-        if (item.get("replicas") or 0) > 0 or (item.get("ready_replicas") or 0) > 0
-    ]
-    if not active:
-        raise RuntimeError("No active inventory-service revision was found")
-    current = max(active, key=lambda item: int(item.get("revision", 0)))
-    previous = [
-        item
-        for item in revisions
-        if int(item.get("revision", 0)) < int(current.get("revision", 0))
-    ]
-    if not previous:
-        raise RuntimeError("No prior inventory-service revision was found")
-    target = max(previous, key=lambda item: int(item.get("revision", 0)))
-    rollback = await backend.call(
-        "rollback_deployment",
-        {"name": "inventory-service", "revision": int(target["revision"])},
+    reset = await backend.call(
+        "reset_demo_baseline",
+        {
+            "name": "inventory-service",
+            "timeout_seconds": settings.demo_alert_timeout_seconds,
+        },
     )
-    if not rollback.success:
-        raise RuntimeError(rollback.error or "Could not restore the demo baseline")
+    if not reset.success:
+        raise RuntimeError(reset.error or "Could not restore the demo baseline")
+    await _wait_for_demo_alerts_clear(settings)
+    return {
+        "deployment": "inventory-service",
+        "baseline_restored": True,
+        "source_revision": reset.content.get("revision"),
+    }
 
-    for _ in range(60):
-        metrics, pods = await asyncio.gather(
-            backend.call("get_service_metrics", {"name": "inventory-service"}),
-            backend.call("list_pods", {"label_selector": "app=inventory-service"}),
-        )
-        pod_items = pods.content.get("items", [])
-        if (
-            metrics.success
-            and metrics.content.get("availability") == 1
-            and pods.success
-            and pod_items
-            and all(item.get("ready") for item in pod_items)
-        ):
-            return {
-                "deployment": "inventory-service",
-                "baseline_restored": True,
-                "source_revision": int(target["revision"]),
+
+def _transient_fault_metric_is_active(metrics: str) -> bool:
+    return any(
+        line.startswith("sentinelops_transient_runtime_fault")
+        and line.rstrip().endswith((" 1", " 1.0"))
+        for line in metrics.splitlines()
+        if not line.startswith("#")
+    )
+
+
+async def _wait_for_demo_alerts_clear(settings: Settings) -> None:
+    if not settings.prometheus_url:
+        return
+    deadline = time.monotonic() + min(settings.demo_alert_timeout_seconds, 45)
+    async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+        while time.monotonic() < deadline:
+            try:
+                response = await client.get(
+                    f"{settings.prometheus_url.rstrip('/')}/api/v1/alerts"
+                )
+                response.raise_for_status()
+                alerts = response.json().get("data", {}).get("alerts", [])
+            except (httpx.HTTPError, ValueError):
+                await asyncio.sleep(0.5)
+                continue
+            active_demo_alerts = {
+                item.get("labels", {}).get("alertname")
+                for item in alerts
+                if item.get("state") in {"pending", "firing"}
             }
-        await asyncio.sleep(0.5)
-    raise RuntimeError("Timed out waiting for the restored demo baseline")
+            if not active_demo_alerts.intersection(
+                {"HighInventoryErrorRate", "InventoryTransientRuntimeFault"}
+            ):
+                return
+            await asyncio.sleep(0.5)
+    raise RuntimeError("恢复健康基线后旧告警仍未清除，已停止注入新的演示故障")
 
 
 async def _post_with_transport_retry(

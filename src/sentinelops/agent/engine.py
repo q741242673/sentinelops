@@ -446,7 +446,10 @@ class IncidentAgent:
                 arguments={"service": service},
             )
             observations["changes"] = result.content if result.success else {"error": result.error}
-        observations["scenario"] = observations.get("metrics", {}).get("scenario", "live_cluster")
+        observations["scenario"] = state["alert"].get("labels", {}).get(
+            "scenario",
+            observations.get("metrics", {}).get("scenario", "live_cluster"),
+        )
         return {
             "status": IncidentStatus.INVESTIGATING.value,
             "observations": observations,
@@ -470,6 +473,8 @@ class IncidentAgent:
                 "你是一名以证据为依据的 Kubernetes 事故调查专家。没有观测证据时不得断言根因。"
                 "必须综合分析 Pod、事件、日志、发布历史以及已配置的全部可观测性数据源。"
                 "如果发布历史包含因果变更，必须将该发布记录作为独立证据明确引用。"
+                "contradictions 只能填写真正反驳该条假设的证据；没有代码变更并不反驳"
+                "进程内瞬态状态故障，反驳低置信度备选假设的证据也不得写成主要根因的矛盾。"
                 "root_cause、hypotheses.statement、evidence.finding、contradictions 和 "
                 "evidence_summary 等所有面向用户的文字必须使用简体中文。技术标识符、"
                 "查询语句、工具名和 Kubernetes 资源名保持原样。"
@@ -681,7 +686,35 @@ class IncidentAgent:
             state["alert"].get("labels", {}).get("reflection_demo") == "true"
             and state.get("reflection_rounds", 0) == 0
         )
-        return force_demo_round or self._diagnosis_requires_reflection(diagnosis)
+        if force_demo_round:
+            return True
+        if self._has_verified_transient_runtime_fault(state, diagnosis):
+            return False
+        return self._diagnosis_requires_reflection(diagnosis)
+
+    def _has_verified_transient_runtime_fault(
+        self,
+        state: IncidentState,
+        diagnosis: Diagnosis,
+    ) -> bool:
+        """Accept the auto-demo only when collected runtime evidence proves its contract."""
+        labels = state["alert"].get("labels", {})
+        if (
+            labels.get("scenario") != "transient_runtime_fault"
+            or labels.get("auto_remediation") != "true"
+            or diagnosis.confidence < self.diagnosis_confidence_threshold
+        ):
+            return False
+
+        observations = state.get("observations", {})
+        logs = json.dumps(observations.get("logs", {}), ensure_ascii=False).lower()
+        has_live_runtime_marker = (
+            "transient_runtime_fault_enabled" in logs and "restart_required=true" in logs
+        )
+        simulator_scenario = (
+            observations.get("metrics", {}).get("scenario") == "transient_runtime_fault"
+        )
+        return has_live_runtime_marker or simulator_scenario
 
     @staticmethod
     def _diagnosis_contradictions(diagnosis: Diagnosis) -> list[str]:

@@ -4,7 +4,22 @@ import httpx
 import pytest
 
 from sentinelops.config import Settings
-from sentinelops.demo import _post_with_transport_retry, live_demo_alert
+from sentinelops.demo import (
+    _post_with_transport_retry,
+    _transient_fault_metric_is_active,
+    live_demo_alert,
+)
+
+
+def test_transient_fault_metric_requires_active_gauge() -> None:
+    inactive = (
+        '# HELP sentinelops_transient_runtime_fault Runtime fault\n'
+        'sentinelops_transient_runtime_fault{service="inventory-service"} 0.0\n'
+    )
+    active = inactive.replace(" 0.0", " 1.0")
+
+    assert _transient_fault_metric_is_active(inactive) is False
+    assert _transient_fault_metric_is_active(active) is True
 
 
 @pytest.mark.asyncio

@@ -108,3 +108,38 @@ def test_demo_fault_injection_patches_failure_rate_and_waits_for_rollout() -> No
     assert body["spec"]["template"]["spec"]["containers"][0]["env"] == [
         {"name": "FAIL_EVERY", "value": "3"}
     ]
+
+
+def test_reset_demo_baseline_sets_known_healthy_config() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    backend.apps.patch_namespaced_deployment.return_value = ns(metadata=ns(generation=8))
+    backend.apps.read_namespaced_deployment_status.return_value = ns(
+        spec=ns(replicas=1),
+        status=ns(
+            observed_generation=8,
+            replicas=1,
+            updated_replicas=1,
+            ready_replicas=1,
+            available_replicas=1,
+        ),
+    )
+    backend._tool_get_rollout_history = Mock(  # type: ignore[method-assign]
+        return_value={"revisions": [{"revision": 8, "replicas": 1}]}
+    )
+
+    result = backend._tool_reset_demo_baseline(
+        {"name": "inventory-service", "timeout_seconds": 1}
+    )
+
+    assert result["baseline_restored"] is True
+    assert result["revision"] == 8
+    body = backend.apps.patch_namespaced_deployment.call_args.args[2]
+    template = body["spec"]["template"]
+    assert template["metadata"]["annotations"]["sentinelops.io/change-cause"] == (
+        "healthy-baseline"
+    )
+    assert template["spec"]["containers"][0]["env"] == [
+        {"name": "FAIL_EVERY", "value": "0"}
+    ]

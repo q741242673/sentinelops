@@ -90,6 +90,34 @@ class RecordingSimulator(SimulatedKubernetesBackend):
         return await super().call(name, arguments)
 
 
+class ContradictoryTransientProvider(RuleBasedProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_calls = 0
+
+    async def structured(self, *, system, prompt, schema, metadata=None):
+        result = await super().structured(
+            system=system,
+            prompt=prompt,
+            schema=schema,
+            metadata=metadata,
+        )
+        if schema is Diagnosis:
+            primary = result.hypotheses[0].model_copy(
+                update={
+                    "contradictions": [
+                        "当前与上一 revision 使用相同代码提交，但故障在运行时才出现"
+                    ]
+                }
+            )
+            return result.model_copy(
+                update={"hypotheses": [primary, *result.hypotheses[1:]]}
+            )
+        if schema is DiagnosisReview:
+            self.review_calls += 1
+        return result
+
+
 def make_alert() -> Alert:
     return Alert(
         name="HighErrorRate",
@@ -263,6 +291,36 @@ async def test_transient_runtime_fault_is_auto_remediated_without_human_gate() -
     assert any(event.type == "approval.auto_approved" for event in record.timeline)
     assert IncidentAgent._diagnosis_needs_localization(record.diagnosis) is False
     assert IncidentAgent._plan_needs_localization(record.plan) is False
+
+
+@pytest.mark.asyncio
+async def test_verified_transient_fault_ignores_non_causal_revision_contradiction() -> None:
+    provider = ContradictoryTransientProvider()
+    backend = SimulatedKubernetesBackend(scenario="transient_runtime_fault")
+    agent = IncidentAgent(
+        provider=provider,
+        tools=ToolRegistry(backend),
+        auto_approve_max_risk=RiskLevel.MEDIUM,
+    )
+    alert = Alert(
+        name="InventoryTransientRuntimeFault",
+        namespace="sentinelops-demo",
+        service="inventory-service",
+        severity="warning",
+        summary="库存服务存在进程内瞬态故障",
+        labels={
+            "scenario": "transient_runtime_fault",
+            "auto_remediation": "true",
+        },
+    )
+
+    record = await agent.start(alert)
+
+    assert record.status == IncidentStatus.RESOLVED
+    assert record.reflection_rounds == 0
+    assert record.plan is not None
+    assert record.plan.actions[0].tool_name == "restart_deployment"
+    assert provider.review_calls == 0
 
 
 @pytest.mark.asyncio

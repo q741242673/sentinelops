@@ -287,6 +287,63 @@ class KubernetesBackend:
         self.apps.patch_namespaced_deployment(name, self.namespace, body)
         return {"deployment": name, "restarted": True}
 
+    def _tool_reset_demo_baseline(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Set a known healthy demo configuration; never exposed through the Agent registry."""
+        name = arguments.get("name", "inventory-service")
+        timeout_seconds = float(arguments.get("timeout_seconds", 45))
+        restored_at = datetime.now(UTC).isoformat()
+        body = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "sentinelops.io/change-cause": "healthy-baseline",
+                            "sentinelops.io/baseline-restored-at": restored_at,
+                        }
+                    },
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": name,
+                                "env": [{"name": "FAIL_EVERY", "value": "0"}],
+                            }
+                        ]
+                    },
+                }
+            }
+        }
+        updated = self.apps.patch_namespaced_deployment(
+            name,
+            self.namespace,
+            body,
+            _request_timeout=self._api_timeout(),
+        )
+        target_generation = updated.metadata.generation
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            current = self.apps.read_namespaced_deployment_status(
+                name,
+                self.namespace,
+                _request_timeout=self._api_timeout(),
+            )
+            desired = current.spec.replicas or 0
+            if (
+                (current.status.observed_generation or 0) >= target_generation
+                and (current.status.updated_replicas or 0) == desired
+                and (current.status.replicas or 0) == desired
+                and (current.status.ready_replicas or 0) == desired
+                and (current.status.available_replicas or 0) == desired
+            ):
+                history = self._tool_get_rollout_history({"name": name})
+                active = [item for item in history["revisions"] if item["replicas"] > 0]
+                return {
+                    "deployment": name,
+                    "baseline_restored": True,
+                    "revision": active[-1]["revision"] if active else None,
+                }
+            time.sleep(0.5)
+        raise RuntimeError(f"Timed out waiting for the healthy baseline rollout on {name}")
+
     def _tool_rollback_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         target_revision = int(arguments["revision"])

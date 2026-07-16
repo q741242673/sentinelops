@@ -202,6 +202,8 @@ async def _run_demo_fault(job_id: str) -> None:
     settings = get_settings()
     job = demo_fault_jobs[job_id]
     try:
+        if job.scenario == "transient_runtime_fault":
+            await reset_demo_environment(settings)
         result = await asyncio.wait_for(
             (
                 inject_auto_demo_fault(settings)
