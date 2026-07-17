@@ -105,6 +105,14 @@ _NEGATION_AFTER_FAILURE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_LOG_SEVERITY_MARKERS = {"fatal:", "error:", "exception:"}
+_STRUCTURED_LOG_FAILURE_MARKERS = {
+    "required environment variable",
+    "invalid configuration",
+    "inventory_reservation_failed",
+    "synthetic_timeout",
+}
+_FALSE_FLAG_VALUES = {"false", "0", "no", "off"}
 
 
 def _event(event_type: str, message: str, **data: Any) -> dict[str, Any]:
@@ -1162,18 +1170,88 @@ class IncidentAgent:
             "synthetic_timeout",
         )
         for assertion in _ASSERTION_BOUNDARY.split(text):
+            has_structured_claim = any(
+                marker in assertion for marker in _STRUCTURED_LOG_FAILURE_MARKERS
+            )
             for marker in markers:
+                # A severity prefix alone must not override an explicitly healthy
+                # structured claim such as "ERROR: invalid configuration count=0".
+                if marker in _LOG_SEVERITY_MARKERS and has_structured_claim:
+                    continue
                 offset = 0
                 while (index := assertion.find(marker, offset)) >= 0:
                     prefix = assertion[max(0, index - 80) : index]
                     suffix = assertion[index + len(marker) : index + len(marker) + 80]
-                    if not (
+                    negated = (
                         _NEGATION_BEFORE_FAILURE.search(prefix)
                         or _NEGATION_AFTER_FAILURE.search(suffix)
-                    ):
+                    )
+                    if not negated and marker in _STRUCTURED_LOG_FAILURE_MARKERS:
+                        if IncidentAgent._structured_log_claim_is_failure(
+                            assertion, marker, index
+                        ):
+                            return True
+                    elif not negated:
                         return True
                     offset = index + len(marker)
         return False
+
+    @staticmethod
+    def _structured_log_claim_is_failure(
+        assertion: str, marker: str, index: int
+    ) -> bool:
+        """Validate structured failure claims instead of trusting keywords alone."""
+
+        context = assertion[index : index + 160]
+        if marker == "required environment variable":
+            if re.search(
+                r"\b(?:missing|unset|undefined|absent|empty)\s*[:=]\s*"
+                r"(?:false|0|no|off)\b|"
+                r"\b(?:is|are|was|were)\s+not\s+"
+                r"(?:missing|unset|undefined|absent|empty)\b",
+                context,
+            ):
+                return False
+            return bool(
+                re.search(
+                    r"\b(?:missing|unset|undefined|absent|empty|not\s+set)\b|"
+                    r"未设置|缺失|为空|不存在",
+                    context,
+                )
+            )
+
+        if marker == "invalid configuration":
+            count = re.search(r"\bcount\s*[:=]\s*(\d+(?:\.\d+)?)\b", context)
+            if count:
+                return float(count.group(1)) > 0
+            flag = re.search(
+                r"invalid configuration\s*[:=]\s*(true|false|1|0|yes|no|on|off)\b",
+                context,
+            )
+            if flag:
+                return flag.group(1) not in _FALSE_FLAG_VALUES
+            return not bool(
+                re.search(
+                    r"invalid configuration\s+(?:is\s+)?(?:disabled|inactive)\b",
+                    context,
+                )
+            )
+
+        flag = re.search(
+            rf"{re.escape(marker)}\s*[:=]\s*(true|false|1|0|yes|no|on|off)\b",
+            context,
+        )
+        if flag:
+            return flag.group(1) not in _FALSE_FLAG_VALUES
+        count = re.search(r"\bcount\s*[:=]\s*(\d+(?:\.\d+)?)\b", context)
+        if count:
+            return float(count.group(1)) > 0
+        return not bool(
+            re.search(
+                rf"{re.escape(marker)}\s+(?:is\s+)?(?:disabled|inactive)\b",
+                context,
+            )
+        )
 
     @classmethod
     def _logs_have_explicit_failure(cls, payload: Any) -> bool:

@@ -1823,10 +1823,35 @@ def test_log_failure_predicate_rejects_negated_assertions(line: str) -> None:
 @pytest.mark.parametrize(
     "line",
     [
+        "required environment variable DATABASE_URL is present",
+        "invalid configuration count=0",
+        "inventory_reservation_failed=false",
+        "synthetic_timeout disabled",
+        "FATAL: required environment variable DATABASE_URL is present",
+        "required environment variable DATABASE_URL missing=false",
+        "required environment variable DATABASE_URL is not missing",
+        "ERROR: invalid configuration count=0",
+        "invalid configuration=false",
+        "exception: inventory_reservation_failed=false",
+        "inventory_reservation_failed count=0",
+        "ERROR: synthetic_timeout inactive",
+        "synthetic_timeout count=0",
+    ],
+)
+def test_log_failure_predicate_rejects_structured_false_values(line: str) -> None:
+    assert not IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
         "FATAL: required environment variable DATABASE_URL is missing",
         "ERROR: timeout acquiring database connection from pool",
         "invalid configuration was detected",
+        "invalid configuration count=2",
+        "inventory_reservation_failed=true",
         "inventory_reservation_failed reason=synthetic_timeout",
+        "synthetic_timeout active",
         "transient_runtime_fault_enabled restart_required=true",
     ],
 )
@@ -1843,9 +1868,16 @@ def test_log_failure_predicate_preserves_asserted_failures(line: str) -> None:
         ("we never observed invalid configuration", False),
         ("monitor did not report invalid configuration", False),
         ("未发现 invalid configuration", False),
+        ("required environment variable DATABASE_URL is present", False),
+        ("invalid configuration count=0", False),
+        ("inventory_reservation_failed=false", False),
+        ("synthetic_timeout disabled", False),
         ("FATAL: required environment variable DATABASE_URL is missing", True),
         ("ERROR: timeout acquiring database connection from pool", True),
+        ("invalid configuration count=2", True),
+        ("inventory_reservation_failed=true", True),
         ("inventory_reservation_failed reason=synthetic_timeout", True),
+        ("synthetic_timeout active", True),
         ("transient_runtime_fault_enabled restart_required=true", True),
     ],
 )
