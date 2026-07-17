@@ -361,10 +361,33 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
     }
     observations = {
         "logs": {"lines": ["inventory_reservation_failed reason=synthetic_timeout"]},
-        "prometheus": {"result": [{"metric": {"status": "503"}}]},
+        "prometheus": {
+            "result": [
+                {"metric": {"status": "503"}, "value": [1_700_000_000, "0.3"]}
+            ]
+        },
         "loki": {"result": [{"values": [["1", "inventory_reservation_failed"]]}]},
-        "trace": {"trace": {"resourceSpans": [{"service.name": "inventory-service"}]}},
-        "rollout": {"revisions": [{"revision": 11}, {"revision": 12}]},
+        "trace": {
+            "trace": {
+                "resourceSpans": [
+                    {
+                        "service.name": "inventory-service",
+                        "status": {"code": "STATUS_CODE_ERROR"},
+                    }
+                ]
+            }
+        },
+        "rollout": {
+            "current_revision": 12,
+            "revisions": [
+                {"revision": 11},
+                {
+                    "revision": 12,
+                    "replicas": 1,
+                    "change_cause": "enable-every-third-inventory-failure",
+                },
+            ],
+        },
         "scenario": "live_cluster",
         "evidence_catalog": {
             "collect_context:1:tool:logs": {
@@ -432,3 +455,54 @@ async def test_inventory_fault_uses_cross_signal_evidence_and_rolls_back() -> No
     assert plan.actions[0].tool_name == "rollback_deployment"
     assert plan.actions[0].arguments == {"name": "inventory-service", "revision": 11}
     assert "修复" in plan.summary
+
+
+@pytest.mark.asyncio
+async def test_inventory_findings_omit_successful_but_healthy_queries() -> None:
+    provider = RuleBasedProvider()
+    observations = {
+        "logs": {"lines": ["inventory_reservation_failed reason=synthetic_timeout"]},
+        "metrics": {"availability": 1.0},
+        "prometheus": {
+            "query": 'sum by (status) (rate(http_requests_total[5m]))',
+            "result": [
+                {"metric": {"status": "503"}, "value": [1_700_000_000, "0"]}
+            ],
+        },
+        "loki": {"result": []},
+        "trace": {
+            "trace": {"resourceSpans": [{"service.name": "inventory-service"}]}
+        },
+        "rollout": {
+            "current_revision": 12,
+            "revisions": [
+                {"revision": 12, "replicas": 1, "change_cause": "healthy-baseline"}
+            ],
+        },
+        "evidence_catalog": {
+            f"collect_context:1:tool:{key}": {
+                "evidence_id": f"collect_context:1:tool:{key}",
+                "source": source,
+                "tool": tool,
+                "success": True,
+            }
+            for key, source, tool in (
+                ("logs", "kubernetes_logs", "get_pod_logs"),
+                ("metrics", "workload_metrics", "get_service_metrics"),
+                ("prometheus", "prometheus", "query_prometheus"),
+                ("loki", "loki", "search_loki"),
+                ("trace", "tempo", "get_trace"),
+                ("rollout", "kubernetes_rollout", "get_rollout_history"),
+            )
+        },
+    }
+
+    diagnosis = await provider.structured(
+        system="diagnose",
+        prompt=json.dumps({"alert": {}, "observations": observations}),
+        schema=Diagnosis,
+    )
+
+    assert [item.source for item in diagnosis.hypotheses[0].evidence] == [
+        "kubernetes_logs"
+    ]

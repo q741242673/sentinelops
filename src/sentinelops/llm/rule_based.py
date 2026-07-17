@@ -206,6 +206,68 @@ class RuleBasedProvider:
             return False
 
     @staticmethod
+    def _has_inventory_log_signal(observations: dict[str, Any]) -> bool:
+        text = "\n".join(
+            str(line) for line in observations.get("logs", {}).get("lines", [])
+        ).casefold()
+        return any(
+            marker in text
+            for marker in ("inventory_reservation_failed", "synthetic_timeout")
+        )
+
+    @staticmethod
+    def _has_inventory_prometheus_signal(observations: dict[str, Any]) -> bool:
+        payload = observations.get("prometheus", {})
+        query = str(payload.get("query", "")).casefold()
+        query_targets_5xx = 'status=~"5.."' in query
+        for series in payload.get("result", []):
+            value = series.get("value", [None, "0"])
+            try:
+                positive = len(value) == 2 and float(value[1]) > 0
+            except (TypeError, ValueError):
+                positive = False
+            status = str(series.get("metric", {}).get("status", ""))
+            if positive and (status.startswith("5") or query_targets_5xx):
+                return True
+        return False
+
+    @staticmethod
+    def _has_inventory_loki_signal(observations: dict[str, Any]) -> bool:
+        text = json.dumps(
+            observations.get("loki", {}), ensure_ascii=False
+        ).casefold()
+        return any(
+            marker in text
+            for marker in ("inventory_reservation_failed", "synthetic_timeout")
+        )
+
+    @staticmethod
+    def _has_inventory_trace_signal(observations: dict[str, Any]) -> bool:
+        text = json.dumps(
+            observations.get("trace", {}), ensure_ascii=False
+        ).casefold()
+        return any(
+            marker in text
+            for marker in (
+                "status_code_error",
+                '"status": "502"',
+                '"status": "503"',
+                '"http.status_code": 502',
+                '"http.status_code": 503',
+                "inventory_reservation_failed",
+                "synthetic_timeout",
+            )
+        )
+
+    @classmethod
+    def _has_inventory_rollout_signal(cls, observations: dict[str, Any]) -> bool:
+        current = cls._current_rollout_revision(observations)
+        if current is None:
+            return False
+        cause = str(current.get("change_cause", "")).casefold()
+        return "enable-every-third-inventory-failure" in cause
+
+    @staticmethod
     def _current_rollout_revision(observations: dict[str, Any]) -> dict[str, Any] | None:
         rollout = observations.get("rollout", {})
         revisions = rollout.get("revisions", [])
@@ -296,18 +358,33 @@ class RuleBasedProvider:
                 )
             root_cause = "库存服务进程内的瞬态故障状态导致所有预留请求返回 HTTP 503"
         elif scenario == "inventory_faulty_rollout":
-            candidates = [
-                ("get_pod_logs", "logs", "库存服务日志记录了合成的预留超时"),
-                ("get_service_metrics", "metrics", "工作负载指标显示库存服务错误率升高"),
-                ("query_prometheus", "prometheus", "库存服务请求指标中出现 HTTP 503 响应"),
-                ("search_loki", "loki", "Loki 日志记录了合成的预留超时"),
-                ("get_trace", "trace", "失败的结账链路经过库存服务并在此发生错误"),
-                (
+            candidates = []
+            if self._has_inventory_log_signal(observations):
+                candidates.append(
+                    ("get_pod_logs", "logs", "库存服务日志记录了合成的预留超时")
+                )
+            if self._has_error_metric_signal(observations):
+                candidates.append(
+                    ("get_service_metrics", "metrics", "工作负载指标显示库存服务错误率升高")
+                )
+            if self._has_inventory_prometheus_signal(observations):
+                candidates.append(
+                    ("query_prometheus", "prometheus", "库存服务请求指标中出现 HTTP 5xx 响应")
+                )
+            if self._has_inventory_loki_signal(observations):
+                candidates.append(
+                    ("search_loki", "loki", "Loki 日志记录了合成的预留超时")
+                )
+            if self._has_inventory_trace_signal(observations):
+                candidates.append(
+                    ("get_trace", "trace", "失败的结账链路经过库存服务并在此发生错误")
+                )
+            if self._has_inventory_rollout_signal(observations):
+                candidates.append((
                     "get_rollout_history",
                     "rollout",
                     f"产生错误的配置来自 Deployment revision {current_revision}",
-                ),
-            ]
+                ))
             root_cause = (
                 f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
             )
