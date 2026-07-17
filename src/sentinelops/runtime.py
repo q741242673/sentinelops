@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Literal
 
 from sentinelops.agent import IncidentAgent
 from sentinelops.agent.runbook import IncidentRunbook
@@ -17,6 +18,7 @@ def build_agent(
     profile_id: str = "production-default",
     auto_approve_max_risk: RiskLevel | None = None,
     verification_probe_url: str | None = None,
+    verification_policy: Literal["strict", "offline"] | None = None,
     progress_callback: Callable[[IncidentRecord], None] | None = None,
 ) -> IncidentAgent:
     settings = settings or get_settings()
@@ -26,7 +28,11 @@ def build_agent(
         auto_approve_max_risk=(
             auto_approve_max_risk or RiskLevel(settings.auto_approve_max_risk)
         ),
-        verification_probe_url=verification_probe_url,
+        verification_probe_url=verification_probe_url or settings.verification_probe_url,
+        verification_policy=(
+            verification_policy
+            or ("strict" if settings.tool_backend == "kubernetes" else "offline")
+        ),
         diagnosis_confidence_threshold=settings.diagnosis_confidence_threshold,
         max_reflection_rounds=settings.max_reflection_rounds,
         runbook=runbook,

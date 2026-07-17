@@ -94,16 +94,61 @@ class KubernetesBackend:
         }
 
     def _tool_list_events(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        events = self.core.list_namespaced_event(self.namespace)
+        name = str(arguments.get("name") or "")
+        if not name:
+            raise RuntimeError("list_events requires a target workload name")
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned_replica_sets = self._owned_replica_sets(deployment, replica_sets.items)
+        replica_set_uids = {str(item.metadata.uid) for item in owned_replica_sets}
+        pods = self.core.list_namespaced_pod(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned_pod_uids = {
+            str(pod.metadata.uid)
+            for pod in pods.items
+            if any(
+                str(owner.uid) in replica_set_uids and owner.kind == "ReplicaSet"
+                for owner in (pod.metadata.owner_references or [])
+            )
+        }
+        allowed_uids = {
+            str(deployment.metadata.uid),
+            *replica_set_uids,
+            *owned_pod_uids,
+        }
+        events = self.core.list_namespaced_event(
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        matching = [
+            event
+            for event in events.items
+            if str(getattr(event.involved_object, "uid", "")) in allowed_uids
+        ]
         return {
+            "target_service": name,
             "items": [
                 {
                     "type": event.type,
                     "reason": event.reason,
                     "message": event.message,
                     "object": event.involved_object.name,
+                    "object_kind": event.involved_object.kind,
+                    "object_uid": str(event.involved_object.uid),
+                    "target_bound": True,
                 }
-                for event in events.items[-50:]
+                for event in matching[-50:]
             ]
         }
 

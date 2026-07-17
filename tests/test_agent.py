@@ -819,6 +819,7 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -854,6 +855,7 @@ async def test_approval_is_invalidated_when_fresh_preflight_changes(
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -1038,6 +1040,7 @@ async def test_status_only_resource_version_change_does_not_invalidate_approval(
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -1144,6 +1147,7 @@ async def test_verified_transient_fault_ignores_non_causal_revision_contradictio
         tools=ToolRegistry(backend),
         auto_approve_max_risk=RiskLevel.MEDIUM,
         runbook=VerifiedRuntimeStateRunbook(confidence_threshold=0.8),
+        verification_policy="offline",
     )
     alert = Alert(
         name="InventoryTransientRuntimeFault",
@@ -1803,6 +1807,80 @@ def test_server_predicates_ignore_query_metadata_and_negated_failures() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_strict_verification_escalates_when_required_capabilities_are_missing() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+        verification_policy="strict",
+    )
+
+    result = await agent._verify(  # type: ignore[arg-type]
+        {
+            "incident_id": "strict-verification",
+            "alert": {
+                "name": "HighOrderServiceErrorRate",
+                "service": "order-service",
+                "labels": {},
+            },
+        }
+    )
+
+    assert result["status"] == IncidentStatus.ESCALATED.value
+    assert result["timeline"][0]["type"] == "recovery.verification_incomplete"
+    assert result["timeline"][0]["data"]["missing_capabilities"] == [
+        "prometheus",
+        "active_probe",
+        "tempo",
+    ]
+
+
+def test_unbound_cross_service_event_cannot_authorize_rollback() -> None:
+    events = {
+        "items": [
+            {
+                "type": "Warning",
+                "reason": "Unhealthy",
+                "message": "revision 7 readiness probe failed",
+                "object": "unrelated-api-abc",
+                "object_uid": "unrelated-uid",
+            }
+        ]
+    }
+    observations = {
+        "pods": {"items": []},
+        "logs": {"lines": ["ERROR: timeout acquiring database connection from pool"]},
+        "metrics": {"error_rate": 0.2},
+        "events": events,
+    }
+    current = {"revision": 7, "status": "stable", "change_cause": "ordinary release"}
+
+    assert not IncidentAgent._events_have_explicit_failure(events)
+    assert not IncidentAgent._rollback_has_causal_evidence(observations, current)
+
+
+def test_trace_failure_predicate_parses_false_and_active_values() -> None:
+    healthy = {
+        "trace": {
+            "attributes": {
+                "inventory_reservation_failed": False,
+                "synthetic_timeout": "disabled",
+            }
+        }
+    }
+    failed = {
+        "trace": {
+            "attributes": {
+                "inventory_reservation_failed": True,
+                "synthetic_timeout": "active",
+            }
+        }
+    }
+
+    assert not IncidentAgent._trace_has_explicit_failure(healthy)
+    assert IncidentAgent._trace_has_explicit_failure(failed)
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -2120,6 +2198,7 @@ def test_root_cause_and_confidence_binding_rules_are_independent(
                         "type": "Warning",
                         "reason": "BackOff",
                         "message": "Back-off restarting failed container",
+                        "target_bound": True,
                     }
                 ]
             },
@@ -2233,6 +2312,7 @@ def test_each_evidence_authenticity_rule_is_enforced_independently(
                         "type": "Warning",
                         "reason": "BackOff",
                         "message": "Back-off restarting failed container",
+                        "target_bound": True,
                     }
                 ]
             },
