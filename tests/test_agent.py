@@ -1596,6 +1596,75 @@ def test_rollback_requires_a_current_fault_or_trusted_change_correlation() -> No
     assert "没有明确异常" in feedback
 
 
+def test_rollback_accepts_kind_bad_rollout_marker_with_observed_failure() -> None:
+    plan = RemediationPlan(
+        summary="回滚服务",
+        actions=[
+            RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": "order-service", "revision": 1},
+                rationale="上一版本健康",
+                expected_outcome="服务恢复",
+                risk=RiskLevel.HIGH,
+            )
+        ],
+        rollback="停止操作",
+        verification=["检查错误率"],
+    )
+    state = {
+        "alert": {"service": "order-service"},
+        "observations": {
+            "evidence_catalog": {
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                }
+            },
+            # The real Kubernetes backend omits revision from Pod summaries.
+            "pods": {
+                "items": [
+                    {
+                        "phase": "Running",
+                        "ready": False,
+                        "restarts": 3,
+                        "waiting_reasons": ["CrashLoopBackOff"],
+                    }
+                ]
+            },
+            "logs": {
+                "lines": ["FATAL: application configuration is invalid"]
+            },
+            "metrics": {
+                "desired_replicas": 1,
+                "available_replicas": 0,
+                "availability": 0.0,
+            },
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "health_proof": {"valid": True, "status": "healthy"},
+                    },
+                    {
+                        "revision": 2,
+                        "replicas": 1,
+                        "ready_replicas": 0,
+                        "change_cause": "bad-rollout",
+                        "health_proof": {"valid": False, "status": "unknown"},
+                    },
+                ],
+            },
+        },
+    }
+
+    assert IncidentAgent._plan_feedback(state, plan) is None  # type: ignore[arg-type]
+
+
 def test_supporting_finding_must_match_server_raw_observation() -> None:
     state = {
         "observations": {

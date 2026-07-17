@@ -1192,6 +1192,7 @@ class IncidentAgent:
         return any(
             marker in cause
             for marker in (
+                "bad-rollout",
                 "enable-every-third-inventory-failure",
                 "fault-injection",
                 "faulty-rollout",
