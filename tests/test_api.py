@@ -92,8 +92,18 @@ async def test_api_incident_approval_flow(monkeypatch: pytest.MonkeyPatch) -> No
         api_module.lab_profiles.clear()
 
         reset = await client.post("/api/v1/demo/reset")
-        assert reset.status_code == 200
-        assert reset.json()["baseline_restored"] is True
+        assert reset.status_code == 202
+        reset_job = reset.json()
+        assert reset_job["status"] == "resetting"
+        for _ in range(20):
+            reset_status = await client.get(
+                f"/api/v1/demo/resets/{reset_job['id']}"
+            )
+            if reset_status.json()["status"] != "resetting":
+                break
+            await asyncio.sleep(0)
+        assert reset_status.json()["status"] == "succeeded"
+        assert reset_status.json()["result"]["baseline_restored"] is True
 
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
@@ -363,3 +373,82 @@ async def test_every_lab_fault_starts_from_a_clean_baseline(
     completed = api_module.demo_fault_jobs[job.id]
     assert completed.status == "active"
     assert completed.phase == "waiting_for_alert"
+
+
+@pytest.mark.asyncio
+async def test_demo_reset_runs_in_background_and_converges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=True),
+    )
+
+    async def slow_reset(settings):
+        started.set()
+        await release.wait()
+        return {"baseline_restored": True, "deployment": "inventory-service"}
+
+    monkeypatch.setattr(api_module, "reset_demo_environment", slow_reset)
+    api_module.demo_reset_jobs.clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/api/v1/demo/reset")
+        assert created.status_code == 202
+        job = created.json()
+        assert job["status"] == "resetting"
+
+        await started.wait()
+        duplicate = await client.post("/api/v1/demo/reset")
+        assert duplicate.status_code == 202
+        assert duplicate.json()["id"] == job["id"]
+
+        in_progress = await client.get(f"/api/v1/demo/resets/{job['id']}")
+        assert in_progress.json()["status"] == "resetting"
+
+        release.set()
+        for _ in range(20):
+            completed = await client.get(f"/api/v1/demo/resets/{job['id']}")
+            if completed.json()["status"] != "resetting":
+                break
+            await asyncio.sleep(0)
+
+        payload = completed.json()
+        assert payload["status"] == "succeeded"
+        assert payload["result"]["baseline_restored"] is True
+
+
+@pytest.mark.asyncio
+async def test_demo_reset_job_records_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=True),
+    )
+
+    async def failed_reset(settings):
+        raise RuntimeError("alert did not clear")
+
+    monkeypatch.setattr(api_module, "reset_demo_environment", failed_reset)
+    api_module.demo_reset_jobs.clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post("/api/v1/demo/reset")
+        job_id = created.json()["id"]
+        for _ in range(20):
+            failed = await client.get(f"/api/v1/demo/resets/{job_id}")
+            if failed.json()["status"] != "resetting":
+                break
+            await asyncio.sleep(0)
+
+        assert failed.json()["status"] == "failed"
+        assert failed.json()["error"] == "alert did not clear"
+
+        missing = await client.get("/api/v1/demo/resets/missing")
+        assert missing.status_code == 404

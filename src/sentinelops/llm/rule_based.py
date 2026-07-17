@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -28,6 +29,14 @@ class RuleBasedProvider:
     """
 
     name = "rule_based"
+
+    _BOOLEAN_TRUE = {"true", "1", "yes", "on"}
+    _BOOLEAN_FALSE = {"false", "0", "no", "off"}
+    _NEGATION_BEFORE_MARKER = re.compile(
+        r"(?:\bno\b|\bnot\b|\bnever\b|\bwithout\b|\bdid\s+not\b|"
+        r"没有|并未|未发现|无)(?:[\s\w_=-]{0,64})$",
+        re.IGNORECASE,
+    )
 
     async def structured(
         self,
@@ -80,13 +89,17 @@ class RuleBasedProvider:
         }:
             return declared
 
-        all_evidence = json.dumps(observations, ensure_ascii=False).lower()
-        if (
-            "transient_runtime_fault_enabled" in all_evidence
-            or "reason=transient_runtime_fault" in all_evidence
-        ):
+        if RuleBasedProvider._has_transient_runtime_log_signal(observations):
             return "transient_runtime_fault"
-        if "inventory_reservation_failed" in all_evidence or "synthetic_timeout" in all_evidence:
+        if any(
+            (
+                RuleBasedProvider._has_inventory_log_signal(observations),
+                RuleBasedProvider._has_inventory_prometheus_signal(observations),
+                RuleBasedProvider._has_inventory_loki_signal(observations),
+                RuleBasedProvider._has_inventory_trace_signal(observations),
+                RuleBasedProvider._has_inventory_rollout_signal(observations),
+            )
+        ):
             return "inventory_faulty_rollout"
         if any(
             (
@@ -107,14 +120,105 @@ class RuleBasedProvider:
     def _has_db_pool_log_signal(observations: dict[str, Any]) -> bool:
         lines = observations.get("logs", {}).get("lines", [])
         logs = "\n".join(str(line) for line in lines).lower()
-        return any(
-            marker in logs
-            for marker in (
+        return RuleBasedProvider._contains_asserted_marker(
+            logs,
+            (
                 "timeout acquiring database connection from pool",
                 "database connection pool exhausted",
                 "db_pool_exhaustion",
+            ),
+        )
+
+    @classmethod
+    def _contains_asserted_marker(cls, text: str, markers: tuple[str, ...]) -> bool:
+        """Return true only when a marker is asserted, not explicitly negated.
+
+        This intentionally stays conservative. Log and Event payloads are untrusted text;
+        a sentence such as ``No readiness probe failed`` must not authorize a write merely
+        because it contains the same words as a real failure.
+        """
+
+        normalized = text.casefold()
+        for marker in markers:
+            offset = 0
+            while (index := normalized.find(marker.casefold(), offset)) >= 0:
+                prefix = normalized[max(0, index - 80) : index]
+                # Punctuation starts a new assertion, so a negation in a previous sentence
+                # does not suppress a later, positive failure record.
+                prefix = re.split(r"[.;!?\n]", prefix)[-1]
+                if not cls._NEGATION_BEFORE_MARKER.search(prefix):
+                    return True
+                offset = index + len(marker)
+        return False
+
+    @classmethod
+    def _explicit_boolean(cls, text: str, key: str) -> bool | None:
+        assignments = re.findall(
+            rf"(?<![\w]){re.escape(key)}\s*=\s*(true|false|1|0|yes|no|on|off)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not assignments:
+            return None
+        # Conflicting values are not trustworthy. Any explicit false therefore fails closed.
+        values = {value.casefold() for value in assignments}
+        if values & cls._BOOLEAN_FALSE:
+            return False
+        return bool(values) and values <= cls._BOOLEAN_TRUE
+
+    @classmethod
+    def _has_transient_runtime_text_signal(cls, text: str) -> bool:
+        normalized = text.casefold()
+        enabled = cls._explicit_boolean(normalized, "transient_runtime_fault_enabled")
+        restart_required = cls._explicit_boolean(normalized, "restart_required")
+        if enabled is False or restart_required is not True:
+            return False
+        if enabled is True:
+            return True
+        # The live demo historically emits the enabled marker without ``=true``. Preserve
+        # that wire format, while ensuring ``..._enabled=false`` cannot match as a prefix.
+        return bool(
+            re.search(
+                r"(?<![\w])transient_runtime_fault_enabled(?!\s*=)(?![\w])",
+                normalized,
             )
         )
+
+    @classmethod
+    def _has_transient_runtime_log_signal(cls, observations: dict[str, Any]) -> bool:
+        text = "\n".join(
+            str(line) for line in observations.get("logs", {}).get("lines", [])
+        )
+        return cls._has_transient_runtime_text_signal(text)
+
+    @classmethod
+    def _has_transient_runtime_loki_signal(cls, observations: dict[str, Any]) -> bool:
+        # Inspect returned streams only. A successful empty query may itself contain the
+        # fault token, but a query string is not evidence that the fault occurred.
+        text = json.dumps(
+            observations.get("loki", {}).get("result", []), ensure_ascii=False
+        )
+        return cls._has_transient_runtime_text_signal(text)
+
+    @staticmethod
+    def _has_transient_runtime_prometheus_signal(
+        observations: dict[str, Any],
+    ) -> bool:
+        for series in observations.get("prometheus", {}).get("result", []):
+            metric = json.dumps(series.get("metric", {}), ensure_ascii=False).casefold()
+            if "transient_runtime_fault" not in metric:
+                continue
+            samples = []
+            if isinstance(series.get("value"), list):
+                samples.append(series["value"])
+            samples.extend(series.get("values", []))
+            for sample in samples:
+                try:
+                    if len(sample) == 2 and float(sample[1]) > 0:
+                        return True
+                except (TypeError, ValueError):
+                    continue
+        return False
 
     @staticmethod
     def _has_db_pool_metric_signal(observations: dict[str, Any]) -> bool:
@@ -158,10 +262,22 @@ class RuleBasedProvider:
             "imagepullbackoff",
         )
         for item in observations.get("events", {}).get("items", []):
-            message = " ".join(
-                str(item.get(key, "")) for key in ("reason", "message")
-            ).casefold()
-            if any(marker in message for marker in markers):
+            event_type = str(item.get("type", "")).casefold()
+            reason = str(item.get("reason", "")).casefold()
+            message = str(item.get("message", "")).casefold()
+            if event_type == "normal":
+                continue
+            if reason in {
+                "backoff",
+                "crashloopbackoff",
+                "errimagepull",
+                "imagepullbackoff",
+                "failedcreate",
+            }:
+                return True
+            if RuleBasedProvider._contains_asserted_marker(
+                " ".join((reason, message)), markers
+            ):
                 return True
         return False
 
@@ -170,15 +286,15 @@ class RuleBasedProvider:
         logs = "\n".join(
             str(line) for line in observations.get("logs", {}).get("lines", [])
         ).casefold()
-        return any(
-            marker in logs
-            for marker in (
+        return RuleBasedProvider._contains_asserted_marker(
+            logs,
+            (
                 "required environment variable",
                 "application configuration is invalid",
                 "invalid configuration",
                 "crashloopbackoff",
                 "failed to start",
-            )
+            ),
         )
 
     @classmethod
@@ -210,9 +326,8 @@ class RuleBasedProvider:
         text = "\n".join(
             str(line) for line in observations.get("logs", {}).get("lines", [])
         ).casefold()
-        return any(
-            marker in text
-            for marker in ("inventory_reservation_failed", "synthetic_timeout")
+        return RuleBasedProvider._contains_asserted_marker(
+            text, ("inventory_reservation_failed", "synthetic_timeout")
         )
 
     @staticmethod
@@ -234,11 +349,10 @@ class RuleBasedProvider:
     @staticmethod
     def _has_inventory_loki_signal(observations: dict[str, Any]) -> bool:
         text = json.dumps(
-            observations.get("loki", {}), ensure_ascii=False
+            observations.get("loki", {}).get("result", []), ensure_ascii=False
         ).casefold()
-        return any(
-            marker in text
-            for marker in ("inventory_reservation_failed", "synthetic_timeout")
+        return RuleBasedProvider._contains_asserted_marker(
+            text, ("inventory_reservation_failed", "synthetic_timeout")
         )
 
     @staticmethod
@@ -307,10 +421,7 @@ class RuleBasedProvider:
         current_revision, _ = self._rollout_revisions(observations)
         if scenario == "transient_runtime_fault":
             candidates = []
-            log_text = "\n".join(
-                str(line) for line in observations.get("logs", {}).get("lines", [])
-            ).casefold()
-            if "transient_runtime_fault" in log_text:
+            if self._has_transient_runtime_log_signal(observations):
                 candidates.append(
                     (
                         "get_pod_logs",
@@ -326,10 +437,7 @@ class RuleBasedProvider:
                         "工作负载指标确认进程内瞬态故障处于活动状态",
                     )
                 )
-            prometheus_text = json.dumps(
-                observations.get("prometheus", {}), ensure_ascii=False
-            ).casefold()
-            if "transient_runtime_fault" in prometheus_text:
+            if self._has_transient_runtime_prometheus_signal(observations):
                 candidates.append(
                     (
                         "query_prometheus",
@@ -337,10 +445,7 @@ class RuleBasedProvider:
                         "Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
                     )
                 )
-            loki_text = json.dumps(
-                observations.get("loki", {}), ensure_ascii=False
-            ).casefold()
-            if "transient_runtime_fault" in loki_text:
+            if self._has_transient_runtime_loki_signal(observations):
                 candidates.append(
                     (
                         "search_loki",

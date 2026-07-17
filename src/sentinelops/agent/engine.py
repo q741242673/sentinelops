@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -583,6 +585,7 @@ class IncidentAgent:
             calls["trace"] = ("get_trace", {"trace_id": trace_id})
         observations: dict[str, Any] = {}
         evidence_catalog: dict[str, dict[str, Any]] = {}
+        evidence_snapshots: dict[str, dict[str, Any]] = {}
         for key, (tool_name, arguments) in calls.items():
             result = await self._call_tool_traced(
                 state,
@@ -591,7 +594,8 @@ class IncidentAgent:
                 tool_name=tool_name,
                 arguments=arguments,
             )
-            observations[key] = result.content if result.success else {"error": result.error}
+            raw = result.content if result.success else {"error": result.error}
+            observations[key] = raw
             entry = self._catalog_entry(
                 state,
                 parent_name="collect_context",
@@ -601,6 +605,7 @@ class IncidentAgent:
                 success=result.success,
             )
             evidence_catalog[entry.evidence_id] = entry.model_dump(mode="json")
+            evidence_snapshots[entry.evidence_id] = copy.deepcopy(raw)
         if self.tools.has_tool("get_change_evidence"):
             result = await self._call_tool_traced(
                 state,
@@ -609,7 +614,8 @@ class IncidentAgent:
                 tool_name="get_change_evidence",
                 arguments={"service": service},
             )
-            observations["changes"] = result.content if result.success else {"error": result.error}
+            raw = result.content if result.success else {"error": result.error}
+            observations["changes"] = raw
             entry = self._catalog_entry(
                 state,
                 parent_name="collect_context",
@@ -619,10 +625,12 @@ class IncidentAgent:
                 success=result.success,
             )
             evidence_catalog[entry.evidence_id] = entry.model_dump(mode="json")
+            evidence_snapshots[entry.evidence_id] = copy.deepcopy(raw)
         observations["evidence_catalog"] = evidence_catalog
         return {
             "status": IncidentStatus.INVESTIGATING.value,
             "observations": observations,
+            "evidence_snapshots": evidence_snapshots,
             "timeline": [_event("context.collected", "已采集 Kubernetes 与可观测性诊断上下文")],
         }
 
@@ -885,6 +893,7 @@ class IncidentAgent:
                 )
             )
         observations = dict(state["observations"])
+        evidence_snapshots = copy.deepcopy(state.get("evidence_snapshots", {}))
         prior = dict(observations.get("follow_up_evidence", {}))
         observations["follow_up_evidence"] = {**prior, f"round_{round_number}": supplemental}
         evidence_catalog = dict(observations.get("evidence_catalog", {}))
@@ -904,8 +913,10 @@ class IncidentAgent:
             evidence_id = f"collect_follow_up:{round_number}:tool:{source}"
             if catalog_updates.get(evidence_id, {}).get("success"):
                 observations[canonical_sources[source]] = content
+            evidence_snapshots[evidence_id] = copy.deepcopy(content)
         return {
             "observations": observations,
+            "evidence_snapshots": evidence_snapshots,
             "reflection_rounds": round_number,
             "timeline": events,
         }
@@ -1035,22 +1046,10 @@ class IncidentAgent:
     ) -> str | None:
         if not evidence.supports_hypothesis:
             return None
-        observations = state.get("observations", {})
-        raw_keys = {
-            "list_pods": "pods",
-            "list_events": "events",
-            "get_pod_logs": "logs",
-            "get_rollout_history": "rollout",
-            "get_service_metrics": "metrics",
-            "query_prometheus": "prometheus",
-            "search_loki": "loki",
-            "get_trace": "trace",
-            "get_change_evidence": "changes",
-        }
-        raw_key = raw_keys.get(entry.tool)
-        if raw_key is None or raw_key not in observations:
-            return None
-        raw = observations[raw_key]
+        snapshots = state.get("evidence_snapshots", {})
+        if entry.evidence_id not in snapshots:
+            return f"证据 {evidence.evidence_id} 缺少采集时的不可变原始快照"
+        raw = snapshots[entry.evidence_id]
         if evidence.raw and evidence.raw != raw:
             return f"证据 {evidence.evidence_id} 的 raw 与服务端原始观测不一致"
 
@@ -1060,7 +1059,7 @@ class IncidentAgent:
         elif entry.tool == "list_events":
             supported = cls._events_have_explicit_failure(raw)
         elif entry.tool == "get_pod_logs":
-            supported = cls._text_has_explicit_failure(raw)
+            supported = cls._logs_have_explicit_failure(raw)
         elif entry.tool == "get_rollout_history":
             current = cls._active_revision(raw) if isinstance(raw, dict) else None
             supported = bool(
@@ -1079,8 +1078,12 @@ class IncidentAgent:
             )
         elif entry.tool == "get_service_metrics":
             supported = cls._metrics_have_explicit_failure(raw)
-        elif entry.tool in {"query_prometheus", "search_loki", "get_trace"}:
-            supported = cls._text_has_explicit_failure(raw)
+        elif entry.tool == "query_prometheus":
+            supported = cls._prometheus_has_explicit_failure(raw)
+        elif entry.tool == "search_loki":
+            supported = cls._loki_has_explicit_failure(raw)
+        elif entry.tool == "get_trace":
+            supported = cls._trace_has_explicit_failure(raw)
         elif entry.tool == "get_change_evidence":
             supported = isinstance(raw, dict) and raw.get("correlation_status") in {
                 "verified",
@@ -1095,25 +1098,143 @@ class IncidentAgent:
     def _payload_text(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True).casefold()
 
-    @classmethod
-    def _text_has_explicit_failure(cls, payload: Any) -> bool:
-        text = cls._payload_text(payload)
+    @staticmethod
+    def _line_has_explicit_failure(line: str) -> bool:
+        text = line.casefold().strip()
+        negated = (
+            "no request failure",
+            "no failures",
+            "no error",
+            "no exception",
+            "no timeout",
+            "not failed",
+            "without error",
+            "error budget is healthy",
+            "未出现故障",
+            "没有故障",
+            "无故障",
+        )
+        if any(marker in text for marker in negated):
+            return False
+        fault_flag = re.search(r"(?<![\w])([a-z0-9_]*fault_enabled)(?![\w])", text)
+        if fault_flag:
+            flag_name = re.escape(fault_flag.group(1))
+            enabled_values = re.findall(
+                rf"{flag_name}\s*=\s*(true|false|1|0|yes|no|on|off)\b",
+                text,
+            )
+            restart_values = re.findall(
+                r"restart_required\s*=\s*(true|false|1|0|yes|no|on|off)\b",
+                text,
+            )
+            false_values = {"false", "0", "no", "off"}
+            true_values = {"true", "1", "yes", "on"}
+            if (
+                set(enabled_values) & false_values
+                or set(restart_values) & false_values
+                or not restart_values
+                or not set(restart_values) <= true_values
+            ):
+                return False
+            if enabled_values:
+                return set(enabled_values) <= true_values
+            return bool(
+                re.search(
+                    rf"(?<![\w]){flag_name}(?!\s*=)(?![\w])",
+                    text,
+                )
+            )
         return any(
             marker in text
             for marker in (
-                "error",
-                "failed",
-                "failure",
-                "fatal",
-                "exception",
-                "timeout",
+                "fatal:",
+                "error:",
+                "exception:",
                 "crashloopbackoff",
-                "http 5",
-                '"status": "5',
+                "timeout acquiring",
+                "connection pool exhausted",
                 "required environment variable",
                 "invalid configuration",
                 "inventory_reservation_failed",
-                "fault_enabled",
+                "synthetic_timeout",
+            )
+        )
+
+    @classmethod
+    def _logs_have_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return any(
+            cls._line_has_explicit_failure(str(line))
+            for line in payload.get("lines", [])
+        )
+
+    @staticmethod
+    def _positive_prometheus_sample(series: Any) -> bool:
+        if not isinstance(series, dict):
+            return False
+        samples = []
+        if isinstance(series.get("value"), list):
+            samples.append(series["value"])
+        samples.extend(series.get("values", []))
+        for sample in samples:
+            try:
+                if len(sample) == 2 and float(sample[1]) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    @classmethod
+    def _prometheus_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        query = str(payload.get("query", "")).casefold()
+        query_targets_failure = any(
+            marker in query
+            for marker in ('status=~"5.."', "error", "failure", "fault")
+        )
+        for series in payload.get("result", []):
+            if not cls._positive_prometheus_sample(series):
+                continue
+            labels = series.get("metric", {}) if isinstance(series, dict) else {}
+            status = str(labels.get("status", labels.get("status_code", "")))
+            if status.startswith("5") or query_targets_failure:
+                return True
+        return False
+
+    @classmethod
+    def _loki_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        for stream in payload.get("result", []):
+            if not isinstance(stream, dict):
+                continue
+            for sample in stream.get("values", []):
+                if (
+                    isinstance(sample, list)
+                    and len(sample) == 2
+                    and cls._line_has_explicit_failure(str(sample[1]))
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _trace_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict) or not isinstance(payload.get("trace"), dict):
+            return False
+        text = cls._payload_text(payload["trace"])
+        return any(
+            marker in text
+            for marker in (
+                "status_code_error",
+                '"status.code": 2',
+                '"http.status_code": 500',
+                '"http.status_code": 502',
+                '"http.status_code": 503',
+                '"error": true',
+                "inventory_reservation_failed",
+                "synthetic_timeout",
             )
         )
 
@@ -1143,6 +1264,14 @@ class IncidentAgent:
     def _events_have_explicit_failure(payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
+        failure_reasons = {
+            "backoff",
+            "failed",
+            "failedcreate",
+            "failedmount",
+            "failedscheduling",
+            "unhealthy",
+        }
         markers = (
             "back-off restarting failed container",
             "crashloopbackoff",
@@ -1153,10 +1282,26 @@ class IncidentAgent:
             "imagepullbackoff",
         )
         for item in payload.get("items", []):
+            if str(item.get("type", "")).casefold() != "warning":
+                continue
+            reason = str(item.get("reason", "")).casefold()
             message = " ".join(
                 str(item.get(key, "")) for key in ("reason", "message")
             ).casefold()
-            if any(marker in message for marker in markers):
+            if any(
+                negation in message
+                for negation in (
+                    "no readiness probe failed",
+                    "no startup probe failed",
+                    "not failed",
+                    "没有失败",
+                    "未失败",
+                )
+            ):
+                continue
+            if (not reason or reason in failure_reasons) and any(
+                marker in message for marker in markers
+            ):
                 return True
         return False
 
@@ -1225,7 +1370,7 @@ class IncidentAgent:
         if cls._pods_have_explicit_failure(matching_pods):
             return True
 
-        observed_failure = cls._text_has_explicit_failure(
+        observed_failure = cls._logs_have_explicit_failure(
             observations.get("logs", {})
         ) or cls._metrics_have_explicit_failure(observations.get("metrics", {}))
         if cls._revision_has_explicit_fault_cause(current) and observed_failure:

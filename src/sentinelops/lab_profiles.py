@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -60,10 +59,7 @@ class VerifiedRuntimeStateRunbook(IncidentRunbook):
         if diagnosis.confidence < self.confidence_threshold:
             return None
         observations = state.get("observations", {})
-        logs = json.dumps(observations.get("logs", {}), ensure_ascii=False).lower()
-        live_marker = (
-            "transient_runtime_fault_enabled" in logs and "restart_required=true" in logs
-        )
+        live_marker = RuleBasedProvider._has_transient_runtime_log_signal(observations)
         simulated_marker = (
             observations.get("metrics", {}).get("scenario") == "transient_runtime_fault"
         )
@@ -99,11 +95,10 @@ class VerifiedRuntimeStateRunbook(IncidentRunbook):
         if action.tool_name != "restart_deployment":
             return False
         observations = state.get("observations", {})
-        logs = json.dumps(observations.get("logs", {}), ensure_ascii=False).lower()
         return (
-            "transient_runtime_fault_enabled" in logs
-            and "restart_required=true" in logs
-        ) or observations.get("metrics", {}).get("scenario") == "transient_runtime_fault"
+            RuleBasedProvider._has_transient_runtime_log_signal(observations)
+            or observations.get("metrics", {}).get("scenario") == "transient_runtime_fault"
+        )
 
 
 class FaultyRolloutRunbook(IncidentRunbook):

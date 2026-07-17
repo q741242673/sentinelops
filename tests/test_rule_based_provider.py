@@ -81,6 +81,62 @@ class RestartedButCurrentlyHealthyBackend:
         return ToolResult(tool_name=name, success=True, content=content)
 
 
+class ExplicitlyHealthyTextBackend:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        self.calls.append(name)
+        content: dict[str, object]
+        if name == "list_pods":
+            content = {
+                "items": [
+                    {
+                        "name": "inventory-service-healthy",
+                        "phase": "Running",
+                        "ready": True,
+                        "restarts": 0,
+                        "waiting_reasons": [],
+                    }
+                ]
+            }
+        elif name == "list_events":
+            content = {
+                "items": [
+                    {
+                        "type": "Warning",
+                        "reason": "Unhealthy",
+                        "message": "No readiness probe failed",
+                    }
+                ]
+            }
+        elif name == "get_pod_logs":
+            content = {
+                "lines": [
+                    "transient_runtime_fault_enabled=false restart_required=true",
+                    "INFO: no invalid configuration was found",
+                ]
+            }
+        elif name == "get_rollout_history":
+            content = {
+                "current_revision": 1,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 1,
+                        "ready_replicas": 1,
+                        "status": "stable",
+                        "health_status": "healthy",
+                    }
+                ],
+            }
+        elif name == "get_service_metrics":
+            content = {"error_rate": 0.0, "db_pool_utilization": 0.3}
+        else:
+            content = {}
+        return ToolResult(tool_name=name, success=True, content=content)
+
+
 def test_infers_runtime_state_fault_before_generic_inventory_failure() -> None:
     observations = {
         "logs": {
@@ -92,6 +148,103 @@ def test_infers_runtime_state_fault_before_generic_inventory_failure() -> None:
     }
 
     assert RuleBasedProvider._infer_scenario(observations) == "transient_runtime_fault"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "transient_runtime_fault_enabled=false restart_required=true",
+        "transient_runtime_fault_enabled=0 restart_required=true",
+        "transient_runtime_fault_enabled=true restart_required=false",
+        "transient_runtime_fault_enabled=true restart_required=off",
+        (
+            "transient_runtime_fault_enabled=true restart_required=true "
+            "transient_runtime_fault_enabled=false"
+        ),
+    ],
+)
+def test_explicit_false_runtime_state_is_not_an_active_fault(line: str) -> None:
+    observations = {"logs": {"lines": [line]}}
+
+    assert RuleBasedProvider._has_transient_runtime_log_signal(observations) is False
+    assert RuleBasedProvider._infer_scenario(observations) == "unknown"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "transient_runtime_fault_enabled=true restart_required=true",
+        "transient_runtime_fault_enabled=1 restart_required=on",
+        "transient_runtime_fault_enabled reason=in_memory_state restart_required=true",
+    ],
+)
+def test_true_runtime_state_preserves_live_and_legacy_demo_formats(line: str) -> None:
+    observations = {"logs": {"lines": [line]}}
+
+    assert RuleBasedProvider._has_transient_runtime_log_signal(observations) is True
+    assert RuleBasedProvider._infer_scenario(observations) == "transient_runtime_fault"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No readiness probe failed",
+        "readiness probe did not fail",
+        "No invalid configuration was detected",
+        "service started without application configuration is invalid errors",
+    ],
+)
+def test_explicitly_negated_event_or_log_markers_do_not_match(message: str) -> None:
+    observations = {
+        "events": {
+            "items": [
+                {"type": "Warning", "reason": "Unhealthy", "message": message}
+            ]
+        },
+        "logs": {"lines": [message]},
+    }
+
+    assert RuleBasedProvider._has_bad_rollout_event_signal(observations) is False
+    assert RuleBasedProvider._has_bad_rollout_log_signal(observations) is False
+
+
+def test_structured_warning_reason_and_positive_message_still_match() -> None:
+    observations = {
+        "events": {
+            "items": [
+                {
+                    "type": "Warning",
+                    "reason": "Unhealthy",
+                    "message": "Readiness probe failed: connection refused",
+                }
+            ]
+        }
+    }
+
+    assert RuleBasedProvider._has_bad_rollout_event_signal(observations) is True
+
+
+@pytest.mark.asyncio
+async def test_negated_fault_text_escalates_without_a_write() -> None:
+    backend = ExplicitlyHealthyTextBackend()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+
+    record = await agent.start(
+        Alert(
+            name="InventoryTransientRuntimeFault",
+            namespace="sentinelops-demo",
+            service="inventory-service",
+            summary="verify whether the runtime fault is active",
+        )
+    )
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.plan is None
+    assert not {
+        "restart_deployment",
+        "rollback_deployment",
+        "scale_deployment",
+    }.intersection(backend.calls)
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -68,6 +68,16 @@ class DemoFaultJob(BaseModel):
 
 
 demo_fault_jobs: dict[str, DemoFaultJob] = {}
+
+
+class DemoResetJob(BaseModel):
+    id: str
+    status: Literal["resetting", "succeeded", "failed"]
+    result: dict[str, object] | None = None
+    error: str | None = None
+
+
+demo_reset_jobs: dict[str, DemoResetJob] = {}
 
 
 class RuntimeInfo(BaseModel):
@@ -288,16 +298,45 @@ async def create_reflection_demo_fault() -> DemoFaultJob:
     return _create_demo_fault_job("ambiguous_change_fault")
 
 
-@app.post("/api/v1/demo/reset")
-async def reset_demo() -> dict[str, Any]:
-    _require_demo_api_enabled()
-    lab_profiles.clear()
+async def _run_demo_reset(job_id: str) -> None:
     try:
         result = await reset_demo_environment(get_settings())
         _release_demo_alert_deduplication()
-        return result
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        demo_reset_jobs[job_id] = demo_reset_jobs[job_id].model_copy(
+            update={"status": "succeeded", "result": result}
+        )
+    except Exception as exc:
+        demo_reset_jobs[job_id] = demo_reset_jobs[job_id].model_copy(
+            update={"status": "failed", "error": str(exc)}
+        )
+
+
+@app.post("/api/v1/demo/reset", response_model=DemoResetJob, status_code=202)
+async def reset_demo() -> DemoResetJob:
+    _require_demo_api_enabled()
+    lab_profiles.clear()
+    active_job = next(
+        (job for job in demo_reset_jobs.values() if job.status == "resetting"),
+        None,
+    )
+    if active_job:
+        return active_job
+
+    job = DemoResetJob(id=str(uuid4()), status="resetting")
+    demo_reset_jobs[job.id] = job
+    task = asyncio.create_task(_run_demo_reset(job.id))
+    demo_fault_tasks.add(task)
+    task.add_done_callback(demo_fault_tasks.discard)
+    return job
+
+
+@app.get("/api/v1/demo/resets/{job_id}", response_model=DemoResetJob)
+async def get_demo_reset(job_id: str) -> DemoResetJob:
+    _require_demo_api_enabled()
+    try:
+        return demo_reset_jobs[job_id]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="演示环境恢复任务不存在") from exc
 
 
 def _create_demo_fault_job(

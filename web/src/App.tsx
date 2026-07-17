@@ -5,6 +5,7 @@ import {
   approvalTimeoutError,
   clearStaleApprovalTimeout,
   consoleError,
+  errorForSelectedIncident,
   isTerminalIncidentStatus,
 } from "./operationErrors";
 import type { ConsoleError } from "./operationErrors";
@@ -452,6 +453,7 @@ function App() {
     () => selected?.diagnosis?.hypotheses.flatMap((item) => item.evidence) ?? [],
     [selected],
   );
+  const visibleError = errorForSelectedIncident(error, selected?.id ?? null);
 
   async function injectFault() {
     setFaultBusy(true);
@@ -541,7 +543,15 @@ function App() {
     setError(null);
     setDemoMessage("正在恢复演示基线…");
     try {
-      await api.resetDemoEnvironment();
+      let job = await api.resetDemoEnvironment();
+      while (job.status === "resetting") {
+        setDemoMessage("后台正在恢复 Deployment，并等待演示告警清除…");
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        job = await api.getDemoResetJob(job.id);
+      }
+      if (job.status === "failed" || !job.result?.baseline_restored) {
+        throw new Error(job.error ?? "演示环境恢复失败");
+      }
       setDemoMessage("演示环境已恢复健康，可以开始下一轮。");
     } catch (cause) {
       setError(consoleError(cause instanceof Error ? cause.message : "无法恢复演示环境"));
@@ -568,7 +578,7 @@ function App() {
         onRun={liveMode ? injectFault : createSimulatedIncident}
       />
 
-      {error && <div className="error-banner" role="alert">{error.message}</div>}
+      {visibleError && <div className="error-banner" role="alert">{visibleError.message}</div>}
 
       <div className="console-layout">
         <IncidentQueue incidents={incidents} selectedId={selected?.id ?? null} onSelect={setSelectedId} />

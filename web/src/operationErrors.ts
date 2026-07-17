@@ -44,3 +44,16 @@ export function clearStaleApprovalTimeout(
 export function isTerminalIncidentStatus(status: IncidentStatus): boolean {
   return TERMINAL_INCIDENT_STATUSES.has(status);
 }
+
+export function errorForSelectedIncident(
+  current: ConsoleError | null,
+  selectedIncidentId: string | null,
+): ConsoleError | null {
+  if (
+    current?.operation?.kind === "approval-timeout"
+    && current.operation.incidentId !== selectedIncidentId
+  ) {
+    return null;
+  }
+  return current;
+}

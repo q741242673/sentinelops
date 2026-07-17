@@ -1,14 +1,13 @@
-import type { DemoFaultJob, Incident, RuntimeInfo } from "./types";
+import type { DemoFaultJob, DemoResetJob, Incident, RuntimeInfo } from "./types";
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const APPROVAL_REQUEST_TIMEOUT_MS = 90_000;
-export const DEMO_RESET_REQUEST_TIMEOUT_MS = 60_000;
 
 const DEFAULT_TIMEOUT_MESSAGE = "请求超时，请确认本地 API、Docker Desktop 和 kind 集群正在运行";
 const APPROVAL_TIMEOUT_MESSAGE =
   "审批请求等待超时，操作可能仍在后台执行，请以实时事故状态为准";
-const DEMO_RESET_TIMEOUT_MESSAGE =
-  "恢复请求等待超时，操作可能仍在后台执行，请以实时状态为准";
+const DEMO_RESET_SUBMIT_TIMEOUT_MESSAGE =
+  "恢复任务提交超时，任务可能已经在后台运行；请再次点击恢复以继续查询同一任务";
 
 interface RequestOptions extends RequestInit {
   timeoutMs?: number;
@@ -77,11 +76,12 @@ export const api = {
   getDemoFaultJob: (jobId: string) =>
     request<DemoFaultJob>(`/api/v1/demo/faults/${jobId}`),
   resetDemoEnvironment: () =>
-    request<{ baseline_restored: boolean }>("/api/v1/demo/reset", {
+    request<DemoResetJob>("/api/v1/demo/reset", {
       method: "POST",
-      timeoutMs: DEMO_RESET_REQUEST_TIMEOUT_MS,
-      timeoutMessage: DEMO_RESET_TIMEOUT_MESSAGE,
+      timeoutMessage: DEMO_RESET_SUBMIT_TIMEOUT_MESSAGE,
     }),
+  getDemoResetJob: (jobId: string) =>
+    request<DemoResetJob>(`/api/v1/demo/resets/${jobId}`),
   decideIncident: (
     incidentId: string,
     approvalId: string,

@@ -4,7 +4,6 @@ import {
   api,
   APPROVAL_REQUEST_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
-  DEMO_RESET_REQUEST_TIMEOUT_MS,
   RequestTimeoutError,
 } from "../src/api";
 
@@ -72,17 +71,28 @@ describe("endpoint request timeouts", () => {
     await result;
   });
 
-  it("waits at least as long as the Kubernetes reset upper bound", async () => {
+  it("starts reset as a fast background job and exposes a polling endpoint", async () => {
+    const job = { id: "reset-1", status: "resetting", result: null, error: null };
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(
+      new Response(JSON.stringify(job), { headers: { "Content-Type": "application/json" } }),
+    )));
+
+    await expect(api.resetDemoEnvironment()).resolves.toEqual(job);
+    await expect(api.getDemoResetJob("reset-1")).resolves.toEqual(job);
+
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/v1/demo/reset", expect.objectContaining({ method: "POST" }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/v1/demo/resets/reset-1", expect.any(Object));
+  });
+
+  it("explains that a reset submission may already be running when its response times out", async () => {
     vi.stubGlobal("fetch", pendingFetch());
 
     const request = api.resetDemoEnvironment();
     const result = expect(request).rejects.toMatchObject({
       name: "RequestTimeoutError",
-      message: expect.stringContaining("操作可能仍在后台执行，请以实时状态为准"),
+      message: expect.stringContaining("任务可能已经在后台运行"),
     });
-    await vi.advanceTimersByTimeAsync(45_000);
-    expect(DEMO_RESET_REQUEST_TIMEOUT_MS).toBeGreaterThanOrEqual(45_000);
-    await vi.advanceTimersByTimeAsync(DEMO_RESET_REQUEST_TIMEOUT_MS - 45_000);
+    await vi.advanceTimersByTimeAsync(DEFAULT_REQUEST_TIMEOUT_MS);
 
     await result;
   });
