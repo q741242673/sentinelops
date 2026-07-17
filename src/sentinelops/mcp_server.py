@@ -26,9 +26,9 @@ def create_server():
         return await invoke("list_pods", {"label_selector": label_selector})
 
     @server.tool()
-    async def list_events() -> dict[str, Any]:
-        """List recent Kubernetes events in the configured namespace."""
-        return await invoke("list_events", {})
+    async def list_events(name: str) -> dict[str, Any]:
+        """List recent Kubernetes events bound to one target workload."""
+        return await invoke("list_events", {"name": name})
 
     @server.tool()
     async def get_pod_logs(

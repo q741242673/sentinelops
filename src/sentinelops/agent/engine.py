@@ -153,6 +153,9 @@ class IncidentAgent:
         self._approval_versions: dict[str, int] = {}
         self._consumed_approval_ids: set[str] = set()
         self._invalidated_incidents: dict[str, str] = {}
+        self._writes_in_flight: set[str] = set()
+        self._write_dispatched_incidents: set[str] = set()
+        self._invalidated_during_write: set[str] = set()
 
     def _build_graph(self):
         builder = StateGraph(IncidentState)
@@ -356,11 +359,17 @@ class IncidentAgent:
     ) -> IncidentRecord | None:
         """Atomically invalidate an incident when its upstream alert resolves."""
 
+        # Cancellation is monotonic and must become visible before waiting for the
+        # approval lock. Otherwise a resume already holding the lock can pass
+        # preflight and dispatch a stale write before this coroutine runs again.
+        self._invalidated_incidents.setdefault(incident_id, reason)
+        if incident_id in self._writes_in_flight:
+            self._invalidated_during_write.add(incident_id)
+
         lock = self._resume_locks.setdefault(incident_id, asyncio.Lock())
         async with lock:
             record = self.records.get(incident_id)
             if record is None:
-                self._invalidated_incidents[incident_id] = reason
                 return None
             if record.status not in {
                 IncidentStatus.RECEIVED,
@@ -368,17 +377,39 @@ class IncidentAgent:
                 IncidentStatus.AWAITING_APPROVAL,
             }:
                 if not any(event.type == "alertmanager.resolved" for event in record.timeline):
+                    write_outcome_unknown = incident_id in self._invalidated_during_write
+                    write_was_dispatched = incident_id in self._write_dispatched_incidents
+                    if not write_was_dispatched:
+                        record.status = IncidentStatus.RESOLVED
+                        record.approval = None
+                        record.active_step_id = None
                     record.timeline.append(
                         TimelineEvent(
                             type="alertmanager.resolved",
-                            message="Alertmanager 已发送 resolved，当前处置流程保持原有终态",
-                            data={"reason": reason},
+                            message=(
+                                "Alertmanager 已发送 resolved，但集群写操作当时已经开始；"
+                                "执行结果按未知处理并停止自动处置"
+                                if write_outcome_unknown
+                                else (
+                                    "Alertmanager 已确认告警恢复，旧操作已撤销且未执行集群写入"
+                                    if not write_was_dispatched
+                                    else "Alertmanager 已发送 resolved，当前处置流程保持原有终态"
+                                )
+                            ),
+                            data={
+                                "reason": reason,
+                                **(
+                                    {"execution_outcome": "unknown"}
+                                    if write_outcome_unknown
+                                    else {}
+                                ),
+                            },
                         )
                     )
                     record.updated_at = datetime.now(UTC)
                     self._publish(record)
+                self._invalidated_during_write.discard(incident_id)
                 return record
-            self._invalidated_incidents[incident_id] = reason
             request = record.approval
             if request is not None:
                 self._consumed_approval_ids.add(request.approval_id)
@@ -1362,6 +1393,35 @@ class IncidentAgent:
         return False
 
     @classmethod
+    def _prometheus_alert_is_firing(
+        cls,
+        result: ToolResult,
+        *,
+        alert_name: str,
+        service: str,
+        namespace: str,
+    ) -> bool:
+        if not result.success:
+            return False
+        for series in result.content.get("result", []):
+            if not isinstance(series, dict) or not cls._positive_prometheus_sample(series):
+                continue
+            labels = series.get("metric")
+            if not isinstance(labels, dict):
+                continue
+            if all(
+                str(labels.get(key, "")) == expected
+                for key, expected in {
+                    "alertname": alert_name,
+                    "alertstate": "firing",
+                    "service": service,
+                    "namespace": namespace,
+                }.items()
+            ):
+                return True
+        return False
+
+    @classmethod
     def _prometheus_has_explicit_failure(cls, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
@@ -1399,34 +1459,143 @@ class IncidentAgent:
     def _trace_has_explicit_failure(cls, payload: Any) -> bool:
         if not isinstance(payload, dict) or not isinstance(payload.get("trace"), dict):
             return False
+        for span in cls._trace_spans(payload["trace"]):
+            status = span.get("status")
+            if isinstance(status, dict) and cls._trace_status_is_error(
+                cls._decode_otlp_any_value(status.get("code"))
+            ):
+                return True
+            for key, value in cls._otlp_attribute_pairs(span.get("attributes")):
+                if cls._trace_attribute_is_failure(key, value):
+                    return True
         for key, value in cls._walk_structured_values(payload["trace"]):
-            normalized_key = key.casefold()
-            if normalized_key in {"status.code", "status_code"} and str(value) in {
-                "2",
-                "status_code_error",
-            }:
-                return True
-            if normalized_key in {"http.status_code", "http_status_code"}:
-                try:
-                    if int(value) >= 500:
-                        return True
-                except (TypeError, ValueError):
-                    pass
-            if normalized_key == "error" and cls._structured_truthy(value):
-                return True
-            if normalized_key in {
-                "inventory_reservation_failed",
-                "synthetic_timeout",
-            } and cls._structured_truthy(value):
-                return True
-            if isinstance(value, str) and value.casefold() == "status_code_error":
+            if cls._trace_attribute_is_failure(key, value):
                 return True
         return False
+
+    @classmethod
+    def _trace_has_valid_span(cls, payload: Any) -> bool:
+        return bool(
+            isinstance(payload, dict)
+            and isinstance(payload.get("trace"), dict)
+            and cls._trace_spans(payload["trace"])
+        )
+
+    @classmethod
+    def _trace_spans(cls, value: Any) -> list[dict[str, Any]]:
+        spans: list[dict[str, Any]] = []
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key.casefold() == "spans" and isinstance(child, list):
+                    spans.extend(
+                        span
+                        for span in child
+                        if isinstance(span, dict) and cls._looks_like_otlp_span(span)
+                    )
+                else:
+                    spans.extend(cls._trace_spans(child))
+        elif isinstance(value, list):
+            for child in value:
+                spans.extend(cls._trace_spans(child))
+        return spans
+
+    @staticmethod
+    def _looks_like_otlp_span(span: dict[str, Any]) -> bool:
+        normalized_keys = {str(key).casefold() for key in span}
+        return bool(
+            normalized_keys.intersection(
+                {"traceid", "trace_id", "spanid", "span_id"}
+            )
+            or (
+                "name" in normalized_keys
+                and normalized_keys.intersection(
+                    {"status", "attributes", "starttimeunixnano", "start_time_unix_nano"}
+                )
+            )
+        )
+
+    @classmethod
+    def _otlp_attribute_pairs(cls, attributes: Any) -> list[tuple[str, Any]]:
+        if not isinstance(attributes, list):
+            return []
+        pairs: list[tuple[str, Any]] = []
+        for attribute in attributes:
+            if not isinstance(attribute, dict) or not isinstance(attribute.get("key"), str):
+                continue
+            pairs.append(
+                (
+                    attribute["key"],
+                    cls._decode_otlp_any_value(attribute.get("value")),
+                )
+            )
+        return pairs
+
+    @classmethod
+    def _decode_otlp_any_value(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        for key in (
+            "stringValue",
+            "boolValue",
+            "intValue",
+            "doubleValue",
+            "bytesValue",
+        ):
+            if key in value:
+                return cls._decode_otlp_any_value(value[key])
+        if "arrayValue" in value:
+            array = value["arrayValue"]
+            items = array.get("values", []) if isinstance(array, dict) else []
+            return [cls._decode_otlp_any_value(item) for item in items]
+        if "kvlistValue" in value:
+            kvlist = value["kvlistValue"]
+            items = kvlist.get("values", []) if isinstance(kvlist, dict) else []
+            return {
+                item["key"]: cls._decode_otlp_any_value(item.get("value"))
+                for item in items
+                if isinstance(item, dict) and isinstance(item.get("key"), str)
+            }
+        return value
+
+    @classmethod
+    def _trace_attribute_is_failure(cls, key: str, value: Any) -> bool:
+        normalized_key = key.strip().casefold()
+        decoded = cls._decode_otlp_any_value(value)
+        if normalized_key in {"status.code", "status_code", "statuscode"}:
+            return cls._trace_status_is_error(decoded)
+        if normalized_key in {
+            "http.status_code",
+            "http_status_code",
+            "http.response.status_code",
+        }:
+            try:
+                return int(decoded) >= 500
+            except (TypeError, ValueError):
+                return False
+        if normalized_key == "error" or normalized_key.endswith("_failed"):
+            return cls._structured_truthy(decoded)
+        if normalized_key == "synthetic_timeout":
+            return cls._structured_truthy(decoded)
+        return isinstance(decoded, str) and decoded.casefold() == "status_code_error"
+
+    @staticmethod
+    def _trace_status_is_error(value: Any) -> bool:
+        if isinstance(value, int):
+            return value == 2
+        normalized = str(value).strip().casefold()
+        return normalized in {"2", "error", "status_code_error"}
 
     @classmethod
     def _walk_structured_values(cls, value: Any) -> list[tuple[str, Any]]:
         values: list[tuple[str, Any]] = []
         if isinstance(value, dict):
+            if isinstance(value.get("key"), str) and "value" in value:
+                values.append(
+                    (
+                        value["key"],
+                        cls._decode_otlp_any_value(value["value"]),
+                    )
+                )
             for key, child in value.items():
                 values.append((str(key), child))
                 values.extend(cls._walk_structured_values(child))
@@ -2491,6 +2660,7 @@ class IncidentAgent:
                 )
             alert_name = json.dumps(state["alert"]["name"])
             service = json.dumps(state["alert"]["service"])
+            namespace = json.dumps(state["alert"]["namespace"])
             alert_state = await self._call_tool_traced(
                 state,
                 parent_name="preflight",
@@ -2499,11 +2669,16 @@ class IncidentAgent:
                 arguments={
                     "query": (
                         f'ALERTS{{alertname={alert_name},alertstate="firing",'
-                        f"service={service}}}"
+                        f"service={service},namespace={namespace}}}"
                     )
                 },
             )
-            if not alert_state.success or not alert_state.content.get("result", []):
+            if not self._prometheus_alert_is_firing(
+                alert_state,
+                alert_name=state["alert"]["name"],
+                service=state["alert"]["service"],
+                namespace=state["alert"]["namespace"],
+            ):
                 return self._preflight_rejected(
                     "执行前未能确认原告警仍处于 firing，旧审批已失效"
                 )
@@ -2552,21 +2727,51 @@ class IncidentAgent:
         return "execute" if state.get("preflight_passed") else "postmortem"
 
     async def _execute(self, state: IncidentState) -> dict[str, Any]:
-        invalidation_reason = self._invalidated_incidents.get(state["incident_id"])
+        incident_id = state["incident_id"]
+        invalidation_reason = self._invalidated_incidents.get(incident_id)
         if invalidation_reason:
             return self._preflight_rejected(
                 f"写入前告警已经恢复，已阻止集群操作：{invalidation_reason}"
             )
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         self.policy.validate(action)
-        result = await self._call_tool_traced(
-            state,
-            parent_name="execute",
-            key=action.tool_name,
-            tool_name=action.tool_name,
-            arguments=action.arguments,
-            precondition=state.get("execution_precondition"),
-        )
+        # The final cancellation check and in-flight marker are consecutive with
+        # no await between them. A resolved signal therefore either prevents the
+        # dispatch or observes that the write may already have started.
+        invalidation_reason = self._invalidated_incidents.get(incident_id)
+        if invalidation_reason:
+            return self._preflight_rejected(
+                f"工具调用前告警已经恢复，已阻止集群操作：{invalidation_reason}"
+            )
+        self._writes_in_flight.add(incident_id)
+        self._write_dispatched_incidents.add(incident_id)
+        try:
+            result = await self._call_tool_traced(
+                state,
+                parent_name="execute",
+                key=action.tool_name,
+                tool_name=action.tool_name,
+                arguments=action.arguments,
+                precondition=state.get("execution_precondition"),
+            )
+        finally:
+            self._writes_in_flight.discard(incident_id)
+        invalidated_during_write = incident_id in self._invalidated_during_write
+        if invalidated_during_write:
+            return {
+                "status": IncidentStatus.ESCALATED.value,
+                "preflight_passed": False,
+                "approval_request": None,
+                "execution_results": [result.model_dump(mode="json")],
+                "timeline": [
+                    _event(
+                        "action.outcome_unknown",
+                        "告警恢复信号到达时集群写操作已经开始，结果按未知处理并停止自动处置",
+                        execution_outcome="unknown",
+                        tool_name=action.tool_name,
+                    )
+                ],
+            }
         guard_failed = bool(
             not result.success
             and result.error
@@ -2606,6 +2811,8 @@ class IncidentAgent:
 
     @staticmethod
     def _route_after_execute(state: IncidentState) -> str:
+        if state.get("status") == IncidentStatus.ESCALATED.value:
+            return "postmortem"
         results = state.get("execution_results", [])
         return "verify" if results and results[-1].get("success") is True else "postmortem"
 
@@ -2645,6 +2852,8 @@ class IncidentAgent:
         successful_probes = 0
         probe_statuses: list[int | str] = []
         successful_trace_id: str | None = None
+        trace_structurally_valid = False
+        trace_explicit_failure = False
         healthy_windows = 0
         attempts = 0
         probe_client = (
@@ -2705,18 +2914,24 @@ class IncidentAgent:
                         },
                     )
                     alert_name = json.dumps(state["alert"]["name"])
+                    namespace_label = json.dumps(state["alert"]["namespace"])
                     alert_state = await self.tools.call(
                         "query_prometheus",
                         {
                             "query": (
                                 f"ALERTS{{alertname={alert_name},alertstate=\"firing\","
-                                f"service={service_label}}}"
+                                f"service={service_label},namespace={namespace_label}}}"
                             )
                         },
                     )
                     request_error_rate = self._prometheus_scalar(prometheus)
                     request_rate = self._prometheus_scalar(traffic)
-                    alert_firing = bool(alert_state.content.get("result", []))
+                    alert_firing = self._prometheus_alert_is_firing(
+                        alert_state,
+                        alert_name=state["alert"]["name"],
+                        service=service,
+                        namespace=state["alert"]["namespace"],
+                    )
                     indicators_healthy = (
                         prometheus.success
                         and traffic.success
@@ -2742,9 +2957,15 @@ class IncidentAgent:
                     trace_result = await self.tools.call(
                         "get_trace", {"trace_id": successful_trace_id}
                     )
-                    trace_healthy = trace_result.success and not self._trace_has_explicit_failure(
-                        trace_result.content
+                    trace_structurally_valid = (
+                        trace_result.success
+                        and self._trace_has_valid_span(trace_result.content)
                     )
+                    trace_explicit_failure = (
+                        trace_result.success
+                        and self._trace_has_explicit_failure(trace_result.content)
+                    )
+                    trace_healthy = trace_structurally_valid and not trace_explicit_failure
                 window_healthy = (
                     metrics.success
                     and pods.success
@@ -2764,12 +2985,33 @@ class IncidentAgent:
                 await probe_client.aclose()
 
         assert metrics is not None and pods is not None
+        trace_verification_incomplete = (
+            self.verification_policy == "strict"
+            and not healthy
+            and not trace_structurally_valid
+        )
         return {
-            "status": IncidentStatus.RESOLVED.value if healthy else IncidentStatus.FAILED.value,
+            "status": (
+                IncidentStatus.RESOLVED.value
+                if healthy
+                else (
+                    IncidentStatus.ESCALATED.value
+                    if trace_verification_incomplete
+                    else IncidentStatus.FAILED.value
+                )
+            ),
             "timeline": [
                 _event(
-                    "recovery.verified",
-                    "服务已恢复" if healthy else "恢复标准未满足",
+                    (
+                        "recovery.verification_incomplete"
+                        if trace_verification_incomplete
+                        else "recovery.verified"
+                    ),
+                    (
+                        "Tempo 未返回可识别的有效 Span，恢复证据不完整并升级人工确认"
+                        if trace_verification_incomplete
+                        else ("服务已恢复" if healthy else "恢复标准未满足")
+                    ),
                     metrics=metrics.content,
                     pods=pods.content,
                     prometheus=prometheus.content if prometheus else None,
@@ -2778,7 +3020,10 @@ class IncidentAgent:
                     alert_firing=alert_firing,
                     active_probe_statuses=probe_statuses,
                     successful_trace_id=successful_trace_id,
-                    successful_trace_verified=trace_result.success if trace_result else None,
+                    trace_structure_valid=trace_structurally_valid,
+                    successful_trace_verified=(
+                        trace_structurally_valid and not trace_explicit_failure
+                    ),
                     healthy_windows=healthy_windows,
                     attempts=attempts,
                 )
@@ -2829,7 +3074,10 @@ class IncidentAgent:
 
     def _sync_record(self, incident_id: str, state: dict[str, Any]) -> IncidentRecord:
         record = self.records[incident_id]
-        if incident_id in self._invalidated_incidents:
+        if (
+            incident_id in self._invalidated_incidents
+            and incident_id not in self._invalidated_during_write
+        ):
             record.status = IncidentStatus.RESOLVED
             record.approval = None
             record.active_step_id = None

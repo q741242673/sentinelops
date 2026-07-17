@@ -34,8 +34,14 @@ KUBERNETES_TOOL_SPECS = [
     ),
     ToolSpec(
         name="list_events",
-        description="List recent Kubernetes events",
+        description="List recent Kubernetes events bound to a target workload",
         risk=RiskLevel.READ_ONLY,
+        input_schema={
+            "type": "object",
+            "properties": {"name": KUBERNETES_NAME_SCHEMA},
+            "required": ["name"],
+            "additionalProperties": False,
+        },
     ),
     ToolSpec(
         name="get_pod_logs",

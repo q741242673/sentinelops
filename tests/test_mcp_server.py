@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sys
 from types import ModuleType
-from unittest.mock import Mock
+
+import pytest
 
 from sentinelops import mcp_server
 from sentinelops.config import Settings
-from sentinelops.tools.kubernetes import KubernetesBackend
+from sentinelops.domain import ToolResult
 from sentinelops.tools.registry import ToolRegistry
 
 
@@ -23,7 +24,8 @@ class FakeFastMCP:
         return register
 
 
-def test_kubernetes_mcp_exposes_only_read_only_evidence_tools(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_kubernetes_mcp_exposes_only_read_only_evidence_tools(monkeypatch) -> None:
     mcp_package = ModuleType("mcp")
     server_package = ModuleType("mcp.server")
     fastmcp_module = ModuleType("mcp.server.fastmcp")
@@ -32,9 +34,19 @@ def test_kubernetes_mcp_exposes_only_read_only_evidence_tools(monkeypatch) -> No
     monkeypatch.setitem(sys.modules, "mcp.server", server_package)
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
 
-    backend = KubernetesBackend.__new__(KubernetesBackend)
-    backend.apps = Mock()
-    backend.core = Mock()
+    class RecordingBackend:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def call(self, name, arguments) -> ToolResult:
+            self.calls.append((name, arguments))
+            return ToolResult(
+                tool_name=name,
+                success=True,
+                content={"target_service": arguments.get("name"), "items": []},
+            )
+
+    backend = RecordingBackend()
     registry = ToolRegistry(backend)
     monkeypatch.setattr(
         mcp_server,
@@ -59,3 +71,8 @@ def test_kubernetes_mcp_exposes_only_read_only_evidence_tools(monkeypatch) -> No
         "rollback_deployment",
         "scale_deployment",
     }.intersection(server.registered_tools)
+
+    result = await server.registered_tools["list_events"]("order-service")
+
+    assert result["success"] is True
+    assert backend.calls == [("list_events", {"name": "order-service"})]

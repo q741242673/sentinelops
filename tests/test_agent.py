@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import sentinelops.agent.engine as engine_module
 from sentinelops.agent import IncidentAgent
 from sentinelops.agent.runbook import IncidentRunbook
 from sentinelops.config import Settings
@@ -29,7 +30,11 @@ from sentinelops.lab_profiles import (
 )
 from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.base import CompositeBackend, ToolSpec
-from sentinelops.tools.registry import KUBERNETES_TOOL_SPECS, ToolRegistry
+from sentinelops.tools.registry import (
+    KUBERNETES_TOOL_SPECS,
+    OBSERVABILITY_TOOL_SPECS,
+    ToolRegistry,
+)
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
 
@@ -179,6 +184,57 @@ class BlockingRollbackSimulator(RecordingSimulator):
         self.rollback_started.set()
         await self.never_finish.wait()
         return result
+
+
+class BlockingPreflightSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rollout_reads = 0
+        self.preflight_started = asyncio.Event()
+        self.release_preflight = asyncio.Event()
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "get_rollout_history":
+            self.rollout_reads += 1
+            if self.rollout_reads == 3:
+                self.preflight_started.set()
+                await self.release_preflight.wait()
+        return await super().call(name, arguments)
+
+
+class CrossNamespaceAlertSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.alert_queries: list[str] = []
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "query_prometheus":
+            self.calls.append(name)
+            query = arguments["query"]
+            if query.startswith("ALERTS{"):
+                self.alert_queries.append(query)
+                return ToolResult(
+                    tool_name=name,
+                    success=True,
+                    content={
+                        "result": [
+                            {
+                                "metric": {
+                                    "alertname": "HighErrorRate",
+                                    "alertstate": "firing",
+                                    "service": "order-service",
+                                    "namespace": "other-namespace",
+                                },
+                                "value": [0, "1"],
+                            }
+                        ]
+                    },
+                )
+            return ToolResult(tool_name=name, success=True, content={"result": []})
+        if name in {"search_loki", "get_trace"}:
+            self.calls.append(name)
+            return ToolResult(tool_name=name, success=True, content={"result": []})
+        return await super().call(name, arguments)
 
 
 class ScaleEvidenceSimulator(SimulatedKubernetesBackend):
@@ -900,6 +956,116 @@ async def test_alert_namespace_mismatch_is_rejected_before_approval_or_write() -
         event for event in record.timeline if event.type == "approval.invalidated"
     )
     assert "namespace" in invalidated.data["reason"]
+
+
+@pytest.mark.asyncio
+async def test_resolved_signal_cancels_before_waiting_for_resume_lock() -> None:
+    backend = BlockingPreflightSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.preflight_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved")
+    )
+    await asyncio.sleep(0)
+    assert not invalidate_task.done()
+
+    backend.release_preflight.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.RESOLVED
+    assert backend.calls.count("rollback_deployment") == 0
+    assert not any(event.type == "action.executed" for event in current.timeline)
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert "未执行集群写入" in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_resolved_during_write_records_unknown_outcome() -> None:
+    backend = BlockingRollbackSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.rollback_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved")
+    )
+    await asyncio.sleep(0)
+    assert not invalidate_task.done()
+
+    backend.never_finish.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.ESCALATED
+    unknown = next(event for event in current.timeline if event.type == "action.outcome_unknown")
+    assert unknown.data["execution_outcome"] == "unknown"
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert current.timeline[-1].data["execution_outcome"] == "unknown"
+    assert "未执行写操作" not in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_cross_namespace_alert_cannot_authorize_preflight() -> None:
+    backend = CrossNamespaceAlertSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(
+            backend,
+            [*KUBERNETES_TOOL_SPECS, *OBSERVABILITY_TOOL_SPECS],
+        ),
+        verification_policy="strict",
+    )
+    alert = make_alert().model_copy(
+        update={"labels": {"source": "alertmanager"}}
+    )
+    record = await agent.start(alert)
+    assert record.approval is not None
+
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+    )
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert backend.calls.count("rollback_deployment") == 0
+    assert backend.alert_queries
+    assert 'namespace="sentinelops-demo"' in backend.alert_queries[-1]
+    invalidated = next(
+        event for event in record.timeline if event.type == "approval.invalidated"
+    )
+    assert "原告警仍处于 firing" in invalidated.data["reason"]
 
 
 @pytest.mark.asyncio
@@ -1879,6 +2045,130 @@ def test_trace_failure_predicate_parses_false_and_active_values() -> None:
 
     assert not IncidentAgent._trace_has_explicit_failure(healthy)
     assert IncidentAgent._trace_has_explicit_failure(failed)
+
+
+@pytest.mark.parametrize(
+    "span",
+    [
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "status": {"code": 2},
+        },
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "attributes": [
+                {
+                    "key": "inventory_reservation_failed",
+                    "value": {"boolValue": True},
+                }
+            ],
+        },
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "attributes": [
+                {
+                    "key": "http.response.status_code",
+                    "value": {"intValue": "503"},
+                }
+            ],
+        },
+    ],
+)
+def test_trace_failure_predicate_parses_otlp_spans(span: dict) -> None:
+    payload = {
+        "trace": {
+            "resourceSpans": [
+                {"scopeSpans": [{"spans": [span]}]}
+            ]
+        }
+    }
+
+    assert IncidentAgent._trace_has_valid_span(payload)
+    assert IncidentAgent._trace_has_explicit_failure(payload)
+
+
+def test_empty_or_unknown_trace_has_no_valid_span() -> None:
+    assert not IncidentAgent._trace_has_valid_span({"trace": {}})
+    assert not IncidentAgent._trace_has_valid_span(
+        {"trace": {"batches": [{"scopeSpans": []}]}}
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_verification_escalates_on_empty_tempo_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyTraceBackend:
+        async def call(self, name, arguments) -> ToolResult:
+            if name == "get_service_metrics":
+                content = {"availability": 1.0, "error_rate": 0.0}
+            elif name == "list_pods":
+                content = {"items": [{"name": "order-1", "ready": True}]}
+            elif name == "get_trace":
+                content = {"trace": {}}
+            elif name == "query_prometheus":
+                query = arguments["query"]
+                if query.startswith("ALERTS{"):
+                    content = {"result": []}
+                elif query.startswith("sum(rate"):
+                    content = {"result": [{"value": [0, "1"]}]}
+                else:
+                    content = {"result": [{"value": [0, "0"]}]}
+            else:
+                content = {}
+            return ToolResult(tool_name=name, success=True, content=content)
+
+    class ProbeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, str]:
+            return {"trace_id": "0123456789abcdef"}
+
+    class ProbeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url: str) -> ProbeResponse:
+            return ProbeResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(engine_module.httpx, "AsyncClient", ProbeClient)
+    monkeypatch.setattr(engine_module.asyncio, "sleep", no_sleep)
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(
+            EmptyTraceBackend(),
+            [*KUBERNETES_TOOL_SPECS, *OBSERVABILITY_TOOL_SPECS],
+        ),
+        verification_policy="strict",
+        verification_probe_url="http://probe",
+    )
+
+    result = await agent._verify(  # type: ignore[arg-type]
+        {
+            "incident_id": "empty-trace",
+            "alert": {
+                "name": "HighErrorRate",
+                "namespace": "sentinelops-demo",
+                "service": "order-service",
+                "labels": {},
+            },
+        }
+    )
+
+    assert result["status"] == IncidentStatus.ESCALATED.value
+    assert result["timeline"][0]["type"] == "recovery.verification_incomplete"
+    assert result["timeline"][0]["data"]["trace_structure_valid"] is False
+    assert result["timeline"][0]["data"]["successful_trace_verified"] is False
 
 
 @pytest.mark.parametrize(
