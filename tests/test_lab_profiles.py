@@ -56,6 +56,7 @@ async def test_manual_lab_runbook_reaches_human_gate_with_verified_rollout() -> 
     )
     alert = Alert(
         name="HighInventoryErrorRate",
+        namespace="sentinelops-demo",
         service="order-service",
         severity="critical",
         summary="显式注入的故障发布",
@@ -80,6 +81,7 @@ async def test_rejected_alternative_does_not_invalidate_primary_root_cause() -> 
     record = await agent.start(
         Alert(
             name="HighErrorRate",
+            namespace="sentinelops-demo",
             service="order-service",
             severity="critical",
             summary="故障发布",

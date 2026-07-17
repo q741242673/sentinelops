@@ -168,6 +168,8 @@ async def main() -> None:
 
             record = await agent.resume(
                 record.id,
+                approval_id=record.approval.approval_id,
+                approval_version=record.approval.version,
                 approved=True,
                 note="Approved by the automated golden-path operator",
             )

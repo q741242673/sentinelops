@@ -42,6 +42,8 @@ incident_feed_streams: set[asyncio.Queue[str]] = set()
 
 
 class ApprovalDecision(BaseModel):
+    approval_id: str
+    approval_version: int = Field(ge=1)
     approved: bool
     note: str = ""
 
@@ -214,6 +216,7 @@ async def create_incident(alert: Alert) -> IncidentRecord:
 
 @app.post("/api/v1/demo/incidents", response_model=IncidentRecord, status_code=201)
 async def create_demo_incident() -> IncidentRecord:
+    _require_demo_api_enabled()
     try:
         alert = await build_demo_alert(get_settings())
         return await create_incident(alert)
@@ -269,21 +272,25 @@ async def _run_demo_fault(job_id: str) -> None:
 
 @app.post("/api/v1/demo/faults", response_model=DemoFaultJob, status_code=202)
 async def create_demo_fault() -> DemoFaultJob:
+    _require_demo_api_enabled()
     return _create_demo_fault_job("bad_rollout")
 
 
 @app.post("/api/v1/demo/auto-faults", response_model=DemoFaultJob, status_code=202)
 async def create_auto_demo_fault() -> DemoFaultJob:
+    _require_demo_api_enabled()
     return _create_demo_fault_job("transient_runtime_fault")
 
 
 @app.post("/api/v1/demo/reflection-faults", response_model=DemoFaultJob, status_code=202)
 async def create_reflection_demo_fault() -> DemoFaultJob:
+    _require_demo_api_enabled()
     return _create_demo_fault_job("ambiguous_change_fault")
 
 
 @app.post("/api/v1/demo/reset")
 async def reset_demo() -> dict[str, Any]:
+    _require_demo_api_enabled()
     lab_profiles.clear()
     try:
         result = await reset_demo_environment(get_settings())
@@ -319,6 +326,22 @@ def _create_demo_fault_job(
     return job
 
 
+def _require_demo_api_enabled() -> None:
+    settings = get_settings()
+    environment = settings.environment.strip().casefold()
+    namespace_mismatch = (
+        settings.tool_backend == "kubernetes"
+        and settings.kubernetes_namespace != settings.demo_namespace
+    )
+    if not settings.demo_enabled or environment in {"prod", "production"}:
+        raise HTTPException(status_code=404, detail="Not Found")
+    if namespace_mismatch:
+        raise HTTPException(
+            status_code=503,
+            detail="Demo Kubernetes namespace is not isolated from the configured runtime",
+        )
+
+
 def _disarm_job_profile(job: DemoFaultJob) -> None:
     if job.scenario == "bad_rollout":
         lab_profiles.disarm("manual_approval")
@@ -346,6 +369,7 @@ def _release_demo_alert_deduplication() -> None:
 
 @app.get("/api/v1/demo/faults/{job_id}", response_model=DemoFaultJob)
 async def get_demo_fault(job_id: str) -> DemoFaultJob:
+    _require_demo_api_enabled()
     try:
         return demo_fault_jobs[job_id]
     except KeyError as exc:
@@ -529,6 +553,8 @@ async def decide_incident(incident_id: str, decision: ApprovalDecision) -> Incid
     try:
         record = await incident_agents[incident_id].resume(
             incident_id,
+            approval_id=decision.approval_id,
+            approval_version=decision.approval_version,
             approved=decision.approved,
             note=decision.note,
         )

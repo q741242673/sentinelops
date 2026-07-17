@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from sentinelops.agent.state import IncidentState
-from sentinelops.domain import Diagnosis, RemediationPlan
+from sentinelops.domain import Diagnosis, RemediationAction, RemediationPlan
 
 
 class IncidentRunbook:
@@ -39,3 +39,11 @@ class IncidentRunbook:
     ) -> str | None:
         """Reject a plan that violates this trusted runbook."""
         return None
+
+    def action_causal_precondition(
+        self,
+        state: IncidentState,
+        action: RemediationAction,
+    ) -> bool:
+        """Confirm a deterministic service-specific cause for a write action."""
+        return False

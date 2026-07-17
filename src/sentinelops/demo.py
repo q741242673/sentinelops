@@ -11,6 +11,25 @@ from sentinelops.domain import Alert
 from sentinelops.tools.kubernetes import KubernetesBackend
 
 
+def _ensure_demo_write_allowed(settings: Settings) -> None:
+    """Fail closed before any demo helper can mutate an external system."""
+    if not settings.demo_enabled:
+        raise RuntimeError(
+            "Demo write operations are disabled; set SENTINELOPS_DEMO_ENABLED=true "
+            "only in an isolated demo environment"
+        )
+    if settings.environment.strip().casefold() in {"prod", "production"}:
+        raise RuntimeError("Demo write operations are forbidden in production")
+    if (
+        settings.tool_backend == "kubernetes"
+        and settings.kubernetes_namespace != settings.demo_namespace
+    ):
+        raise RuntimeError(
+            "Demo Kubernetes writes require SENTINELOPS_KUBERNETES_NAMESPACE "
+            "to exactly match SENTINELOPS_DEMO_NAMESPACE"
+        )
+
+
 def simulated_demo_alert(settings: Settings) -> Alert:
     return Alert(
         name="HighOrderServiceErrorRate",
@@ -157,6 +176,7 @@ async def enrich_alert_with_failed_trace(settings: Settings, alert: Alert) -> Al
 
 
 async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
+    _ensure_demo_write_allowed(settings)
     if settings.tool_backend == "simulator":
         return {
             "deployment": "order-service",
@@ -179,6 +199,7 @@ async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
 
 
 async def inject_auto_demo_fault(settings: Settings) -> dict[str, Any]:
+    _ensure_demo_write_allowed(settings)
     if settings.tool_backend == "simulator":
         return {
             "service": "inventory-service",
@@ -219,6 +240,7 @@ async def inject_auto_demo_fault(settings: Settings) -> dict[str, Any]:
 
 async def reset_demo_environment(settings: Settings) -> dict[str, Any]:
     """Explicit operator cleanup after a deliberately escalated demo incident."""
+    _ensure_demo_write_allowed(settings)
     if settings.tool_backend == "simulator":
         return {"deployment": "inventory-service", "baseline_restored": True}
     backend = KubernetesBackend(namespace=settings.kubernetes_namespace)

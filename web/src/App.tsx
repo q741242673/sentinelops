@@ -492,12 +492,20 @@ function App() {
   }
 
   async function decide(approved: boolean) {
-    if (!selected) return;
+    if (!selected?.approval) return;
     setActionBusy(true);
     setError(null);
     setDemoMessage(approved ? "审批已提交，Agent 正在执行并验证恢复…" : "正在拒绝本次操作…");
     try {
-      acceptIncident(await api.decideIncident(selected.id, approved), true);
+      acceptIncident(
+        await api.decideIncident(
+          selected.id,
+          selected.approval.approval_id,
+          selected.approval.version,
+          approved,
+        ),
+        true,
+      );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "审批操作失败");
     } finally {

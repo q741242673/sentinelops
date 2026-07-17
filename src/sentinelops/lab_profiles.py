@@ -9,7 +9,13 @@ from sentinelops.agent import IncidentAgent
 from sentinelops.agent.runbook import IncidentRunbook
 from sentinelops.agent.state import IncidentState
 from sentinelops.config import Settings
-from sentinelops.domain import Diagnosis, IncidentRecord, RemediationPlan, RiskLevel
+from sentinelops.domain import (
+    Diagnosis,
+    IncidentRecord,
+    RemediationAction,
+    RemediationPlan,
+    RiskLevel,
+)
 from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
@@ -84,6 +90,20 @@ class VerifiedRuntimeStateRunbook(IncidentRunbook):
         if action.arguments.get("name") != state["alert"]["service"]:
             return "restart_deployment must target the alerted service"
         return None
+
+    def action_causal_precondition(
+        self,
+        state: IncidentState,
+        action: RemediationAction,
+    ) -> bool:
+        if action.tool_name != "restart_deployment":
+            return False
+        observations = state.get("observations", {})
+        logs = json.dumps(observations.get("logs", {}), ensure_ascii=False).lower()
+        return (
+            "transient_runtime_fault_enabled" in logs
+            and "restart_required=true" in logs
+        ) or observations.get("metrics", {}).get("scenario") == "transient_runtime_fault"
 
 
 class FaultyRolloutRunbook(IncidentRunbook):

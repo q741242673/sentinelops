@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 API_PID=""
+export SENTINELOPS_DEMO_ENABLED="${SENTINELOPS_DEMO_ENABLED:-true}"
 
 cleanup() {
   if [[ -n "${API_PID}" ]]; then

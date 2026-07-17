@@ -115,6 +115,8 @@ class RemediationPlan(BaseModel):
 
 
 class ApprovalRequest(BaseModel):
+    approval_id: str
+    version: int = Field(ge=1)
     incident_id: str
     action: RemediationAction
     reason: str

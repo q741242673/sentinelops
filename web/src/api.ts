@@ -49,10 +49,17 @@ export const api = {
     request<{ baseline_restored: boolean }>("/api/v1/demo/reset", {
       method: "POST",
     }),
-  decideIncident: (incidentId: string, approved: boolean) =>
+  decideIncident: (
+    incidentId: string,
+    approvalId: string,
+    approvalVersion: number,
+    approved: boolean,
+  ) =>
     request<Incident>(`/api/v1/incidents/${incidentId}/approval`, {
       method: "POST",
       body: JSON.stringify({
+        approval_id: approvalId,
+        approval_version: approvalVersion,
         approved,
         note: approved
           ? "已从 SentinelOps 本地控制台批准"

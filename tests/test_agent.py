@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -150,6 +152,8 @@ class PreflightMutationSimulator(RecordingSimulator):
                 current = result.content["revisions"][1]
                 current["ready_replicas"] = current["replicas"]
                 current["status"] = "stable"
+            if self.rollout_reads > 2 and self.mutation == "namespace":
+                result.content["namespace"] = "another-namespace"
             return result
         if name == "rollback_deployment" and self.mutation == "backend_guard_failure":
             self.calls.append(name)
@@ -734,7 +738,13 @@ async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
     assert record.diagnosis.evidence_summary
     assert record.approval is not None
 
-    record = await agent.resume(record.id, approved=True, note="test approval")
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note="test approval",
+    )
 
     assert record.status == IncidentStatus.RESOLVED
     assert record.execution_results[0].success is True
@@ -753,7 +763,13 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
     assert record.approval is not None
     assert record.approval.preflight_snapshot["current_revision"] == 2
 
-    record = await agent.resume(record.id, approved=True, note="approve stable snapshot")
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note="approve stable snapshot",
+    )
 
     assert record.status == IncidentStatus.RESOLVED
     assert backend.calls.count("get_rollout_history") == 3
@@ -766,7 +782,8 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutation", ["new_revision", "proof_revoked", "read_failure", "self_recovered"]
+    "mutation",
+    ["new_revision", "proof_revoked", "read_failure", "self_recovered", "namespace"],
 )
 async def test_approval_is_invalidated_when_fresh_preflight_changes(
     mutation: str,
@@ -779,7 +796,14 @@ async def test_approval_is_invalidated_when_fresh_preflight_changes(
 
     record = await agent.start(make_alert())
     assert record.status == IncidentStatus.AWAITING_APPROVAL
-    record = await agent.resume(record.id, approved=True, note="approve stale plan")
+    assert record.approval is not None
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note="approve stale plan",
+    )
 
     assert record.status == IncidentStatus.ESCALATED
     assert record.plan is None
@@ -797,6 +821,106 @@ async def test_approval_is_invalidated_when_fresh_preflight_changes(
 
 
 @pytest.mark.asyncio
+async def test_alert_namespace_mismatch_is_rejected_before_approval_or_write() -> None:
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    alert = make_alert().model_copy(update={"namespace": "payments-prod"})
+
+    record = await agent.start(alert)
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.approval is None
+    assert record.execution_results == []
+    assert "rollback_deployment" not in backend.calls
+    invalidated = next(
+        event for event in record.timeline if event.type == "approval.invalidated"
+    )
+    assert "namespace" in invalidated.data["reason"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_approval_is_consumed_exactly_once() -> None:
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    approval = record.approval
+
+    outcomes = await asyncio.gather(
+        agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=True,
+        ),
+        agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=True,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(item, RuntimeError) for item in outcomes) == 1
+    assert backend.calls.count("rollback_deployment") == 1
+
+
+@pytest.mark.asyncio
+async def test_conflicting_approval_decisions_cannot_both_take_effect() -> None:
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    approval = record.approval
+
+    outcomes = await asyncio.gather(
+        agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=True,
+        ),
+        agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=False,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(item, RuntimeError) for item in outcomes) == 1
+    assert backend.calls.count("rollback_deployment") <= 1
+
+
+@pytest.mark.asyncio
+async def test_stale_or_expired_approval_cannot_resume_graph() -> None:
+    backend = RecordingSimulator()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+
+    with pytest.raises(RuntimeError, match="标识或版本已失效"):
+        await agent.resume(
+            record.id,
+            approval_id="stale-approval",
+            approval_version=record.approval.version,
+            approved=True,
+        )
+
+    record.approval.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    with pytest.raises(RuntimeError, match="已过期"):
+        await agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    assert backend.calls.count("rollback_deployment") == 0
+
+
+@pytest.mark.asyncio
 async def test_status_only_resource_version_change_does_not_invalidate_approval() -> None:
     backend = PreflightMutationSimulator("resource_version_only")
     agent = IncidentAgent(
@@ -805,7 +929,14 @@ async def test_status_only_resource_version_change_does_not_invalidate_approval(
     )
 
     record = await agent.start(make_alert())
-    record = await agent.resume(record.id, approved=True, note="status update is harmless")
+    assert record.approval is not None
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note="status update is harmless",
+    )
 
     assert record.status == IncidentStatus.RESOLVED
     assert backend.calls.count("rollback_deployment") == 1
@@ -820,7 +951,14 @@ async def test_backend_cas_failure_cannot_be_reported_as_recovered() -> None:
     )
 
     record = await agent.start(make_alert())
-    record = await agent.resume(record.id, approved=True, note="race after preflight")
+    assert record.approval is not None
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note="race after preflight",
+    )
 
     assert record.status == IncidentStatus.ESCALATED
     assert record.execution_results[0].success is False
@@ -836,7 +974,14 @@ async def test_rejected_action_is_not_executed() -> None:
     agent = build_simulated_lab_agent(settings, scenario="bad_rollout")
 
     record = await agent.start(make_alert())
-    record = await agent.resume(record.id, approved=False, note="change freeze")
+    assert record.approval is not None
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=False,
+        note="change freeze",
+    )
 
     assert record.status == IncidentStatus.REJECTED
     assert record.execution_results == []
@@ -958,6 +1103,72 @@ def test_prometheus_scalar_parsing(content, expected) -> None:
     result = ToolResult(tool_name="query_prometheus", success=True, content=content)
 
     assert IncidentAgent._prometheus_scalar(result) == expected
+
+
+def test_restart_requires_deterministic_causal_evidence() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    action = RemediationAction(
+        tool_name="restart_deployment",
+        arguments={"name": "order-service"},
+        rationale="重启服务",
+        expected_outcome="服务恢复",
+        risk=RiskLevel.MEDIUM,
+    )
+
+    unsupported = agent._causal_action_feedback(
+        {"observations": {"logs": {"lines": []}, "metrics": {}}},  # type: ignore[arg-type]
+        action,
+    )
+    supported = agent._causal_action_feedback(
+        {
+            "observations": {
+                "logs": {
+                    "lines": ["ERROR timeout acquiring database connection from pool"]
+                },
+                "metrics": {"db_pool_utilization": 0.98},
+            }
+        },  # type: ignore[arg-type]
+        action,
+    )
+
+    assert unsupported is not None
+    assert supported is None
+
+
+def test_scale_requires_saturation_and_user_impact_evidence() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    action = RemediationAction(
+        tool_name="scale_deployment",
+        arguments={"name": "order-service", "replicas": 3},
+        rationale="扩容服务",
+        expected_outcome="服务恢复",
+        risk=RiskLevel.HIGH,
+    )
+
+    assert (
+        agent._causal_action_feedback(
+            {"observations": {"metrics": {"cpu_utilization": 0.95}}},  # type: ignore[arg-type]
+            action,
+        )
+        is not None
+    )
+    assert (
+        agent._causal_action_feedback(
+            {
+                "observations": {
+                    "metrics": {"cpu_utilization": 0.95, "error_rate": 0.12}
+                }
+            },  # type: ignore[arg-type]
+            action,
+        )
+        is None
+    )
 
 
 def test_restart_is_rejected_when_it_preserves_a_faulty_rollout() -> None:

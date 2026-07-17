@@ -99,9 +99,44 @@ class RuleBasedProvider:
             )
             for pod in pods
         )
-        if has_unhealthy_rollout_pod or "fatal" in logs:
+        has_rollout_failure_log = any(
+            marker in logs
+            for marker in (
+                "required environment variable",
+                "application configuration is invalid",
+                "crashloopbackoff",
+            )
+        )
+        if has_unhealthy_rollout_pod or has_rollout_failure_log:
             return "bad_rollout"
-        return "db_pool_exhaustion"
+        if RuleBasedProvider._has_db_pool_log_signal(
+            observations
+        ) or RuleBasedProvider._has_db_pool_metric_signal(observations):
+            return "db_pool_exhaustion"
+        return "unknown"
+
+    @staticmethod
+    def _has_db_pool_log_signal(observations: dict[str, Any]) -> bool:
+        lines = observations.get("logs", {}).get("lines", [])
+        logs = "\n".join(str(line) for line in lines).lower()
+        return any(
+            marker in logs
+            for marker in (
+                "timeout acquiring database connection from pool",
+                "database connection pool exhausted",
+                "db_pool_exhaustion",
+            )
+        )
+
+    @staticmethod
+    def _has_db_pool_metric_signal(observations: dict[str, Any]) -> bool:
+        value = observations.get("metrics", {}).get("db_pool_utilization")
+        if isinstance(value, bool):
+            return False
+        try:
+            return float(value) >= 0.95
+        except (TypeError, ValueError):
+            return False
 
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
         current_revision, _ = self._rollout_revisions(observations)
@@ -153,13 +188,31 @@ class RuleBasedProvider:
                 ("get_pod_logs", "logs", "Pod 日志显示发布后的启动配置错误"),
             ]
             root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
-        else:
-            candidates = [
-                ("get_pod_logs", "logs", "请求在获取数据库连接时失败"),
-                ("get_service_metrics", "metrics", "数据库连接池利用率达到 100%"),
-                ("list_pods", "pods", "Pod 仍可运行但请求处理能力下降"),
-            ]
+        elif scenario == "db_pool_exhaustion":
+            candidates = []
+            if self._has_db_pool_log_signal(observations):
+                candidates.append(
+                    ("get_pod_logs", "logs", "日志明确记录了获取数据库连接超时")
+                )
+            if self._has_db_pool_metric_signal(observations):
+                candidates.append(
+                    ("get_service_metrics", "metrics", "数据库连接池利用率达到 95% 以上")
+                )
             root_cause = "订单服务的数据库连接池已耗尽"
+        else:
+            root_cause = "现有证据不足，无法确认根本原因"
+            return Diagnosis(
+                root_cause=root_cause,
+                confidence=0.1,
+                hypotheses=[
+                    Hypothesis(
+                        statement=root_cause,
+                        confidence=0.1,
+                        evidence=[],
+                    )
+                ],
+                evidence_summary=[],
+            )
 
         evidence = [
             reference
@@ -228,6 +281,13 @@ class RuleBasedProvider:
         current_revision, previous_revision = self._rollout_revisions(
             payload.get("observations", {})
         )
+        if scenario == "unknown":
+            return RemediationPlan(
+                summary="证据不足，不生成自动修复方案",
+                actions=[],
+                rollback="未执行任何集群写操作，无需回滚",
+                verification=["补充至少两个独立且成功的证据来源后重新诊断"],
+            )
         if scenario == "transient_runtime_fault":
             service = payload["alert"]["service"]
             action = RemediationAction(
