@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import weakref
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
@@ -68,6 +69,21 @@ class DemoFaultJob(BaseModel):
 
 
 demo_fault_jobs: dict[str, DemoFaultJob] = {}
+demo_fault_generations: dict[str, int] = {}
+_demo_operation_generation = 0
+_demo_write_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+class DemoResetJob(BaseModel):
+    id: str
+    status: Literal["resetting", "succeeded", "failed"]
+    result: dict[str, object] | None = None
+    error: str | None = None
+
+
+demo_reset_jobs: dict[str, DemoResetJob] = {}
 
 
 class RuntimeInfo(BaseModel):
@@ -227,21 +243,33 @@ async def create_demo_incident() -> IncidentRecord:
 async def _run_demo_fault(job_id: str) -> None:
     settings = get_settings()
     job = demo_fault_jobs[job_id]
+    generation = demo_fault_generations.get(job_id, _demo_operation_generation)
     try:
-        await reset_demo_environment(settings)
-        _release_demo_alert_deduplication()
-        lab_profiles.arm(_job_profile_mode(job), job.id)
-        demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
-            update={"phase": "injecting_fault"}
-        )
-        result = await asyncio.wait_for(
-            (
-                inject_auto_demo_fault(settings)
-                if job.scenario == "transient_runtime_fault"
-                else inject_demo_fault(settings)
-            ),
-            timeout=settings.demo_alert_timeout_seconds + 10,
-        )
+        async with _demo_write_lock():
+            if _demo_fault_was_invalidated(job_id, generation):
+                _mark_demo_fault_invalidated(job_id)
+                return
+            await reset_demo_environment(settings)
+            if _demo_fault_was_invalidated(job_id, generation):
+                _mark_demo_fault_invalidated(job_id)
+                return
+            _release_demo_alert_deduplication()
+            lab_profiles.arm(_job_profile_mode(job), job.id)
+            demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
+                update={"phase": "injecting_fault"}
+            )
+            result = await asyncio.wait_for(
+                (
+                    inject_auto_demo_fault(settings)
+                    if job.scenario == "transient_runtime_fault"
+                    else inject_demo_fault(settings)
+                ),
+                timeout=settings.demo_alert_timeout_seconds + 10,
+            )
+            if _demo_fault_was_invalidated(job_id, generation):
+                _disarm_job_profile(job)
+                _mark_demo_fault_invalidated(job_id)
+                return
     except TimeoutError:
         _disarm_job_profile(job)
         demo_fault_jobs[job_id] = demo_fault_jobs[job_id].model_copy(
@@ -288,16 +316,56 @@ async def create_reflection_demo_fault() -> DemoFaultJob:
     return _create_demo_fault_job("ambiguous_change_fault")
 
 
-@app.post("/api/v1/demo/reset")
-async def reset_demo() -> dict[str, Any]:
-    _require_demo_api_enabled()
-    lab_profiles.clear()
+async def _run_demo_reset(job_id: str) -> None:
     try:
-        result = await reset_demo_environment(get_settings())
-        _release_demo_alert_deduplication()
-        return result
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        async with _demo_write_lock():
+            result = await reset_demo_environment(get_settings())
+            _release_demo_alert_deduplication()
+        demo_reset_jobs[job_id] = demo_reset_jobs[job_id].model_copy(
+            update={"status": "succeeded", "result": result}
+        )
+    except Exception as exc:
+        demo_reset_jobs[job_id] = demo_reset_jobs[job_id].model_copy(
+            update={"status": "failed", "error": str(exc)}
+        )
+
+
+@app.post("/api/v1/demo/reset", response_model=DemoResetJob, status_code=202)
+async def reset_demo() -> DemoResetJob:
+    global _demo_operation_generation
+
+    _require_demo_api_enabled()
+    active_job = next(
+        (job for job in demo_reset_jobs.values() if job.status == "resetting"),
+        None,
+    )
+    if active_job:
+        return active_job
+
+    # Record reset intent before the background task waits for the write lock. Any
+    # running or queued injector from the previous generation must not publish an
+    # active fault after the operator has requested a healthy baseline.
+    _demo_operation_generation += 1
+    lab_profiles.clear()
+    for fault_job in list(demo_fault_jobs.values()):
+        if fault_job.status in {"injecting", "active"}:
+            _mark_demo_fault_invalidated(fault_job.id)
+
+    job = DemoResetJob(id=str(uuid4()), status="resetting")
+    demo_reset_jobs[job.id] = job
+    task = asyncio.create_task(_run_demo_reset(job.id))
+    demo_fault_tasks.add(task)
+    task.add_done_callback(demo_fault_tasks.discard)
+    return job
+
+
+@app.get("/api/v1/demo/resets/{job_id}", response_model=DemoResetJob)
+async def get_demo_reset(job_id: str) -> DemoResetJob:
+    _require_demo_api_enabled()
+    try:
+        return demo_reset_jobs[job_id]
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="演示环境恢复任务不存在") from exc
 
 
 def _create_demo_fault_job(
@@ -307,6 +375,12 @@ def _create_demo_fault_job(
         "ambiguous_change_fault",
     ],
 ) -> DemoFaultJob:
+    if any(job.status == "resetting" for job in demo_reset_jobs.values()):
+        raise HTTPException(
+            status_code=409,
+            detail="演示环境正在恢复健康基线，请等待恢复任务完成后再注入故障",
+        )
+
     active_job = next(
         (
             job
@@ -320,10 +394,43 @@ def _create_demo_fault_job(
 
     job = DemoFaultJob(id=str(uuid4()), scenario=scenario, status="injecting")
     demo_fault_jobs[job.id] = job
+    demo_fault_generations[job.id] = _demo_operation_generation
     task = asyncio.create_task(_run_demo_fault(job.id))
     demo_fault_tasks.add(task)
     task.add_done_callback(demo_fault_tasks.discard)
     return job
+
+
+def _demo_write_lock() -> asyncio.Lock:
+    """Return one Demo cluster-write lock for the current event loop.
+
+    Tests may create a fresh event loop for each case. Keeping one lock per loop
+    avoids reusing a contended asyncio primitive across those loop lifecycles,
+    while the API server still has exactly one lock for all Demo writes.
+    """
+
+    loop = asyncio.get_running_loop()
+    lock = _demo_write_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _demo_write_locks[loop] = lock
+    return lock
+
+
+def _demo_fault_was_invalidated(job_id: str, generation: int) -> bool:
+    job = demo_fault_jobs[job_id]
+    return generation != _demo_operation_generation or job.status == "failed"
+
+
+def _mark_demo_fault_invalidated(job_id: str) -> None:
+    job = demo_fault_jobs[job_id]
+    _disarm_job_profile(job)
+    demo_fault_jobs[job_id] = job.model_copy(
+        update={
+            "status": "failed",
+            "error": "故障注入已被演示环境恢复请求取消",
+        }
+    )
 
 
 def _require_demo_api_enabled() -> None:

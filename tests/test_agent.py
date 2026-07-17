@@ -1528,6 +1528,479 @@ def test_rollback_without_positive_health_marker_fails_closed() -> None:
     assert "没有可信健康标记" in feedback
 
 
+def test_rollback_requires_a_current_fault_or_trusted_change_correlation() -> None:
+    plan = RemediationPlan(
+        summary="回滚服务",
+        actions=[
+            RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": "order-service", "revision": 1},
+                rationale="上一版本健康",
+                expected_outcome="服务恢复",
+                risk=RiskLevel.HIGH,
+            )
+        ],
+        rollback="停止操作",
+        verification=["检查错误率"],
+    )
+    state = {
+        "alert": {"service": "order-service"},
+        "observations": {
+            "evidence_catalog": {
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                }
+            },
+            "pods": {
+                "items": [
+                    {
+                        "revision": 2,
+                        "phase": "Running",
+                        "ready": False,
+                        "restarts": 7,
+                        "waiting_reasons": [],
+                    }
+                ]
+            },
+            "events": {"items": [{"type": "Normal", "message": "No warnings"}]},
+            "logs": {"lines": ["INFO: service healthy"]},
+            "metrics": {"error_rate": 0.0, "p95_ms": 100},
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "status": "stable",
+                        "health_proof": {"valid": True, "status": "healthy"},
+                    },
+                    {
+                        "revision": 2,
+                        "replicas": 1,
+                        "ready_replicas": 1,
+                        "status": "stable",
+                        "health_status": "healthy",
+                    },
+                ],
+            },
+        },
+    }
+
+    feedback = IncidentAgent._plan_feedback(state, plan)  # type: ignore[arg-type]
+
+    assert feedback is not None
+    assert "没有明确异常" in feedback
+
+
+def test_rollback_accepts_kind_bad_rollout_marker_with_observed_failure() -> None:
+    plan = RemediationPlan(
+        summary="回滚服务",
+        actions=[
+            RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": "order-service", "revision": 1},
+                rationale="上一版本健康",
+                expected_outcome="服务恢复",
+                risk=RiskLevel.HIGH,
+            )
+        ],
+        rollback="停止操作",
+        verification=["检查错误率"],
+    )
+    state = {
+        "alert": {"service": "order-service"},
+        "observations": {
+            "evidence_catalog": {
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                }
+            },
+            # The real Kubernetes backend omits revision from Pod summaries.
+            "pods": {
+                "items": [
+                    {
+                        "phase": "Running",
+                        "ready": False,
+                        "restarts": 3,
+                        "waiting_reasons": ["CrashLoopBackOff"],
+                    }
+                ]
+            },
+            "logs": {
+                "lines": ["FATAL: application configuration is invalid"]
+            },
+            "metrics": {
+                "desired_replicas": 1,
+                "available_replicas": 0,
+                "availability": 0.0,
+            },
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "health_proof": {"valid": True, "status": "healthy"},
+                    },
+                    {
+                        "revision": 2,
+                        "replicas": 1,
+                        "ready_replicas": 0,
+                        "change_cause": "bad-rollout",
+                        "health_proof": {"valid": False, "status": "unknown"},
+                    },
+                ],
+            },
+        },
+    }
+
+    assert IncidentAgent._plan_feedback(state, plan) is None  # type: ignore[arg-type]
+
+
+def test_supporting_finding_must_match_server_raw_observation() -> None:
+    state = {
+        "evidence_snapshots": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+            },
+        },
+        "observations": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+            },
+            "evidence_catalog": {
+                "events": {
+                    "evidence_id": "events",
+                    "source": "kubernetes_events",
+                    "tool": "list_events",
+                    "success": True,
+                },
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                },
+            },
+        }
+    }
+    diagnosis = Diagnosis(
+        root_cause="最新发布导致容器启动失败",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="最新发布导致容器启动失败",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件明确显示 CrashLoopBackOff",
+                    ),
+                    Evidence(
+                        evidence_id="rollout",
+                        source="kubernetes_rollout",
+                        query="get_rollout_history",
+                        finding="当前 revision 明确失败",
+                    ),
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+
+    assert "证据 events 的 finding 没有对应原始观测支持" in issues
+
+
+def test_model_supplied_raw_cannot_replace_server_observation() -> None:
+    state = {
+        "evidence_snapshots": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]}
+        },
+        "observations": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+            "evidence_catalog": {
+                "events": {
+                    "evidence_id": "events",
+                    "source": "kubernetes_events",
+                    "tool": "list_events",
+                    "success": True,
+                }
+            },
+        }
+    }
+    diagnosis = Diagnosis(
+        root_cause="容器启动失败",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="容器启动失败",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件明确显示 CrashLoopBackOff",
+                        raw={"items": [{"message": "CrashLoopBackOff"}]},
+                    )
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+
+    assert "证据 events 的 raw 与服务端原始观测不一致" in issues
+
+
+def test_server_predicates_ignore_query_metadata_and_negated_failures() -> None:
+    assert not IncidentAgent._loki_has_explicit_failure(
+        {
+            "query": '|~ "(error|failed|fatal|timeout|exception)"',
+            "result": [],
+        }
+    )
+    assert not IncidentAgent._logs_have_explicit_failure(
+        {"lines": ["INFO: error budget is healthy; no request failures detected"]}
+    )
+    assert not IncidentAgent._logs_have_explicit_failure(
+        {"lines": ["transient_runtime_fault_enabled=false restart_required=true"]}
+    )
+    assert IncidentAgent._logs_have_explicit_failure(
+        {"lines": ["transient_runtime_fault_enabled restart_required=true"]}
+    )
+    assert not IncidentAgent._events_have_explicit_failure(
+        {
+            "items": [
+                {
+                    "type": "Normal",
+                    "reason": "Pulled",
+                    "message": "No readiness probe failed",
+                }
+            ]
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "No invalid configuration was detected",
+        "invalid configuration was not detected",
+        "service started without invalid configuration",
+        "we never observed invalid configuration",
+        "monitor did not report invalid configuration",
+        "未发现 invalid configuration",
+        "没有 inventory_reservation_failed",
+        "无 synthetic_timeout",
+    ],
+)
+def test_log_failure_predicate_rejects_negated_assertions(line: str) -> None:
+    assert not IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "required environment variable DATABASE_URL is present",
+        "invalid configuration count=0",
+        "inventory_reservation_failed=false",
+        "synthetic_timeout disabled",
+        "FATAL: required environment variable DATABASE_URL is present",
+        "required environment variable DATABASE_URL missing=false",
+        "required environment variable DATABASE_URL is not missing",
+        "ERROR: invalid configuration count=0",
+        "invalid configuration=false",
+        "exception: inventory_reservation_failed=false",
+        "inventory_reservation_failed count=0",
+        "ERROR: synthetic_timeout inactive",
+        "synthetic_timeout count=0",
+    ],
+)
+def test_log_failure_predicate_rejects_structured_false_values(line: str) -> None:
+    assert not IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "FATAL: required environment variable DATABASE_URL is missing",
+        "ERROR: timeout acquiring database connection from pool",
+        "invalid configuration was detected",
+        "invalid configuration count=2",
+        "inventory_reservation_failed=true",
+        "inventory_reservation_failed reason=synthetic_timeout",
+        "synthetic_timeout active",
+        "transient_runtime_fault_enabled restart_required=true",
+    ],
+)
+def test_log_failure_predicate_preserves_asserted_failures(line: str) -> None:
+    assert IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("No invalid configuration was detected", False),
+        ("invalid configuration was not detected", False),
+        ("service started without invalid configuration", False),
+        ("we never observed invalid configuration", False),
+        ("monitor did not report invalid configuration", False),
+        ("未发现 invalid configuration", False),
+        ("required environment variable DATABASE_URL is present", False),
+        ("invalid configuration count=0", False),
+        ("inventory_reservation_failed=false", False),
+        ("synthetic_timeout disabled", False),
+        ("FATAL: required environment variable DATABASE_URL is missing", True),
+        ("ERROR: timeout acquiring database connection from pool", True),
+        ("invalid configuration count=2", True),
+        ("inventory_reservation_failed=true", True),
+        ("inventory_reservation_failed reason=synthetic_timeout", True),
+        ("synthetic_timeout active", True),
+        ("transient_runtime_fault_enabled restart_required=true", True),
+    ],
+)
+def test_rollback_causal_gate_requires_an_asserted_log_failure(
+    line: str, expected: bool
+) -> None:
+    current = {
+        "revision": 2,
+        "replicas": 1,
+        "ready_replicas": 1,
+        "status": "stable",
+        "change_cause": "bad-rollout",
+    }
+    observations = {
+        "pods": {"items": []},
+        "logs": {"lines": [line]},
+        "metrics": {"error_rate": 0.0, "p95_ms": 100},
+        "events": {"items": []},
+    }
+
+    assert IncidentAgent._rollback_has_causal_evidence(  # type: ignore[arg-type]
+        observations, current
+    ) is expected
+
+
+def test_negation_does_not_suppress_a_later_positive_log_assertion() -> None:
+    assert IncidentAgent._logs_have_explicit_failure(
+        {
+            "lines": [
+                "No invalid configuration was detected. "
+                "FATAL: required environment variable DATABASE_URL is missing"
+            ]
+        }
+    )
+
+
+def test_evidence_id_resolves_its_immutable_snapshot_after_follow_up() -> None:
+    healthy_logs = {"lines": ["INFO: service healthy"]}
+    failed_logs = {"lines": ["FATAL: application configuration is invalid"]}
+    rollout = {
+        "current_revision": 2,
+        "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+    }
+    catalog = {
+        "collect_context:1:tool:logs": {
+            "evidence_id": "collect_context:1:tool:logs",
+            "source": "kubernetes_logs",
+            "tool": "get_pod_logs",
+            "success": True,
+        },
+        "collect_follow_up:1:tool:kubernetes_logs": {
+            "evidence_id": "collect_follow_up:1:tool:kubernetes_logs",
+            "source": "kubernetes_logs",
+            "tool": "get_pod_logs",
+            "success": True,
+        },
+        "rollout": {
+            "evidence_id": "rollout",
+            "source": "kubernetes_rollout",
+            "tool": "get_rollout_history",
+            "success": True,
+        },
+    }
+    state = {
+        "evidence_snapshots": {
+            "collect_context:1:tool:logs": healthy_logs,
+            "collect_follow_up:1:tool:kubernetes_logs": failed_logs,
+            "rollout": rollout,
+        },
+        "observations": {
+            "logs": failed_logs,
+            "rollout": rollout,
+            "evidence_catalog": catalog,
+        },
+    }
+    diagnosis = Diagnosis(
+        root_cause="当前日志包含启动配置错误",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="当前日志包含启动配置错误",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="collect_context:1:tool:logs",
+                        source="kubernetes_logs",
+                        query="get_pod_logs",
+                        finding="初始日志包含 FATAL 配置错误",
+                    ),
+                    Evidence(
+                        evidence_id="rollout",
+                        source="kubernetes_rollout",
+                        query="get_rollout_history",
+                        finding="当前 revision 明确失败",
+                    ),
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+    assert (
+        "证据 collect_context:1:tool:logs 的 finding 没有对应原始观测支持"
+        in issues
+    )
+
+    state["observations"]["logs"] = healthy_logs
+    diagnosis.hypotheses[0].evidence[0] = Evidence(
+        evidence_id="collect_follow_up:1:tool:kubernetes_logs",
+        source="kubernetes_logs",
+        query="get_pod_logs",
+        finding="补查日志包含 FATAL 配置错误",
+        raw=failed_logs,
+    )
+
+    assert IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    ) == []
+
+
 @pytest.mark.parametrize(
     "revision",
     [
@@ -1636,6 +2109,21 @@ def test_root_cause_and_confidence_binding_rules_are_independent(
     unexpected_issue: str,
 ) -> None:
     state = {
+        "evidence_snapshots": {
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+            },
+            "events": {
+                "items": [
+                    {
+                        "type": "Warning",
+                        "reason": "BackOff",
+                        "message": "Back-off restarting failed container",
+                    }
+                ]
+            },
+        },
         "observations": {
             "evidence_catalog": {
                 "rollout": {
@@ -1734,6 +2222,23 @@ def test_each_evidence_authenticity_rule_is_enforced_independently(
     expected_issue: str,
 ) -> None:
     state = {
+        "evidence_snapshots": {
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+            },
+            "events": {
+                "items": [
+                    {
+                        "type": "Warning",
+                        "reason": "BackOff",
+                        "message": "Back-off restarting failed container",
+                    }
+                ]
+            },
+            "logs": {"lines": ["FATAL: application configuration is invalid"]},
+            "failed": {"result": []},
+        },
         "observations": {
             "evidence_catalog": {
                 "rollout": {

@@ -156,3 +156,10 @@ export interface DemoFaultJob {
   result: DemoFaultResult | null;
   error: string | null;
 }
+
+export interface DemoResetJob {
+  id: string;
+  status: "resetting" | "succeeded" | "failed";
+  result: { baseline_restored: boolean } | null;
+  error: string | null;
+}

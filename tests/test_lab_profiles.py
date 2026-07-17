@@ -9,9 +9,14 @@ from sentinelops.domain import (
     Evidence,
     Hypothesis,
     IncidentStatus,
+    RemediationAction,
     RiskLevel,
 )
-from sentinelops.lab_profiles import FaultyRolloutRunbook, LabProfileCoordinator
+from sentinelops.lab_profiles import (
+    FaultyRolloutRunbook,
+    LabProfileCoordinator,
+    VerifiedRuntimeStateRunbook,
+)
 from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
@@ -113,3 +118,47 @@ def test_arming_a_lab_profile_replaces_stale_profiles() -> None:
     assert profile is not None
     assert profile.id == "lab.manual-approval.v1:fresh-manual"
     assert profile.auto_approve_max_risk == RiskLevel.LOW
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "transient_runtime_fault_enabled=false restart_required=true",
+        "transient_runtime_fault_enabled=true restart_required=false",
+        "transient_runtime_fault_enabled=0 restart_required=1",
+    ],
+)
+def test_runtime_runbook_rejects_explicitly_inactive_fault(line: str) -> None:
+    runbook = VerifiedRuntimeStateRunbook(confidence_threshold=0.8)
+    state = {
+        "alert": {"service": "inventory-service"},
+        "observations": {"logs": {"lines": [line]}},
+    }
+    action = RemediationAction(
+        tool_name="restart_deployment",
+        arguments={"name": "inventory-service"},
+        rationale="clear verified in-memory state",
+        expected_outcome="requests recover",
+        risk=RiskLevel.MEDIUM,
+    )
+
+    assert runbook.action_causal_precondition(state, action) is False  # type: ignore[arg-type]
+
+
+def test_runtime_runbook_accepts_explicit_active_fault() -> None:
+    runbook = VerifiedRuntimeStateRunbook(confidence_threshold=0.8)
+    state = {
+        "alert": {"service": "inventory-service"},
+        "observations": {
+            "logs": {"lines": ["transient_runtime_fault_enabled=true restart_required=true"]}
+        },
+    }
+    action = RemediationAction(
+        tool_name="restart_deployment",
+        arguments={"name": "inventory-service"},
+        rationale="clear verified in-memory state",
+        expected_outcome="requests recover",
+        risk=RiskLevel.MEDIUM,
+    )
+
+    assert runbook.action_causal_precondition(state, action) is True  # type: ignore[arg-type]

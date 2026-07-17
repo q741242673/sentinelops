@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import math
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -83,6 +85,34 @@ EVIDENCE_SOURCE_BY_TOOL = {
     "get_trace": "tempo",
     "get_change_evidence": "git_changes",
 }
+
+_ASSERTION_BOUNDARY = re.compile(r"[.;!?\n\r。；！？]+")
+_NEGATION_BEFORE_FAILURE = re.compile(
+    r"(?:"
+    r"\b(?:no|not|never|without)\b|"
+    r"\b(?:did|does|do|was|were|is|are|has|have|had)\s+not\b|"
+    r"没有|并未|未曾|未发现|未检测到|无"
+    r")(?:[\s\w_=/,:-]{0,80})$",
+    re.IGNORECASE,
+)
+_NEGATION_AFTER_FAILURE = re.compile(
+    r"^(?:[\s,:=-]{0,8})"
+    r"(?:"
+    r"(?:(?:was|were|is|are|has|have|had)\s+)?(?:not|never)\s+"
+    r"(?:detected|found|observed|seen|present|reported|reproduced|confirmed)|"
+    r"(?:未被|没有被|并未被)(?:检测到|发现|观察到|确认|复现)|"
+    r"(?:不存在|未发生)"
+    r")\b",
+    re.IGNORECASE,
+)
+_LOG_SEVERITY_MARKERS = {"fatal:", "error:", "exception:"}
+_STRUCTURED_LOG_FAILURE_MARKERS = {
+    "required environment variable",
+    "invalid configuration",
+    "inventory_reservation_failed",
+    "synthetic_timeout",
+}
+_FALSE_FLAG_VALUES = {"false", "0", "no", "off"}
 
 
 def _event(event_type: str, message: str, **data: Any) -> dict[str, Any]:
@@ -583,6 +613,7 @@ class IncidentAgent:
             calls["trace"] = ("get_trace", {"trace_id": trace_id})
         observations: dict[str, Any] = {}
         evidence_catalog: dict[str, dict[str, Any]] = {}
+        evidence_snapshots: dict[str, dict[str, Any]] = {}
         for key, (tool_name, arguments) in calls.items():
             result = await self._call_tool_traced(
                 state,
@@ -591,7 +622,8 @@ class IncidentAgent:
                 tool_name=tool_name,
                 arguments=arguments,
             )
-            observations[key] = result.content if result.success else {"error": result.error}
+            raw = result.content if result.success else {"error": result.error}
+            observations[key] = raw
             entry = self._catalog_entry(
                 state,
                 parent_name="collect_context",
@@ -601,6 +633,7 @@ class IncidentAgent:
                 success=result.success,
             )
             evidence_catalog[entry.evidence_id] = entry.model_dump(mode="json")
+            evidence_snapshots[entry.evidence_id] = copy.deepcopy(raw)
         if self.tools.has_tool("get_change_evidence"):
             result = await self._call_tool_traced(
                 state,
@@ -609,7 +642,8 @@ class IncidentAgent:
                 tool_name="get_change_evidence",
                 arguments={"service": service},
             )
-            observations["changes"] = result.content if result.success else {"error": result.error}
+            raw = result.content if result.success else {"error": result.error}
+            observations["changes"] = raw
             entry = self._catalog_entry(
                 state,
                 parent_name="collect_context",
@@ -619,10 +653,12 @@ class IncidentAgent:
                 success=result.success,
             )
             evidence_catalog[entry.evidence_id] = entry.model_dump(mode="json")
+            evidence_snapshots[entry.evidence_id] = copy.deepcopy(raw)
         observations["evidence_catalog"] = evidence_catalog
         return {
             "status": IncidentStatus.INVESTIGATING.value,
             "observations": observations,
+            "evidence_snapshots": evidence_snapshots,
             "timeline": [_event("context.collected", "已采集 Kubernetes 与可观测性诊断上下文")],
         }
 
@@ -885,6 +921,7 @@ class IncidentAgent:
                 )
             )
         observations = dict(state["observations"])
+        evidence_snapshots = copy.deepcopy(state.get("evidence_snapshots", {}))
         prior = dict(observations.get("follow_up_evidence", {}))
         observations["follow_up_evidence"] = {**prior, f"round_{round_number}": supplemental}
         evidence_catalog = dict(observations.get("evidence_catalog", {}))
@@ -904,8 +941,10 @@ class IncidentAgent:
             evidence_id = f"collect_follow_up:{round_number}:tool:{source}"
             if catalog_updates.get(evidence_id, {}).get("success"):
                 observations[canonical_sources[source]] = content
+            evidence_snapshots[evidence_id] = copy.deepcopy(content)
         return {
             "observations": observations,
+            "evidence_snapshots": evidence_snapshots,
             "reflection_rounds": round_number,
             "timeline": events,
         }
@@ -1011,12 +1050,447 @@ class IncidentAgent:
                         f"证据 {evidence.evidence_id} 的 query 与实际工具不一致"
                     )
                     continue
+                raw_issue = cls._supporting_evidence_raw_issue(
+                    state,
+                    entry,
+                    evidence,
+                )
+                if raw_issue is not None:
+                    issues.append(raw_issue)
+                    continue
                 if hypothesis is primary and evidence.supports_hypothesis:
                     valid_primary_sources.add(entry.source)
 
         if len(valid_primary_sources) < 2:
             issues.append("主假设至少需要两个独立且采集成功的证据来源")
         return list(dict.fromkeys(issues))
+
+    @classmethod
+    def _supporting_evidence_raw_issue(
+        cls,
+        state: IncidentState,
+        entry: EvidenceCatalogEntry,
+        evidence: Any,
+    ) -> str | None:
+        if not evidence.supports_hypothesis:
+            return None
+        snapshots = state.get("evidence_snapshots", {})
+        if entry.evidence_id not in snapshots:
+            return f"证据 {evidence.evidence_id} 缺少采集时的不可变原始快照"
+        raw = snapshots[entry.evidence_id]
+        if evidence.raw and evidence.raw != raw:
+            return f"证据 {evidence.evidence_id} 的 raw 与服务端原始观测不一致"
+
+        supported = True
+        if entry.tool == "list_pods":
+            supported = cls._pods_have_explicit_failure(raw)
+        elif entry.tool == "list_events":
+            supported = cls._events_have_explicit_failure(raw)
+        elif entry.tool == "get_pod_logs":
+            supported = cls._logs_have_explicit_failure(raw)
+        elif entry.tool == "get_rollout_history":
+            current = cls._active_revision(raw) if isinstance(raw, dict) else None
+            supported = bool(
+                current
+                and (
+                    cls._revision_is_explicitly_abnormal(current)
+                    or cls._revision_has_explicit_fault_cause(current)
+                    or (
+                        any(
+                            marker in evidence.finding
+                            for marker in ("没有出现", "未出现", "没有新", "相同")
+                        )
+                        and bool(raw.get("revisions"))
+                    )
+                )
+            )
+        elif entry.tool == "get_service_metrics":
+            supported = cls._metrics_have_explicit_failure(raw)
+        elif entry.tool == "query_prometheus":
+            supported = cls._prometheus_has_explicit_failure(raw)
+        elif entry.tool == "search_loki":
+            supported = cls._loki_has_explicit_failure(raw)
+        elif entry.tool == "get_trace":
+            supported = cls._trace_has_explicit_failure(raw)
+        elif entry.tool == "get_change_evidence":
+            supported = isinstance(raw, dict) and raw.get("correlation_status") in {
+                "verified",
+                "no_code_change",
+                "current_commit_verified",
+            }
+        if supported:
+            return None
+        return f"证据 {evidence.evidence_id} 的 finding 没有对应原始观测支持"
+
+    @staticmethod
+    def _payload_text(payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True).casefold()
+
+    @staticmethod
+    def _line_has_explicit_failure(line: str) -> bool:
+        text = line.casefold().strip()
+        fault_flag = re.search(r"(?<![\w])([a-z0-9_]*fault_enabled)(?![\w])", text)
+        if fault_flag:
+            flag_name = re.escape(fault_flag.group(1))
+            enabled_values = re.findall(
+                rf"{flag_name}\s*=\s*(true|false|1|0|yes|no|on|off)\b",
+                text,
+            )
+            restart_values = re.findall(
+                r"restart_required\s*=\s*(true|false|1|0|yes|no|on|off)\b",
+                text,
+            )
+            false_values = {"false", "0", "no", "off"}
+            true_values = {"true", "1", "yes", "on"}
+            if (
+                set(enabled_values) & false_values
+                or set(restart_values) & false_values
+                or not restart_values
+                or not set(restart_values) <= true_values
+            ):
+                return False
+            if enabled_values:
+                return set(enabled_values) <= true_values
+            return bool(
+                re.search(
+                    rf"(?<![\w]){flag_name}(?!\s*=)(?![\w])",
+                    text,
+                )
+            )
+        markers = (
+            "fatal:",
+            "error:",
+            "exception:",
+            "crashloopbackoff",
+            "timeout acquiring",
+            "connection pool exhausted",
+            "required environment variable",
+            "invalid configuration",
+            "inventory_reservation_failed",
+            "synthetic_timeout",
+        )
+        for assertion in _ASSERTION_BOUNDARY.split(text):
+            has_structured_claim = any(
+                marker in assertion for marker in _STRUCTURED_LOG_FAILURE_MARKERS
+            )
+            for marker in markers:
+                # A severity prefix alone must not override an explicitly healthy
+                # structured claim such as "ERROR: invalid configuration count=0".
+                if marker in _LOG_SEVERITY_MARKERS and has_structured_claim:
+                    continue
+                offset = 0
+                while (index := assertion.find(marker, offset)) >= 0:
+                    prefix = assertion[max(0, index - 80) : index]
+                    suffix = assertion[index + len(marker) : index + len(marker) + 80]
+                    negated = (
+                        _NEGATION_BEFORE_FAILURE.search(prefix)
+                        or _NEGATION_AFTER_FAILURE.search(suffix)
+                    )
+                    if not negated and marker in _STRUCTURED_LOG_FAILURE_MARKERS:
+                        if IncidentAgent._structured_log_claim_is_failure(
+                            assertion, marker, index
+                        ):
+                            return True
+                    elif not negated:
+                        return True
+                    offset = index + len(marker)
+        return False
+
+    @staticmethod
+    def _structured_log_claim_is_failure(
+        assertion: str, marker: str, index: int
+    ) -> bool:
+        """Validate structured failure claims instead of trusting keywords alone."""
+
+        context = assertion[index : index + 160]
+        if marker == "required environment variable":
+            if re.search(
+                r"\b(?:missing|unset|undefined|absent|empty)\s*[:=]\s*"
+                r"(?:false|0|no|off)\b|"
+                r"\b(?:is|are|was|were)\s+not\s+"
+                r"(?:missing|unset|undefined|absent|empty)\b",
+                context,
+            ):
+                return False
+            return bool(
+                re.search(
+                    r"\b(?:missing|unset|undefined|absent|empty|not\s+set)\b|"
+                    r"未设置|缺失|为空|不存在",
+                    context,
+                )
+            )
+
+        if marker == "invalid configuration":
+            count = re.search(r"\bcount\s*[:=]\s*(\d+(?:\.\d+)?)\b", context)
+            if count:
+                return float(count.group(1)) > 0
+            flag = re.search(
+                r"invalid configuration\s*[:=]\s*(true|false|1|0|yes|no|on|off)\b",
+                context,
+            )
+            if flag:
+                return flag.group(1) not in _FALSE_FLAG_VALUES
+            return not bool(
+                re.search(
+                    r"invalid configuration\s+(?:is\s+)?(?:disabled|inactive)\b",
+                    context,
+                )
+            )
+
+        flag = re.search(
+            rf"{re.escape(marker)}\s*[:=]\s*(true|false|1|0|yes|no|on|off)\b",
+            context,
+        )
+        if flag:
+            return flag.group(1) not in _FALSE_FLAG_VALUES
+        count = re.search(r"\bcount\s*[:=]\s*(\d+(?:\.\d+)?)\b", context)
+        if count:
+            return float(count.group(1)) > 0
+        return not bool(
+            re.search(
+                rf"{re.escape(marker)}\s+(?:is\s+)?(?:disabled|inactive)\b",
+                context,
+            )
+        )
+
+    @classmethod
+    def _logs_have_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return any(
+            cls._line_has_explicit_failure(str(line))
+            for line in payload.get("lines", [])
+        )
+
+    @staticmethod
+    def _positive_prometheus_sample(series: Any) -> bool:
+        if not isinstance(series, dict):
+            return False
+        samples = []
+        if isinstance(series.get("value"), list):
+            samples.append(series["value"])
+        samples.extend(series.get("values", []))
+        for sample in samples:
+            try:
+                if len(sample) == 2 and float(sample[1]) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
+    @classmethod
+    def _prometheus_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        query = str(payload.get("query", "")).casefold()
+        query_targets_failure = any(
+            marker in query
+            for marker in ('status=~"5.."', "error", "failure", "fault")
+        )
+        for series in payload.get("result", []):
+            if not cls._positive_prometheus_sample(series):
+                continue
+            labels = series.get("metric", {}) if isinstance(series, dict) else {}
+            status = str(labels.get("status", labels.get("status_code", "")))
+            if status.startswith("5") or query_targets_failure:
+                return True
+        return False
+
+    @classmethod
+    def _loki_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        for stream in payload.get("result", []):
+            if not isinstance(stream, dict):
+                continue
+            for sample in stream.get("values", []):
+                if (
+                    isinstance(sample, list)
+                    and len(sample) == 2
+                    and cls._line_has_explicit_failure(str(sample[1]))
+                ):
+                    return True
+        return False
+
+    @classmethod
+    def _trace_has_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict) or not isinstance(payload.get("trace"), dict):
+            return False
+        text = cls._payload_text(payload["trace"])
+        return any(
+            marker in text
+            for marker in (
+                "status_code_error",
+                '"status.code": 2',
+                '"http.status_code": 500',
+                '"http.status_code": 502',
+                '"http.status_code": 503',
+                '"error": true',
+                "inventory_reservation_failed",
+                "synthetic_timeout",
+            )
+        )
+
+    @staticmethod
+    def _pods_have_explicit_failure(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        failure_states = {
+            "crashloopbackoff",
+            "error",
+            "failed",
+            "imagepullbackoff",
+            "errimagepull",
+            "oomkilled",
+        }
+        for pod in payload.get("items", []):
+            states = {
+                str(pod.get("phase", "")).casefold(),
+                str(pod.get("reason", "")).casefold(),
+                *(str(reason).casefold() for reason in pod.get("waiting_reasons", [])),
+            }
+            if not pod.get("ready") and states & failure_states:
+                return True
+        return False
+
+    @staticmethod
+    def _events_have_explicit_failure(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        failure_reasons = {
+            "backoff",
+            "failed",
+            "failedcreate",
+            "failedmount",
+            "failedscheduling",
+            "unhealthy",
+        }
+        markers = (
+            "back-off restarting failed container",
+            "crashloopbackoff",
+            "failed to start",
+            "startup probe failed",
+            "readiness probe failed",
+            "errimagepull",
+            "imagepullbackoff",
+        )
+        for item in payload.get("items", []):
+            if str(item.get("type", "")).casefold() != "warning":
+                continue
+            reason = str(item.get("reason", "")).casefold()
+            message = " ".join(
+                str(item.get(key, "")) for key in ("reason", "message")
+            ).casefold()
+            if any(
+                negation in message
+                for negation in (
+                    "no readiness probe failed",
+                    "no startup probe failed",
+                    "not failed",
+                    "没有失败",
+                    "未失败",
+                )
+            ):
+                continue
+            if (not reason or reason in failure_reasons) and any(
+                marker in message for marker in markers
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _metrics_have_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        thresholds = {
+            "error_rate": 0.05,
+            "p95_ms": 1000,
+            "db_pool_utilization": 0.95,
+        }
+        return any(
+            (value := cls._numeric_metric(payload, key)) is not None
+            and value >= threshold
+            for key, threshold in thresholds.items()
+        )
+
+    @staticmethod
+    def _revision_is_explicitly_abnormal(revision: dict[str, Any]) -> bool:
+        return str(revision.get("status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+            "degraded",
+        } or str(revision.get("health_status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+        }
+
+    @staticmethod
+    def _revision_has_explicit_fault_cause(revision: dict[str, Any]) -> bool:
+        cause = str(revision.get("change_cause") or "").casefold()
+        return any(
+            marker in cause
+            for marker in (
+                "bad-rollout",
+                "enable-every-third-inventory-failure",
+                "fault-injection",
+                "faulty-rollout",
+                "enable-failure",
+            )
+        )
+
+    @classmethod
+    def _rollback_has_causal_evidence(
+        cls,
+        observations: dict[str, Any],
+        current: dict[str, Any],
+    ) -> bool:
+        if cls._revision_is_explicitly_abnormal(current):
+            return True
+        try:
+            current_revision = int(current.get("revision", 0))
+        except (TypeError, ValueError):
+            return False
+
+        pods = observations.get("pods", {})
+        matching_pods = {
+            **pods,
+            "items": [
+                pod
+                for pod in pods.get("items", [])
+                if str(pod.get("revision", "")) == str(current_revision)
+            ],
+        }
+        if cls._pods_have_explicit_failure(matching_pods):
+            return True
+
+        observed_failure = cls._logs_have_explicit_failure(
+            observations.get("logs", {})
+        ) or cls._metrics_have_explicit_failure(observations.get("metrics", {}))
+        if cls._revision_has_explicit_fault_cause(current) and observed_failure:
+            return True
+
+        event_text = cls._payload_text(observations.get("events", {}))
+        if (
+            cls._events_have_explicit_failure(observations.get("events", {}))
+            and f"revision {current_revision}" in event_text
+            and observed_failure
+        ):
+            return True
+
+        changes = observations.get("changes", {})
+        changed_rollout = (
+            changes.get("current_rollout", {}) if isinstance(changes, dict) else {}
+        )
+        try:
+            changed_revision = int(changed_rollout.get("revision", 0))
+        except (TypeError, ValueError):
+            changed_revision = 0
+        return bool(
+            isinstance(changes, dict)
+            and changes.get("correlation_status") == "verified"
+            and changed_revision == current_revision
+            and observed_failure
+        )
 
     @staticmethod
     def _primary_hypothesis(diagnosis: Diagnosis) -> Hypothesis | None:
@@ -1501,6 +1975,14 @@ class IncidentAgent:
                 return (
                     f"回滚 revision {requested!r} 不是精确的上一健康版本；"
                     f"必须根据已验证的发布历史选择 revision {target_revision}"
+                )
+            if not IncidentAgent._rollback_has_causal_evidence(
+                state.get("observations", {}),
+                current,
+            ):
+                return (
+                    f"当前 revision {current_revision} 没有明确异常，也没有可信的故障时间或"
+                    "变更关联，已拒绝回滚"
                 )
             return None
 

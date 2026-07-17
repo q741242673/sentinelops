@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { api } from "./api";
+import { api, RequestTimeoutError } from "./api";
+import {
+  approvalTimeoutError,
+  clearStaleApprovalTimeout,
+  consoleError,
+  errorForSelectedIncident,
+  isTerminalIncidentStatus,
+} from "./operationErrors";
+import type { ConsoleError } from "./operationErrors";
 import type { Evidence, ExecutionStep, Incident, RuntimeInfo } from "./types";
 
 const STATUS_LABELS: Record<Incident["status"], string> = {
@@ -373,13 +381,16 @@ function App() {
   const [faultBusy, setFaultBusy] = useState(false);
   const [demoMode, setDemoMode] = useState<DemoMode>("auto");
   const [demoMessage, setDemoMessage] = useState("选择场景后启动，页面会自动跟随最新事故。");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ConsoleError | null>(null);
   const knownIncidentIds = useRef(new Set<string>());
+  const incidentStatuses = useRef(new Map<string, Incident["status"]>());
 
   const acceptIncident = useCallback((updated: Incident, forceFollow = false) => {
     const isNew = !knownIncidentIds.current.has(updated.id);
     knownIncidentIds.current.add(updated.id);
+    incidentStatuses.current.set(updated.id, updated.status);
     setIncidents((current) => mergeIncident(current, updated));
+    setError((current) => clearStaleApprovalTimeout(current, updated.id, updated.status));
     if (forceFollow || isNew) {
       setSelectedId(updated.id);
       setDemoMode(
@@ -406,11 +417,16 @@ function App() {
         const [runtimeInfo, existing] = await Promise.all([api.getRuntime(), api.listIncidents()]);
         if (!mounted) return;
         setRuntime(runtimeInfo);
-        existing.forEach((incident) => knownIncidentIds.current.add(incident.id));
+        existing.forEach((incident) => {
+          knownIncidentIds.current.add(incident.id);
+          incidentStatuses.current.set(incident.id, incident.status);
+        });
         setIncidents((current) => existing.reduce(mergeIncident, current));
         setSelectedId((current) => current ?? existing[0]?.id ?? null);
       } catch (cause) {
-        if (mounted) setError(cause instanceof Error ? cause.message : "控制台暂时不可用");
+        if (mounted) {
+          setError(consoleError(cause instanceof Error ? cause.message : "控制台暂时不可用"));
+        }
       } finally {
         if (mounted) setLoading(false);
       }
@@ -437,6 +453,7 @@ function App() {
     () => selected?.diagnosis?.hypotheses.flatMap((item) => item.evidence) ?? [],
     [selected],
   );
+  const visibleError = errorForSelectedIncident(error, selected?.id ?? null);
 
   async function injectFault() {
     setFaultBusy(true);
@@ -470,7 +487,7 @@ function App() {
       }
       setDemoMessage("Alertmanager 已创建新事故，Agent 正在实时处理。");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "故障注入失败");
+      setError(consoleError(cause instanceof Error ? cause.message : "故障注入失败"));
       setDemoMessage("演示未启动，请根据错误信息检查环境。");
     } finally {
       setFaultBusy(false);
@@ -485,7 +502,7 @@ function App() {
       const incident = await api.createDemoIncident();
       acceptIncident(incident, true);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法创建模拟事故");
+      setError(consoleError(cause instanceof Error ? cause.message : "无法创建模拟事故"));
     } finally {
       setActionBusy(false);
     }
@@ -493,13 +510,14 @@ function App() {
 
   async function decide(approved: boolean) {
     if (!selected?.approval) return;
+    const incidentId = selected.id;
     setActionBusy(true);
     setError(null);
     setDemoMessage(approved ? "审批已提交，Agent 正在执行并验证恢复…" : "正在拒绝本次操作…");
     try {
       acceptIncident(
         await api.decideIncident(
-          selected.id,
+          incidentId,
           selected.approval.approval_id,
           selected.approval.version,
           approved,
@@ -507,7 +525,14 @@ function App() {
         true,
       );
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "审批操作失败");
+      const message = cause instanceof Error ? cause.message : "审批操作失败";
+      if (approved && cause instanceof RequestTimeoutError) {
+        if (!isTerminalIncidentStatus(incidentStatuses.current.get(incidentId) ?? selected.status)) {
+          setError(approvalTimeoutError(message, incidentId));
+        }
+      } else {
+        setError(consoleError(message));
+      }
     } finally {
       setActionBusy(false);
     }
@@ -518,10 +543,18 @@ function App() {
     setError(null);
     setDemoMessage("正在恢复演示基线…");
     try {
-      await api.resetDemoEnvironment();
+      let job = await api.resetDemoEnvironment();
+      while (job.status === "resetting") {
+        setDemoMessage("后台正在恢复 Deployment，并等待演示告警清除…");
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        job = await api.getDemoResetJob(job.id);
+      }
+      if (job.status === "failed" || !job.result?.baseline_restored) {
+        throw new Error(job.error ?? "演示环境恢复失败");
+      }
       setDemoMessage("演示环境已恢复健康，可以开始下一轮。");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "无法恢复演示环境");
+      setError(consoleError(cause instanceof Error ? cause.message : "无法恢复演示环境"));
     } finally {
       setActionBusy(false);
     }
@@ -545,7 +578,7 @@ function App() {
         onRun={liveMode ? injectFault : createSimulatedIncident}
       />
 
-      {error && <div className="error-banner" role="alert">{error}</div>}
+      {visibleError && <div className="error-banner" role="alert">{visibleError.message}</div>}
 
       <div className="console-layout">
         <IncidentQueue incidents={incidents} selectedId={selected?.id ?? null} onSelect={setSelectedId} />
@@ -570,7 +603,12 @@ function App() {
               </section>
               <div className="workspace-grid">
                 <ExecutionFlow incident={selected} />
-                <ResultPanel incident={selected} busy={actionBusy} onDecide={decide} onReset={resetBaseline} />
+                <ResultPanel
+                  incident={selected}
+                  busy={faultBusy || actionBusy}
+                  onDecide={decide}
+                  onReset={resetBaseline}
+                />
               </div>
             </>
           )}
