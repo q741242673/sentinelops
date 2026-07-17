@@ -259,6 +259,14 @@ class IncidentAgent:
                 raise RuntimeError("该审批请求已经处理，不能重复提交")
             expires_at = request.expires_at
             if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at.astimezone(UTC):
+                self._consumed_approval_ids.add(approval_id)
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.ESCALATED,
+                    event_type="approval.expired",
+                    message="审批已过期，旧计划已失效并升级人工处理",
+                )
                 raise RuntimeError("该审批请求已过期，请重新调查后生成新计划")
 
             # Consume before resuming the graph. The lock makes the state check and
@@ -269,21 +277,61 @@ class IncidentAgent:
                     Command(resume={"approved": approved, "note": note}),
                     self._config(incident_id),
                 )
-            except Exception as exc:
-                record.status = IncidentStatus.FAILED
-                record.approval = None
-                record.timeline.append(
-                    TimelineEvent(
-                        type="approval.resume_failed",
-                        message="审批已消费，但后续执行异常；为避免重复写入已停止重试",
-                        data={"approval_id": approval_id, "error": str(exc)},
-                    )
+            except asyncio.CancelledError:
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.FAILED,
+                    event_type="approval.resume_cancelled",
+                    message="审批后的执行被取消，集群变更结果未知，已停止自动处理",
+                    execution_outcome="unknown",
                 )
-                self._publish(record)
+                raise
+            except Exception as exc:
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.FAILED,
+                    event_type="approval.resume_failed",
+                    message="审批已消费，但后续执行异常；为避免重复写入已停止重试",
+                    error=str(exc),
+                )
                 raise RuntimeError("审批后的执行异常，审批已失效且不会自动重试") from exc
             record = self._sync_record(incident_id, result)
             self._publish(record)
             return record
+
+    def _close_consumed_approval(
+        self,
+        record: IncidentRecord,
+        request: ApprovalRequest,
+        *,
+        status: IncidentStatus,
+        event_type: str,
+        message: str,
+        **data: Any,
+    ) -> None:
+        now = datetime.now(UTC)
+        record.status = status
+        record.approval = None
+        for step in record.execution_trace:
+            if step.status == "running":
+                step.status = "failed"
+                step.completed_at = now
+                step.detail = "执行被中断，结果未知，已停止自动处理"
+        record.active_step_id = None
+        record.timeline.append(
+            TimelineEvent(
+                type=event_type,
+                message=message,
+                data={
+                    "approval_id": request.approval_id,
+                    "approval_version": request.version,
+                    **data,
+                },
+            )
+        )
+        self._publish(record)
 
     def get(self, incident_id: str) -> IncidentRecord:
         return self.records[incident_id]
@@ -1332,6 +1380,18 @@ class IncidentAgent:
                 )
 
         if action.tool_name == "scale_deployment":
+            rollout = observations.get("rollout", {})
+            requested_replicas = self._numeric_metric(
+                action.arguments, "replicas"
+            )
+            desired_replicas = self._numeric_metric(rollout, "desired_replicas")
+            if requested_replicas is None or desired_replicas is None:
+                return "scale_deployment 缺少当前或目标副本数，无法验证扩容方向"
+            if requested_replicas <= desired_replicas:
+                return (
+                    "容量饱和证据只允许正向扩容；目标副本数必须大于当前 desired replicas "
+                    f"{int(desired_replicas)}"
+                )
             saturation = max(
                 (
                     value
@@ -1745,10 +1805,12 @@ class IncidentAgent:
         return "human_gate" if state.get("approval_request") else "preflight"
 
     async def _human_gate(self, state: IncidentState) -> dict[str, Any]:
-        decision = interrupt(state["approval_request"])
+        request = ApprovalRequest.model_validate(state["approval_request"])
+        decision = interrupt(request.model_dump(mode="json"))
         approved = bool(decision.get("approved"))
         return {
             "approved": approved,
+            "approval_request": None,
             "status": (
                 IncidentStatus.REMEDIATING.value if approved else IncidentStatus.REJECTED.value
             ),
@@ -1756,6 +1818,9 @@ class IncidentAgent:
                 _event(
                     "approval.decided",
                     "修复操作已批准" if approved else "修复操作已拒绝",
+                    approval_id=request.approval_id,
+                    approval_version=request.version,
+                    approved=approved,
                     note=decision.get("note", ""),
                 )
             ],

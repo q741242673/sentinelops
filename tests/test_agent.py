@@ -165,6 +165,35 @@ class PreflightMutationSimulator(RecordingSimulator):
         return await super().call(name, arguments)
 
 
+class BlockingRollbackSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rollback_started = asyncio.Event()
+        self.never_finish = asyncio.Event()
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name != "rollback_deployment":
+            return await super().call(name, arguments)
+        self.calls.append(name)
+        result = await SimulatedKubernetesBackend.call(self, name, arguments)
+        self.rollback_started.set()
+        await self.never_finish.wait()
+        return result
+
+
+class ScaleEvidenceSimulator(SimulatedKubernetesBackend):
+    def __init__(self) -> None:
+        super().__init__(scenario="db_pool_exhaustion")
+
+    async def call(self, name, arguments) -> ToolResult:
+        result = await super().call(name, arguments)
+        if name == "get_rollout_history" and result.success:
+            result.content["desired_replicas"] = 3
+            result.content["revisions"][0]["replicas"] = 3
+            result.content["revisions"][0]["ready_replicas"] = 3
+        return result
+
+
 class ContradictoryTransientProvider(RuleBasedProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -367,6 +396,34 @@ class UnsafeScalePlanProvider(RuleBasedProvider):
                 ],
                 rollback="停止操作",
                 verification=["检查服务"],
+            )
+        return await super().structured(
+            system=system,
+            prompt=prompt,
+            schema=schema,
+            metadata=metadata,
+        )
+
+
+class ScalePlanProvider(RuleBasedProvider):
+    def __init__(self, replicas: int) -> None:
+        self.replicas = replicas
+
+    async def structured(self, *, system, prompt, schema, metadata=None):
+        if schema is RemediationPlan:
+            return RemediationPlan(
+                summary="根据容量饱和证据扩容服务",
+                actions=[
+                    RemediationAction(
+                        tool_name="scale_deployment",
+                        arguments={"name": "order-service", "replicas": self.replicas},
+                        rationale="连接池和错误率同时达到容量上限",
+                        expected_outcome="增加处理容量",
+                        risk=RiskLevel.HIGH,
+                    )
+                ],
+                rollback="恢复原副本数",
+                verification=["错误率和延迟恢复"],
             )
         return await super().structured(
             system=system,
@@ -747,8 +804,13 @@ async def test_incident_requires_approval_and_recovers(scenario: str) -> None:
     )
 
     assert record.status == IncidentStatus.RESOLVED
+    assert record.approval is None
     assert record.execution_results[0].success is True
     assert record.postmortem is not None
+    decision = next(event for event in record.timeline if event.type == "approval.decided")
+    assert decision.data["approved"] is True
+    assert decision.data["approval_id"]
+    assert decision.data["approval_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -864,6 +926,7 @@ async def test_duplicate_approval_is_consumed_exactly_once() -> None:
 
     assert sum(isinstance(item, RuntimeError) for item in outcomes) == 1
     assert backend.calls.count("rollback_deployment") == 1
+    assert agent.get(record.id).approval is None
 
 
 @pytest.mark.asyncio
@@ -892,6 +955,50 @@ async def test_conflicting_approval_decisions_cannot_both_take_effect() -> None:
 
     assert sum(isinstance(item, RuntimeError) for item in outcomes) == 1
     assert backend.calls.count("rollback_deployment") <= 1
+    assert agent.get(record.id).approval is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_resume_records_unknown_outcome_and_clears_approval() -> None:
+    backend = BlockingRollbackSimulator()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    approval = record.approval
+
+    task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=True,
+            note="cancel after write started",
+        )
+    )
+    await asyncio.wait_for(backend.rollback_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    current = agent.get(record.id)
+    assert backend.calls.count("rollback_deployment") == 1
+    assert current.status == IncidentStatus.FAILED
+    assert current.approval is None
+    assert current.active_step_id is None
+    assert not any(step.status == "running" for step in current.execution_trace)
+    cancelled = next(
+        event for event in current.timeline if event.type == "approval.resume_cancelled"
+    )
+    assert cancelled.data["execution_outcome"] == "unknown"
+    assert cancelled.data["approval_id"] == approval.approval_id
+
+    with pytest.raises(RuntimeError, match="没有可处理的审批"):
+        await agent.resume(
+            record.id,
+            approval_id=approval.approval_id,
+            approval_version=approval.version,
+            approved=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -918,6 +1025,11 @@ async def test_stale_or_expired_approval_cannot_resume_graph() -> None:
             approved=True,
         )
     assert backend.calls.count("rollback_deployment") == 0
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.approval is None
+    expired = next(event for event in record.timeline if event.type == "approval.expired")
+    assert expired.data["approval_id"]
+    assert expired.data["approval_version"] == 1
 
 
 @pytest.mark.asyncio
@@ -984,7 +1096,10 @@ async def test_rejected_action_is_not_executed() -> None:
     )
 
     assert record.status == IncidentStatus.REJECTED
+    assert record.approval is None
     assert record.execution_results == []
+    decision = next(event for event in record.timeline if event.type == "approval.decided")
+    assert decision.data["approved"] is False
 
 
 @pytest.mark.asyncio
@@ -1138,37 +1253,92 @@ def test_restart_requires_deterministic_causal_evidence() -> None:
     assert supported is None
 
 
-def test_scale_requires_saturation_and_user_impact_evidence() -> None:
+@pytest.mark.parametrize(
+    ("requested_replicas", "allowed"),
+    [(0, False), (2, False), (3, False), (4, True)],
+)
+def test_scale_requires_positive_growth_from_current_desired_replicas(
+    requested_replicas: int,
+    allowed: bool,
+) -> None:
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(SimulatedKubernetesBackend()),
     )
     action = RemediationAction(
         tool_name="scale_deployment",
-        arguments={"name": "order-service", "replicas": 3},
+        arguments={"name": "order-service", "replicas": requested_replicas},
+        rationale="扩容服务",
+        expected_outcome="服务恢复",
+        risk=RiskLevel.HIGH,
+    )
+    feedback = agent._causal_action_feedback(
+        {
+            "observations": {
+                "rollout": {"desired_replicas": 3},
+                "metrics": {"cpu_utilization": 0.95, "error_rate": 0.12},
+            }
+        },  # type: ignore[arg-type]
+        action,
+    )
+
+    assert (feedback is None) is allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_replicas", "expected_status"),
+    [
+        (0, IncidentStatus.ESCALATED),
+        (2, IncidentStatus.ESCALATED),
+        (3, IncidentStatus.ESCALATED),
+        (4, IncidentStatus.AWAITING_APPROVAL),
+    ],
+)
+async def test_scale_plan_direction_is_enforced_before_approval(
+    requested_replicas: int,
+    expected_status: IncidentStatus,
+) -> None:
+    agent = IncidentAgent(
+        provider=ScalePlanProvider(requested_replicas),
+        tools=ToolRegistry(ScaleEvidenceSimulator()),
+    )
+
+    record = await agent.start(make_alert())
+
+    assert record.status == expected_status
+    if expected_status == IncidentStatus.ESCALATED:
+        assert record.approval is None
+        assert record.plan is None
+        assert record.execution_results == []
+    else:
+        assert record.approval is not None
+
+
+def test_scale_still_requires_saturation_and_user_impact_evidence() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    action = RemediationAction(
+        tool_name="scale_deployment",
+        arguments={"name": "order-service", "replicas": 4},
         rationale="扩容服务",
         expected_outcome="服务恢复",
         risk=RiskLevel.HIGH,
     )
 
-    assert (
-        agent._causal_action_feedback(
-            {"observations": {"metrics": {"cpu_utilization": 0.95}}},  # type: ignore[arg-type]
-            action,
-        )
-        is not None
+    feedback = agent._causal_action_feedback(
+        {
+            "observations": {
+                "rollout": {"desired_replicas": 3},
+                "metrics": {"cpu_utilization": 0.95},
+            }
+        },  # type: ignore[arg-type]
+        action,
     )
-    assert (
-        agent._causal_action_feedback(
-            {
-                "observations": {
-                    "metrics": {"cpu_utilization": 0.95, "error_rate": 0.12}
-                }
-            },  # type: ignore[arg-type]
-            action,
-        )
-        is None
-    )
+
+    assert feedback is not None
 
 
 def test_restart_is_rejected_when_it_preserves_a_faulty_rollout() -> None:

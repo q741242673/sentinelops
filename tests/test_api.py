@@ -106,6 +106,7 @@ async def test_api_incident_approval_flow(monkeypatch: pytest.MonkeyPatch) -> No
         )
         assert decided.status_code == 200
         assert decided.json()["status"] == "resolved"
+        assert decided.json()["approval"] is None
 
         duplicate = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
