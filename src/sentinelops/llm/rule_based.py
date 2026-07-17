@@ -74,15 +74,12 @@ class RuleBasedProvider:
     def _infer_scenario(observations: dict[str, Any]) -> str:
         declared = observations.get("metrics", {}).get("scenario")
         if declared in {
-            "bad_rollout",
             "db_pool_exhaustion",
             "inventory_faulty_rollout",
             "transient_runtime_fault",
         }:
             return declared
 
-        pods = observations.get("pods", {}).get("items", [])
-        logs = "\n".join(observations.get("logs", {}).get("lines", [])).lower()
         all_evidence = json.dumps(observations, ensure_ascii=False).lower()
         if (
             "transient_runtime_fault_enabled" in all_evidence
@@ -91,23 +88,14 @@ class RuleBasedProvider:
             return "transient_runtime_fault"
         if "inventory_reservation_failed" in all_evidence or "synthetic_timeout" in all_evidence:
             return "inventory_faulty_rollout"
-        has_unhealthy_rollout_pod = any(
-            (not pod.get("ready"))
-            and (
-                pod.get("restarts", 0) > 0
-                or set(pod.get("waiting_reasons", [])) & {"CrashLoopBackOff", "Error"}
+        if any(
+            (
+                RuleBasedProvider._has_bad_rollout_pod_signal(observations),
+                RuleBasedProvider._has_bad_rollout_event_signal(observations),
+                RuleBasedProvider._has_bad_rollout_log_signal(observations),
+                RuleBasedProvider._has_bad_rollout_history_signal(observations),
             )
-            for pod in pods
-        )
-        has_rollout_failure_log = any(
-            marker in logs
-            for marker in (
-                "required environment variable",
-                "application configuration is invalid",
-                "crashloopbackoff",
-            )
-        )
-        if has_unhealthy_rollout_pod or has_rollout_failure_log:
+        ):
             return "bad_rollout"
         if RuleBasedProvider._has_db_pool_log_signal(
             observations
@@ -138,28 +126,174 @@ class RuleBasedProvider:
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _has_bad_rollout_pod_signal(observations: dict[str, Any]) -> bool:
+        failure_states = {
+            "crashloopbackoff",
+            "error",
+            "failed",
+            "imagepullbackoff",
+            "errimagepull",
+            "oomkilled",
+        }
+        for pod in observations.get("pods", {}).get("items", []):
+            states = {
+                str(pod.get("phase", "")).casefold(),
+                str(pod.get("reason", "")).casefold(),
+                *(str(reason).casefold() for reason in pod.get("waiting_reasons", [])),
+            }
+            if not pod.get("ready") and states & failure_states:
+                return True
+        return False
+
+    @staticmethod
+    def _has_bad_rollout_event_signal(observations: dict[str, Any]) -> bool:
+        markers = (
+            "back-off restarting failed container",
+            "crashloopbackoff",
+            "failed to start",
+            "startup probe failed",
+            "readiness probe failed",
+            "errimagepull",
+            "imagepullbackoff",
+        )
+        for item in observations.get("events", {}).get("items", []):
+            message = " ".join(
+                str(item.get(key, "")) for key in ("reason", "message")
+            ).casefold()
+            if any(marker in message for marker in markers):
+                return True
+        return False
+
+    @staticmethod
+    def _has_bad_rollout_log_signal(observations: dict[str, Any]) -> bool:
+        logs = "\n".join(
+            str(line) for line in observations.get("logs", {}).get("lines", [])
+        ).casefold()
+        return any(
+            marker in logs
+            for marker in (
+                "required environment variable",
+                "application configuration is invalid",
+                "invalid configuration",
+                "crashloopbackoff",
+                "failed to start",
+            )
+        )
+
+    @classmethod
+    def _has_bad_rollout_history_signal(cls, observations: dict[str, Any]) -> bool:
+        current = cls._current_rollout_revision(observations)
+        if current is None:
+            return False
+        return str(current.get("status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+            "degraded",
+        } or str(current.get("health_status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+        }
+
+    @staticmethod
+    def _has_error_metric_signal(observations: dict[str, Any]) -> bool:
+        value = observations.get("metrics", {}).get("error_rate")
+        if isinstance(value, bool):
+            return False
+        try:
+            return float(value) >= 0.05
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _current_rollout_revision(observations: dict[str, Any]) -> dict[str, Any] | None:
+        rollout = observations.get("rollout", {})
+        revisions = rollout.get("revisions", [])
+        try:
+            declared = int(rollout.get("current_revision", 0))
+        except (TypeError, ValueError):
+            declared = 0
+        if declared:
+            matching = next(
+                (
+                    revision
+                    for revision in revisions
+                    if int(revision.get("revision", 0)) == declared
+                ),
+                None,
+            )
+            if matching is not None:
+                return matching
+        candidates = [
+            revision
+            for revision in revisions
+            if str(revision.get("revision", "")).isdigit()
+            and (
+                (revision.get("replicas") or 0) > 0
+                or (revision.get("ready_replicas") or 0) > 0
+                or str(revision.get("status", "")).casefold()
+                in {"failed", "active", "current"}
+            )
+        ]
+        return (
+            max(candidates, key=lambda revision: int(revision["revision"]))
+            if candidates
+            else None
+        )
+
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
         current_revision, _ = self._rollout_revisions(observations)
         if scenario == "transient_runtime_fault":
-            candidates = [
-                ("get_pod_logs", "logs", "Pod 日志显示瞬态运行时故障已启用且需要重启清除"),
-                ("get_service_metrics", "metrics", "工作负载指标确认进程内瞬态故障处于活动状态"),
-                (
-                    "query_prometheus",
-                    "prometheus",
-                    "Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
-                ),
-                (
-                    "search_loki",
-                    "loki",
-                    "Loki 日志显示 transient_runtime_fault 已启用且需要重启清除",
-                ),
-                (
-                    "get_rollout_history",
-                    "rollout",
-                    "Kubernetes 发布历史没有出现与本次故障对应的新 revision",
-                ),
-            ]
+            candidates = []
+            log_text = "\n".join(
+                str(line) for line in observations.get("logs", {}).get("lines", [])
+            ).casefold()
+            if "transient_runtime_fault" in log_text:
+                candidates.append(
+                    (
+                        "get_pod_logs",
+                        "logs",
+                        "Pod 日志显示瞬态运行时故障已启用且需要重启清除",
+                    )
+                )
+            if observations.get("metrics", {}).get("scenario") == scenario:
+                candidates.append(
+                    (
+                        "get_service_metrics",
+                        "metrics",
+                        "工作负载指标确认进程内瞬态故障处于活动状态",
+                    )
+                )
+            prometheus_text = json.dumps(
+                observations.get("prometheus", {}), ensure_ascii=False
+            ).casefold()
+            if "transient_runtime_fault" in prometheus_text:
+                candidates.append(
+                    (
+                        "query_prometheus",
+                        "prometheus",
+                        "Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
+                    )
+                )
+            loki_text = json.dumps(
+                observations.get("loki", {}), ensure_ascii=False
+            ).casefold()
+            if "transient_runtime_fault" in loki_text:
+                candidates.append(
+                    (
+                        "search_loki",
+                        "loki",
+                        "Loki 日志显示 transient_runtime_fault 已启用且需要重启清除",
+                    )
+                )
+            if observations.get("rollout", {}).get("revisions"):
+                candidates.append(
+                    (
+                        "get_rollout_history",
+                        "rollout",
+                        "Kubernetes 发布历史没有出现与本次故障对应的新 revision",
+                    )
+                )
             root_cause = "库存服务进程内的瞬态故障状态导致所有预留请求返回 HTTP 503"
         elif scenario == "inventory_faulty_rollout":
             candidates = [
@@ -178,16 +312,34 @@ class RuleBasedProvider:
                 f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
             )
         elif scenario == "bad_rollout":
-            candidates = [
-                ("list_events", "events", "新 Pod 在发布后立即进入 CrashLoopBackOff"),
-                (
-                    "get_rollout_history",
-                    "rollout",
-                    f"错误峰值从 Deployment revision {current_revision} 发布后开始",
-                ),
-                ("get_pod_logs", "logs", "Pod 日志显示发布后的启动配置错误"),
-            ]
-            root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
+            candidates = []
+            if self._has_bad_rollout_pod_signal(observations):
+                candidates.append(
+                    ("list_pods", "pods", "当前 Pod 明确处于容器启动失败状态")
+                )
+            if self._has_bad_rollout_event_signal(observations):
+                candidates.append(
+                    ("list_events", "events", "Kubernetes 事件明确记录了容器启动失败")
+                )
+            if self._has_bad_rollout_history_signal(observations):
+                candidates.append(
+                    (
+                        "get_rollout_history",
+                        "rollout",
+                        f"Deployment revision {current_revision} 被明确标记为失败",
+                    )
+                )
+            if self._has_bad_rollout_log_signal(observations):
+                candidates.append(
+                    ("get_pod_logs", "logs", "Pod 日志明确记录了启动配置错误")
+                )
+            if self._has_error_metric_signal(observations):
+                candidates.append(
+                    ("get_service_metrics", "metrics", "工作负载错误率达到 5% 以上")
+                )
+            root_cause = (
+                f"Deployment revision {current_revision} 的工作负载发生了明确的启动故障"
+            )
         elif scenario == "db_pool_exhaustion":
             candidates = []
             if self._has_db_pool_log_signal(observations):

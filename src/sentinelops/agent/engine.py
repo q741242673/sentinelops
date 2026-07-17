@@ -1011,12 +1011,247 @@ class IncidentAgent:
                         f"证据 {evidence.evidence_id} 的 query 与实际工具不一致"
                     )
                     continue
+                raw_issue = cls._supporting_evidence_raw_issue(
+                    state,
+                    entry,
+                    evidence,
+                )
+                if raw_issue is not None:
+                    issues.append(raw_issue)
+                    continue
                 if hypothesis is primary and evidence.supports_hypothesis:
                     valid_primary_sources.add(entry.source)
 
         if len(valid_primary_sources) < 2:
             issues.append("主假设至少需要两个独立且采集成功的证据来源")
         return list(dict.fromkeys(issues))
+
+    @classmethod
+    def _supporting_evidence_raw_issue(
+        cls,
+        state: IncidentState,
+        entry: EvidenceCatalogEntry,
+        evidence: Any,
+    ) -> str | None:
+        if not evidence.supports_hypothesis:
+            return None
+        observations = state.get("observations", {})
+        raw_keys = {
+            "list_pods": "pods",
+            "list_events": "events",
+            "get_pod_logs": "logs",
+            "get_rollout_history": "rollout",
+            "get_service_metrics": "metrics",
+            "query_prometheus": "prometheus",
+            "search_loki": "loki",
+            "get_trace": "trace",
+            "get_change_evidence": "changes",
+        }
+        raw_key = raw_keys.get(entry.tool)
+        if raw_key is None or raw_key not in observations:
+            return None
+        raw = observations[raw_key]
+        if evidence.raw and evidence.raw != raw:
+            return f"证据 {evidence.evidence_id} 的 raw 与服务端原始观测不一致"
+
+        supported = True
+        if entry.tool == "list_pods":
+            supported = cls._pods_have_explicit_failure(raw)
+        elif entry.tool == "list_events":
+            supported = cls._events_have_explicit_failure(raw)
+        elif entry.tool == "get_pod_logs":
+            supported = cls._text_has_explicit_failure(raw)
+        elif entry.tool == "get_rollout_history":
+            current = cls._active_revision(raw) if isinstance(raw, dict) else None
+            supported = bool(
+                current
+                and (
+                    cls._revision_is_explicitly_abnormal(current)
+                    or cls._revision_has_explicit_fault_cause(current)
+                    or (
+                        any(
+                            marker in evidence.finding
+                            for marker in ("没有出现", "未出现", "没有新", "相同")
+                        )
+                        and bool(raw.get("revisions"))
+                    )
+                )
+            )
+        elif entry.tool == "get_service_metrics":
+            supported = cls._metrics_have_explicit_failure(raw)
+        elif entry.tool in {"query_prometheus", "search_loki", "get_trace"}:
+            supported = cls._text_has_explicit_failure(raw)
+        elif entry.tool == "get_change_evidence":
+            supported = isinstance(raw, dict) and raw.get("correlation_status") in {
+                "verified",
+                "no_code_change",
+                "current_commit_verified",
+            }
+        if supported:
+            return None
+        return f"证据 {evidence.evidence_id} 的 finding 没有对应原始观测支持"
+
+    @staticmethod
+    def _payload_text(payload: Any) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True).casefold()
+
+    @classmethod
+    def _text_has_explicit_failure(cls, payload: Any) -> bool:
+        text = cls._payload_text(payload)
+        return any(
+            marker in text
+            for marker in (
+                "error",
+                "failed",
+                "failure",
+                "fatal",
+                "exception",
+                "timeout",
+                "crashloopbackoff",
+                "http 5",
+                '"status": "5',
+                "required environment variable",
+                "invalid configuration",
+                "inventory_reservation_failed",
+                "fault_enabled",
+            )
+        )
+
+    @staticmethod
+    def _pods_have_explicit_failure(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        failure_states = {
+            "crashloopbackoff",
+            "error",
+            "failed",
+            "imagepullbackoff",
+            "errimagepull",
+            "oomkilled",
+        }
+        for pod in payload.get("items", []):
+            states = {
+                str(pod.get("phase", "")).casefold(),
+                str(pod.get("reason", "")).casefold(),
+                *(str(reason).casefold() for reason in pod.get("waiting_reasons", [])),
+            }
+            if not pod.get("ready") and states & failure_states:
+                return True
+        return False
+
+    @staticmethod
+    def _events_have_explicit_failure(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        markers = (
+            "back-off restarting failed container",
+            "crashloopbackoff",
+            "failed to start",
+            "startup probe failed",
+            "readiness probe failed",
+            "errimagepull",
+            "imagepullbackoff",
+        )
+        for item in payload.get("items", []):
+            message = " ".join(
+                str(item.get(key, "")) for key in ("reason", "message")
+            ).casefold()
+            if any(marker in message for marker in markers):
+                return True
+        return False
+
+    @classmethod
+    def _metrics_have_explicit_failure(cls, payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        thresholds = {
+            "error_rate": 0.05,
+            "p95_ms": 1000,
+            "db_pool_utilization": 0.95,
+        }
+        return any(
+            (value := cls._numeric_metric(payload, key)) is not None
+            and value >= threshold
+            for key, threshold in thresholds.items()
+        )
+
+    @staticmethod
+    def _revision_is_explicitly_abnormal(revision: dict[str, Any]) -> bool:
+        return str(revision.get("status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+            "degraded",
+        } or str(revision.get("health_status", "")).casefold() in {
+            "failed",
+            "unhealthy",
+        }
+
+    @staticmethod
+    def _revision_has_explicit_fault_cause(revision: dict[str, Any]) -> bool:
+        cause = str(revision.get("change_cause") or "").casefold()
+        return any(
+            marker in cause
+            for marker in (
+                "enable-every-third-inventory-failure",
+                "fault-injection",
+                "faulty-rollout",
+                "enable-failure",
+            )
+        )
+
+    @classmethod
+    def _rollback_has_causal_evidence(
+        cls,
+        observations: dict[str, Any],
+        current: dict[str, Any],
+    ) -> bool:
+        if cls._revision_is_explicitly_abnormal(current):
+            return True
+        try:
+            current_revision = int(current.get("revision", 0))
+        except (TypeError, ValueError):
+            return False
+
+        pods = observations.get("pods", {})
+        matching_pods = {
+            **pods,
+            "items": [
+                pod
+                for pod in pods.get("items", [])
+                if str(pod.get("revision", "")) == str(current_revision)
+            ],
+        }
+        if cls._pods_have_explicit_failure(matching_pods):
+            return True
+
+        observed_failure = cls._text_has_explicit_failure(
+            observations.get("logs", {})
+        ) or cls._metrics_have_explicit_failure(observations.get("metrics", {}))
+        if cls._revision_has_explicit_fault_cause(current) and observed_failure:
+            return True
+
+        event_text = cls._payload_text(observations.get("events", {}))
+        if (
+            cls._events_have_explicit_failure(observations.get("events", {}))
+            and f"revision {current_revision}" in event_text
+            and observed_failure
+        ):
+            return True
+
+        changes = observations.get("changes", {})
+        changed_rollout = (
+            changes.get("current_rollout", {}) if isinstance(changes, dict) else {}
+        )
+        try:
+            changed_revision = int(changed_rollout.get("revision", 0))
+        except (TypeError, ValueError):
+            changed_revision = 0
+        return bool(
+            isinstance(changes, dict)
+            and changes.get("correlation_status") == "verified"
+            and changed_revision == current_revision
+            and observed_failure
+        )
 
     @staticmethod
     def _primary_hypothesis(diagnosis: Diagnosis) -> Hypothesis | None:
@@ -1501,6 +1736,14 @@ class IncidentAgent:
                 return (
                     f"回滚 revision {requested!r} 不是精确的上一健康版本；"
                     f"必须根据已验证的发布历史选择 revision {target_revision}"
+                )
+            if not IncidentAgent._rollback_has_causal_evidence(
+                state.get("observations", {}),
+                current,
+            ):
+                return (
+                    f"当前 revision {current_revision} 没有明确异常，也没有可信的故障时间或"
+                    "变更关联，已拒绝回滚"
                 )
             return None
 

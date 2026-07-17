@@ -30,6 +30,57 @@ class EmptyEvidenceBackend:
         return ToolResult(tool_name=name, success=True, content=content)
 
 
+class RestartedButCurrentlyHealthyBackend:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def call(self, name: str, arguments: dict[str, object]) -> ToolResult:
+        self.calls.append(name)
+        content: dict[str, object]
+        if name == "list_pods":
+            content = {
+                "items": [
+                    {
+                        "name": "order-service-healthy",
+                        "phase": "Running",
+                        "ready": False,
+                        "restarts": 7,
+                        "revision": 2,
+                        "waiting_reasons": [],
+                    }
+                ]
+            }
+        elif name == "list_events":
+            content = {"items": [{"type": "Normal", "message": "Deployment available"}]}
+        elif name == "get_pod_logs":
+            content = {"lines": ["INFO: service healthy"]}
+        elif name == "get_rollout_history":
+            content = {
+                "current_revision": 2,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "status": "stable",
+                        "health_proof": {"valid": True, "status": "healthy"},
+                    },
+                    {
+                        "revision": 2,
+                        "replicas": 1,
+                        "ready_replicas": 1,
+                        "status": "stable",
+                        "health_status": "healthy",
+                    },
+                ],
+            }
+        elif name == "get_service_metrics":
+            content = {"error_rate": 0.0, "p95_ms": 120, "db_pool_utilization": 0.4}
+        else:
+            content = {}
+        return ToolResult(tool_name=name, success=True, content=content)
+
+
 def test_infers_runtime_state_fault_before_generic_inventory_failure() -> None:
     observations = {
         "logs": {
@@ -66,6 +117,105 @@ def test_empty_healthy_or_unrelated_observations_are_unknown(
     observations: dict[str, object],
 ) -> None:
     assert RuleBasedProvider._infer_scenario(observations) == "unknown"
+
+
+def test_restart_count_without_a_current_failure_state_is_unknown() -> None:
+    observations = {
+        "pods": {
+            "items": [
+                {
+                    "phase": "Running",
+                    "ready": False,
+                    "restarts": 7,
+                    "waiting_reasons": [],
+                }
+            ]
+        },
+        "events": {"items": [{"type": "Normal", "message": "Deployment available"}]},
+        "logs": {"lines": ["INFO: service healthy"]},
+        "metrics": {"scenario": "bad_rollout", "error_rate": 0.0},
+        "rollout": {
+            "current_revision": 2,
+            "revisions": [
+                {
+                    "revision": 2,
+                    "replicas": 1,
+                    "ready_replicas": 1,
+                    "status": "stable",
+                    "health_status": "healthy",
+                }
+            ],
+        },
+    }
+
+    assert RuleBasedProvider._infer_scenario(observations) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_bad_rollout_findings_require_matching_raw_predicates() -> None:
+    provider = RuleBasedProvider()
+    observations = {
+        "pods": {
+            "items": [
+                {"phase": "CrashLoopBackOff", "ready": False, "restarts": 7}
+            ]
+        },
+        "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+        "logs": {"lines": ["INFO: service healthy"]},
+        "rollout": {
+            "current_revision": 2,
+            "revisions": [{"revision": 2, "replicas": 1, "status": "stable"}],
+        },
+        "metrics": {"error_rate": 0.0},
+        "evidence_catalog": {
+            f"collect_context:1:tool:{key}": {
+                "evidence_id": f"collect_context:1:tool:{key}",
+                "source": source,
+                "tool": tool,
+                "success": True,
+            }
+            for key, source, tool in (
+                ("pods", "kubernetes_pods", "list_pods"),
+                ("events", "kubernetes_events", "list_events"),
+                ("logs", "kubernetes_logs", "get_pod_logs"),
+                ("rollout", "kubernetes_rollout", "get_rollout_history"),
+                ("metrics", "kubernetes_metrics", "get_service_metrics"),
+            )
+        },
+    }
+
+    diagnosis = await provider.structured(
+        system="diagnose",
+        prompt=json.dumps({"alert": {}, "observations": observations}),
+        schema=Diagnosis,
+    )
+
+    assert [item.query for item in diagnosis.hypotheses[0].evidence] == ["list_pods"]
+    assert "CrashLoopBackOff" not in " ".join(diagnosis.evidence_summary)
+    assert "错误峰值" not in diagnosis.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_restart_history_without_current_failure_escalates_without_a_write() -> None:
+    backend = RestartedButCurrentlyHealthyBackend()
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+
+    record = await agent.start(
+        Alert(
+            name="PodRestarted",
+            namespace="sentinelops-demo",
+            service="order-service",
+            summary="Pod has historical restarts",
+        )
+    )
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.plan is None
+    assert not {
+        "restart_deployment",
+        "rollback_deployment",
+        "scale_deployment",
+    }.intersection(backend.calls)
 
 
 @pytest.mark.parametrize(

@@ -1528,6 +1528,173 @@ def test_rollback_without_positive_health_marker_fails_closed() -> None:
     assert "没有可信健康标记" in feedback
 
 
+def test_rollback_requires_a_current_fault_or_trusted_change_correlation() -> None:
+    plan = RemediationPlan(
+        summary="回滚服务",
+        actions=[
+            RemediationAction(
+                tool_name="rollback_deployment",
+                arguments={"name": "order-service", "revision": 1},
+                rationale="上一版本健康",
+                expected_outcome="服务恢复",
+                risk=RiskLevel.HIGH,
+            )
+        ],
+        rollback="停止操作",
+        verification=["检查错误率"],
+    )
+    state = {
+        "alert": {"service": "order-service"},
+        "observations": {
+            "evidence_catalog": {
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                }
+            },
+            "pods": {
+                "items": [
+                    {
+                        "revision": 2,
+                        "phase": "Running",
+                        "ready": False,
+                        "restarts": 7,
+                        "waiting_reasons": [],
+                    }
+                ]
+            },
+            "events": {"items": [{"type": "Normal", "message": "No warnings"}]},
+            "logs": {"lines": ["INFO: service healthy"]},
+            "metrics": {"error_rate": 0.0, "p95_ms": 100},
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [
+                    {
+                        "revision": 1,
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "status": "stable",
+                        "health_proof": {"valid": True, "status": "healthy"},
+                    },
+                    {
+                        "revision": 2,
+                        "replicas": 1,
+                        "ready_replicas": 1,
+                        "status": "stable",
+                        "health_status": "healthy",
+                    },
+                ],
+            },
+        },
+    }
+
+    feedback = IncidentAgent._plan_feedback(state, plan)  # type: ignore[arg-type]
+
+    assert feedback is not None
+    assert "没有明确异常" in feedback
+
+
+def test_supporting_finding_must_match_server_raw_observation() -> None:
+    state = {
+        "observations": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+            "rollout": {
+                "current_revision": 2,
+                "revisions": [{"revision": 2, "replicas": 1, "status": "failed"}],
+            },
+            "evidence_catalog": {
+                "events": {
+                    "evidence_id": "events",
+                    "source": "kubernetes_events",
+                    "tool": "list_events",
+                    "success": True,
+                },
+                "rollout": {
+                    "evidence_id": "rollout",
+                    "source": "kubernetes_rollout",
+                    "tool": "get_rollout_history",
+                    "success": True,
+                },
+            },
+        }
+    }
+    diagnosis = Diagnosis(
+        root_cause="最新发布导致容器启动失败",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="最新发布导致容器启动失败",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件明确显示 CrashLoopBackOff",
+                    ),
+                    Evidence(
+                        evidence_id="rollout",
+                        source="kubernetes_rollout",
+                        query="get_rollout_history",
+                        finding="当前 revision 明确失败",
+                    ),
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+
+    assert "证据 events 的 finding 没有对应原始观测支持" in issues
+
+
+def test_model_supplied_raw_cannot_replace_server_observation() -> None:
+    state = {
+        "observations": {
+            "events": {"items": [{"type": "Normal", "message": "No warning events"}]},
+            "evidence_catalog": {
+                "events": {
+                    "evidence_id": "events",
+                    "source": "kubernetes_events",
+                    "tool": "list_events",
+                    "success": True,
+                }
+            },
+        }
+    }
+    diagnosis = Diagnosis(
+        root_cause="容器启动失败",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="容器启动失败",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件明确显示 CrashLoopBackOff",
+                        raw={"items": [{"message": "CrashLoopBackOff"}]},
+                    )
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    issues = IncidentAgent._diagnosis_evidence_issues(  # type: ignore[arg-type]
+        state, diagnosis
+    )
+
+    assert "证据 events 的 raw 与服务端原始观测不一致" in issues
+
+
 @pytest.mark.parametrize(
     "revision",
     [

@@ -10,7 +10,7 @@ from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.lab_profiles import build_simulated_lab_agent
 
 SCENARIOS = {
-    "bad_rollout": "损坏的应用镜像",
+    "bad_rollout": "明确的启动故障",
     "db_pool_exhaustion": "数据库连接池已耗尽",
 }
 
