@@ -392,6 +392,8 @@ class KubernetesBackend:
             "current_revision": int(current["revision"]),
             "current_replica_set_uid": current["uid"],
             "current_template_hash": current["template_hash"],
+            "current_replicas": int(current["replicas"]),
+            "current_ready_replicas": int(current["ready_replicas"]),
         }
         changed = [
             key

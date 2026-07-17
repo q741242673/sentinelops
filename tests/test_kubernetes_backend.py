@@ -91,6 +91,8 @@ def rollback_precondition(
         "current_revision": 2,
         "current_replica_set_uid": "replica-set-uid-2",
         "current_template_hash": "hash-2",
+        "current_replicas": 1,
+        "current_ready_replicas": 1,
         "rollback_target": {
             "revision": 1,
             "replica_set_uid": "replica-set-uid-1",
@@ -273,6 +275,34 @@ def test_backend_rejects_rollback_when_public_revision_differs_from_guard() -> N
                 "name": "order-service",
                 "revision": 2,
                 "_precondition": rollback_precondition(target),
+            }
+        )
+
+    backend.apps.replace_namespaced_deployment.assert_not_called()
+
+
+def test_backend_rejects_rollback_when_current_revision_self_recovers() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    deployment = ns(
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
+        spec=ns(paused=False, replicas=1),
+    )
+    target = replica_set(1, healthy_proof=True)
+    precondition = rollback_precondition(target)
+    precondition["current_ready_replicas"] = 0
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(
+        items=[target, replica_set(2)]
+    )
+
+    with pytest.raises(RuntimeError, match="current_ready_replicas"):
+        backend._tool_rollback_deployment(
+            {
+                "name": "order-service",
+                "revision": 1,
+                "_precondition": precondition,
             }
         )
 

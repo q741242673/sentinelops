@@ -146,6 +146,10 @@ class PreflightMutationSimulator(RecordingSimulator):
                 }
             if self.rollout_reads > 2 and self.mutation == "resource_version_only":
                 result.content["resource_version"] = "sim-rv-status-update"
+            if self.rollout_reads > 2 and self.mutation == "self_recovered":
+                current = result.content["revisions"][1]
+                current["ready_replicas"] = current["replicas"]
+                current["status"] = "stable"
             return result
         if name == "rollback_deployment" and self.mutation == "backend_guard_failure":
             self.calls.append(name)
@@ -761,7 +765,9 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mutation", ["new_revision", "proof_revoked", "read_failure"])
+@pytest.mark.parametrize(
+    "mutation", ["new_revision", "proof_revoked", "read_failure", "self_recovered"]
+)
 async def test_approval_is_invalidated_when_fresh_preflight_changes(
     mutation: str,
 ) -> None:
@@ -780,7 +786,11 @@ async def test_approval_is_invalidated_when_fresh_preflight_changes(
     assert record.approval is None
     assert record.execution_results == []
     assert "rollback_deployment" not in backend.calls
-    assert any(event.type == "approval.invalidated" for event in record.timeline)
+    invalidated = next(
+        event for event in record.timeline if event.type == "approval.invalidated"
+    )
+    if mutation == "self_recovered":
+        assert "current_ready_replicas" in invalidated.data["reason"]
     preflight = next(step for step in record.execution_trace if step.id == "preflight:1")
     assert preflight.status == "blocked"
     assert not any(step.id == "execute:1" for step in record.execution_trace)

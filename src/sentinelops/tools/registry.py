@@ -149,6 +149,15 @@ class ToolRegistry:
                 success=False,
                 error=validation_error,
             )
+        if self.specs[name].risk != RiskLevel.READ_ONLY:
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                error=(
+                    "Write tools require a host-generated execution precondition; "
+                    "run remediation through IncidentAgent"
+                ),
+            )
         return await self.backend.call(name, arguments)
 
     async def call_guarded(

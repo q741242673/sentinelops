@@ -102,10 +102,29 @@ async def test_registry_accepts_valid_write_argument_boundaries(
     backend.call.return_value = ToolResult(tool_name=tool_name, success=True)
     registry = ToolRegistry(backend)
 
-    result = await registry.call(tool_name, arguments)
+    result = await registry.call_guarded(tool_name, arguments, {"snapshot": "test"})
 
     assert result.success is True
-    backend.call.assert_awaited_once_with(tool_name, arguments)
+    guarded_arguments = backend.call.await_args.args[1]
+    assert {
+        key: value
+        for key, value in guarded_arguments.items()
+        if key != "_precondition"
+    } == arguments
+
+
+@pytest.mark.asyncio
+async def test_registry_plain_call_rejects_write_tools_even_with_valid_arguments() -> None:
+    backend = AsyncMock()
+    registry = ToolRegistry(backend)
+
+    result = await registry.call(
+        "rollback_deployment", {"name": "order-service", "revision": 1}
+    )
+
+    assert result.success is False
+    assert "host-generated execution precondition" in str(result.error)
+    backend.call.assert_not_awaited()
 
 
 @pytest.mark.asyncio

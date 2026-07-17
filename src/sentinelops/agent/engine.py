@@ -1433,6 +1433,8 @@ class IncidentAgent:
             raise ValueError("rollout 无法确定当前 revision")
         if not current.get("uid") or not current.get("template_hash"):
             raise ValueError("当前 revision 缺少 ReplicaSet UID 或 template hash")
+        if current.get("replicas") is None or current.get("ready_replicas") is None:
+            raise ValueError("当前 revision 缺少副本健康状态")
         captured_at = datetime.now(UTC)
         snapshot: dict[str, Any] = {
             "action_fingerprint": cls._action_fingerprint(action),
@@ -1447,6 +1449,8 @@ class IncidentAgent:
             "current_revision": int(current.get("revision", 0)),
             "current_replica_set_uid": str(current["uid"]),
             "current_template_hash": str(current["template_hash"]),
+            "current_replicas": int(current["replicas"]),
+            "current_ready_replicas": int(current["ready_replicas"]),
             "captured_at": captured_at.isoformat(),
             "expires_at": (captured_at + timedelta(minutes=15)).isoformat(),
         }
@@ -1495,6 +1499,8 @@ class IncidentAgent:
                 "current_revision",
                 "current_replica_set_uid",
                 "current_template_hash",
+                "current_replicas",
+                "current_ready_replicas",
                 "rollback_target",
             )
         }
