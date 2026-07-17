@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from langgraph.checkpoint.memory import MemorySaver
@@ -116,6 +117,9 @@ class IncidentAgent:
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         self.records: dict[str, IncidentRecord] = {}
+        self._resume_locks: dict[str, asyncio.Lock] = {}
+        self._approval_versions: dict[str, int] = {}
+        self._consumed_approval_ids: set[str] = set()
 
     def _build_graph(self):
         builder = StateGraph(IncidentState)
@@ -194,6 +198,7 @@ class IncidentAgent:
             else IncidentRecord(alert=alert, execution_profile_id=self.profile_id)
         )
         self.records[record.id] = record
+        self._resume_locks.setdefault(record.id, asyncio.Lock())
         timeline = [_event("incident.received", alert.summary)]
         if alert.labels.get("source") == "alertmanager":
             timeline.insert(
@@ -231,16 +236,102 @@ class IncidentAgent:
         self._publish(record)
         return record
 
-    async def resume(self, incident_id: str, *, approved: bool, note: str = "") -> IncidentRecord:
+    async def resume(
+        self,
+        incident_id: str,
+        *,
+        approval_id: str,
+        approval_version: int,
+        approved: bool,
+        note: str = "",
+    ) -> IncidentRecord:
         if incident_id not in self.records:
             raise KeyError(incident_id)
-        result = await self.graph.ainvoke(
-            Command(resume={"approved": approved, "note": note}),
-            self._config(incident_id),
+        lock = self._resume_locks.setdefault(incident_id, asyncio.Lock())
+        async with lock:
+            record = self.records[incident_id]
+            request = record.approval
+            if record.status != IncidentStatus.AWAITING_APPROVAL or request is None:
+                raise RuntimeError("该事故当前没有可处理的审批请求")
+            if approval_id != request.approval_id or approval_version != request.version:
+                raise RuntimeError("审批标识或版本已失效，请刷新后重新确认")
+            if approval_id in self._consumed_approval_ids:
+                raise RuntimeError("该审批请求已经处理，不能重复提交")
+            expires_at = request.expires_at
+            if expires_at.tzinfo is None or datetime.now(UTC) >= expires_at.astimezone(UTC):
+                self._consumed_approval_ids.add(approval_id)
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.ESCALATED,
+                    event_type="approval.expired",
+                    message="审批已过期，旧计划已失效并升级人工处理",
+                )
+                raise RuntimeError("该审批请求已过期，请重新调查后生成新计划")
+
+            # Consume before resuming the graph. The lock makes the state check and
+            # consumption atomic, while keeping a failed execution non-retryable.
+            self._consumed_approval_ids.add(approval_id)
+            try:
+                result = await self.graph.ainvoke(
+                    Command(resume={"approved": approved, "note": note}),
+                    self._config(incident_id),
+                )
+            except asyncio.CancelledError:
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.FAILED,
+                    event_type="approval.resume_cancelled",
+                    message="审批后的执行被取消，集群变更结果未知，已停止自动处理",
+                    execution_outcome="unknown",
+                )
+                raise
+            except Exception as exc:
+                self._close_consumed_approval(
+                    record,
+                    request,
+                    status=IncidentStatus.FAILED,
+                    event_type="approval.resume_failed",
+                    message="审批已消费，但后续执行异常；为避免重复写入已停止重试",
+                    error=str(exc),
+                )
+                raise RuntimeError("审批后的执行异常，审批已失效且不会自动重试") from exc
+            record = self._sync_record(incident_id, result)
+            self._publish(record)
+            return record
+
+    def _close_consumed_approval(
+        self,
+        record: IncidentRecord,
+        request: ApprovalRequest,
+        *,
+        status: IncidentStatus,
+        event_type: str,
+        message: str,
+        **data: Any,
+    ) -> None:
+        now = datetime.now(UTC)
+        record.status = status
+        record.approval = None
+        for step in record.execution_trace:
+            if step.status == "running":
+                step.status = "failed"
+                step.completed_at = now
+                step.detail = "执行被中断，结果未知，已停止自动处理"
+        record.active_step_id = None
+        record.timeline.append(
+            TimelineEvent(
+                type=event_type,
+                message=message,
+                data={
+                    "approval_id": request.approval_id,
+                    "approval_version": request.version,
+                    **data,
+                },
+            )
         )
-        record = self._sync_record(incident_id, result)
         self._publish(record)
-        return record
 
     def get(self, incident_id: str) -> IncidentRecord:
         return self.records[incident_id]
@@ -1249,12 +1340,92 @@ class IncidentAgent:
                     f"{action.tool_name} 风险等级被低报："
                     f"declared={action.risk.value}, minimum={spec.risk.value}"
                 )
-        return self._plan_feedback(
+        feedback = self._plan_feedback(
             state,
             plan,
             specs,
             allowed_targets=allowed_targets,
         )
+        if feedback is not None:
+            return feedback
+        return self._causal_action_feedback(state, plan.actions[0])
+
+    def _causal_action_feedback(
+        self,
+        state: IncidentState,
+        action: RemediationAction,
+    ) -> str | None:
+        observations = state.get("observations", {})
+        logs = json.dumps(observations.get("logs", {}), ensure_ascii=False).casefold()
+        metrics = observations.get("metrics", {})
+
+        if action.tool_name == "restart_deployment":
+            db_pool_log = any(
+                marker in logs
+                for marker in (
+                    "timeout acquiring database connection from pool",
+                    "database connection pool exhausted",
+                    "db_pool_exhaustion",
+                )
+            )
+            db_pool_utilization = self._numeric_metric(metrics, "db_pool_utilization")
+            db_pool_fault = db_pool_log and (
+                db_pool_utilization is not None and db_pool_utilization >= 0.95
+            )
+            runbook_proof = self.runbook.action_causal_precondition(state, action)
+            if not (db_pool_fault or runbook_proof):
+                return (
+                    "restart_deployment 缺少可验证的重启因果条件；需要明确的进程内故障标记，"
+                    "或连接池超时日志与高利用率指标同时成立"
+                )
+
+        if action.tool_name == "scale_deployment":
+            rollout = observations.get("rollout", {})
+            requested_replicas = self._numeric_metric(
+                action.arguments, "replicas"
+            )
+            desired_replicas = self._numeric_metric(rollout, "desired_replicas")
+            if requested_replicas is None or desired_replicas is None:
+                return "scale_deployment 缺少当前或目标副本数，无法验证扩容方向"
+            if requested_replicas <= desired_replicas:
+                return (
+                    "容量饱和证据只允许正向扩容；目标副本数必须大于当前 desired replicas "
+                    f"{int(desired_replicas)}"
+                )
+            saturation = max(
+                (
+                    value
+                    for key in (
+                        "cpu_utilization",
+                        "memory_utilization",
+                        "queue_utilization",
+                        "db_pool_utilization",
+                    )
+                    if (value := self._numeric_metric(metrics, key)) is not None
+                ),
+                default=0,
+            )
+            error_rate = self._numeric_metric(metrics, "error_rate") or 0
+            p95_ms = self._numeric_metric(metrics, "p95_ms") or 0
+            if saturation < 0.9 or (error_rate < 0.05 and p95_ms < 1000):
+                return (
+                    "scale_deployment 缺少可验证的容量饱和证据；需要利用率达到 90% 以上，"
+                    "并同时出现错误率或延迟恶化"
+                )
+        return None
+
+    @staticmethod
+    def _numeric_metric(metrics: Any, key: str) -> float | None:
+        if not isinstance(metrics, dict):
+            return None
+        value = metrics.get(key)
+        if isinstance(value, bool):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
 
     @staticmethod
     def _plan_feedback(
@@ -1379,6 +1550,21 @@ class IncidentAgent:
             separators=(",", ":"),
         ).encode()
         return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+    @staticmethod
+    def _namespace_feedback(state: IncidentState, rollout: dict[str, Any]) -> str | None:
+        alert_namespace = state.get("alert", {}).get("namespace")
+        rollout_namespace = rollout.get("namespace")
+        if not isinstance(alert_namespace, str) or not alert_namespace.strip():
+            return "告警没有合法的 namespace，无法确定写操作边界"
+        if not isinstance(rollout_namespace, str) or not rollout_namespace.strip():
+            return "rollout 证据没有合法的 namespace，无法确定写操作边界"
+        if alert_namespace != rollout_namespace:
+            return (
+                f"告警 namespace {alert_namespace!r} 与实际工作负载 namespace "
+                f"{rollout_namespace!r} 不一致"
+            )
+        return None
 
     @staticmethod
     def _active_revision(rollout: dict[str, Any]) -> dict[str, Any] | None:
@@ -1549,6 +1735,9 @@ class IncidentAgent:
             return self._preflight_rejected(
                 f"进入审批前无法读取最新 rollout history：{rollout.error or 'unknown error'}"
             )
+        namespace_feedback = self._namespace_feedback(state, rollout.content)
+        if namespace_feedback is not None:
+            return self._preflight_rejected(f"进入审批前命名空间校验失败：{namespace_feedback}")
         plan = RemediationPlan.model_validate(state["plan"])
         feedback = self._fresh_plan_feedback(
             state,
@@ -1583,7 +1772,11 @@ class IncidentAgent:
                     )
                 ],
             }
+        approval_version = self._approval_versions.get(state["incident_id"], 0) + 1
+        self._approval_versions[state["incident_id"]] = approval_version
         request = ApprovalRequest(
+            approval_id=str(uuid4()),
+            version=approval_version,
             incident_id=state["incident_id"],
             action=action,
             reason=f"{action.risk.value} 风险操作需要人工明确批准",
@@ -1598,6 +1791,8 @@ class IncidentAgent:
                 _event(
                     "approval.requested",
                     request.reason,
+                    approval_id=request.approval_id,
+                    approval_version=request.version,
                     execution_profile_id=self.profile_id,
                     configured_max_risk=self.policy.auto_approve_max_risk.value,
                 )
@@ -1610,10 +1805,12 @@ class IncidentAgent:
         return "human_gate" if state.get("approval_request") else "preflight"
 
     async def _human_gate(self, state: IncidentState) -> dict[str, Any]:
-        decision = interrupt(state["approval_request"])
+        request = ApprovalRequest.model_validate(state["approval_request"])
+        decision = interrupt(request.model_dump(mode="json"))
         approved = bool(decision.get("approved"))
         return {
             "approved": approved,
+            "approval_request": None,
             "status": (
                 IncidentStatus.REMEDIATING.value if approved else IncidentStatus.REJECTED.value
             ),
@@ -1621,6 +1818,9 @@ class IncidentAgent:
                 _event(
                     "approval.decided",
                     "修复操作已批准" if approved else "修复操作已拒绝",
+                    approval_id=request.approval_id,
+                    approval_version=request.version,
+                    approved=approved,
                     note=decision.get("note", ""),
                 )
             ],
@@ -1651,6 +1851,9 @@ class IncidentAgent:
             return self._preflight_rejected(
                 f"无法重新读取最新 rollout history：{result.error or 'unknown error'}"
             )
+        namespace_feedback = self._namespace_feedback(state, result.content)
+        if namespace_feedback is not None:
+            return self._preflight_rejected(f"执行前命名空间校验失败：{namespace_feedback}")
         try:
             current = self._build_preflight_snapshot(action, result.content)
         except (TypeError, ValueError) as exc:

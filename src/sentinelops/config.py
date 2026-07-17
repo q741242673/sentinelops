@@ -21,6 +21,8 @@ class Settings(BaseSettings):
     model_base_url: str | None = None
     model_api_key: SecretStr | None = None
     kubernetes_namespace: str = "sentinelops-demo"
+    demo_enabled: bool = False
+    demo_namespace: str = "sentinelops-demo"
     auto_approve_max_risk: Literal["read_only", "low", "medium", "high", "critical"] = "low"
     prometheus_url: str | None = None
     loki_url: str | None = None

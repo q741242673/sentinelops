@@ -8,10 +8,38 @@ from httpx import ASGITransport, AsyncClient
 
 import sentinelops.api as api_module
 from sentinelops.api import app
+from sentinelops.config import Settings
 
 
 @pytest.mark.asyncio
-async def test_api_incident_approval_flow() -> None:
+async def test_demo_routes_are_hidden_when_demo_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=False),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in (
+            "/api/v1/demo/incidents",
+            "/api/v1/demo/faults",
+            "/api/v1/demo/auto-faults",
+            "/api/v1/demo/reflection-faults",
+            "/api/v1/demo/reset",
+        ):
+            response = await client.post(path)
+            assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_api_incident_approval_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=True),
+    )
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post(
@@ -69,10 +97,27 @@ async def test_api_incident_approval_flow() -> None:
 
         decided = await client.post(
             f"/api/v1/incidents/{incident['id']}/approval",
-            json={"approved": True, "note": "approved in API test"},
+            json={
+                "approval_id": incident["approval"]["approval_id"],
+                "approval_version": incident["approval"]["version"],
+                "approved": True,
+                "note": "approved in API test",
+            },
         )
         assert decided.status_code == 200
         assert decided.json()["status"] == "resolved"
+        assert decided.json()["approval"] is None
+
+        duplicate = await client.post(
+            f"/api/v1/incidents/{incident['id']}/approval",
+            json={
+                "approval_id": incident["approval"]["approval_id"],
+                "approval_version": incident["approval"]["version"],
+                "approved": True,
+                "note": "duplicate approval",
+            },
+        )
+        assert duplicate.status_code == 409
 
         fetched = await client.get(f"/api/v1/incidents/{incident['id']}")
         assert fetched.status_code == 200
@@ -91,6 +136,28 @@ async def test_api_incident_approval_flow() -> None:
         assert second.status_code == 201
         assert second.json()["status"] == "awaiting_approval"
         assert second.json()["id"] != incident["id"]
+
+
+@pytest.mark.asyncio
+async def test_direct_api_alert_namespace_mismatch_never_reaches_approval() -> None:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/incidents",
+            json={
+                "name": "HighOrderServiceErrorRate",
+                "namespace": "payments-prod",
+                "service": "order-service",
+                "severity": "critical",
+                "summary": "Namespace mismatch regression",
+            },
+        )
+
+    assert created.status_code == 201
+    incident = created.json()
+    assert incident["status"] == "escalated"
+    assert incident["approval"] is None
+    assert incident["execution_results"] == []
 
 
 @pytest.mark.asyncio

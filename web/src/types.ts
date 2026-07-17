@@ -105,7 +105,13 @@ export interface Incident {
   reflection_rounds: number;
   change_evidence: ChangeEvidence | null;
   plan: RemediationPlan | null;
-  approval: unknown | null;
+  approval: {
+    approval_id: string;
+    version: number;
+    incident_id: string;
+    reason: string;
+    expires_at: string;
+  } | null;
   execution_results: Array<{
     tool_name: string;
     success: boolean;

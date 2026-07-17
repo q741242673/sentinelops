@@ -31,9 +31,12 @@ async def run_incident(agent, alert: Alert, *, approve: bool) -> None:
     if approve and record.status != IncidentStatus.AWAITING_APPROVAL:
         raise SystemExit(f"Expected an approval request, got status={record.status.value}")
     if record.status == IncidentStatus.AWAITING_APPROVAL and approve:
+        assert record.approval is not None
         print("\n--- approving remediation ---\n")
         record = await agent.resume(
             record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
             approved=True,
             note="Approved by local demo operator",
         )
