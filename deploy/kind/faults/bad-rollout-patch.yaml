@@ -4,6 +4,8 @@ spec:
       annotations:
         sentinelops.io/version: "1.1.0-broken"
         sentinelops.io/fault: bad-rollout
+        sentinelops.io/change-cause: "bad-rollout"
+        sentinelops.io/health-status: null
     spec:
       containers:
         - name: order-service
@@ -11,4 +13,3 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - "echo 'FATAL: application configuration is invalid'; exit 1"
-

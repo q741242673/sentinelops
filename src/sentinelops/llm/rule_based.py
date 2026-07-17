@@ -9,6 +9,7 @@ from sentinelops.domain import (
     Diagnosis,
     DiagnosisReview,
     Evidence,
+    EvidenceCatalogEntry,
     FollowUpQuery,
     Hypothesis,
     RemediationAction,
@@ -105,93 +106,74 @@ class RuleBasedProvider:
     def _diagnose(self, scenario: str, observations: dict[str, Any]) -> Diagnosis:
         current_revision, _ = self._rollout_revisions(observations)
         if scenario == "transient_runtime_fault":
-            evidence = [
-                Evidence(
-                    source="prometheus",
-                    query="query_prometheus",
-                    finding="Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
-                    raw=observations.get("prometheus", {}),
+            candidates = [
+                ("get_pod_logs", "logs", "Pod 日志显示瞬态运行时故障已启用且需要重启清除"),
+                ("get_service_metrics", "metrics", "工作负载指标确认进程内瞬态故障处于活动状态"),
+                (
+                    "query_prometheus",
+                    "prometheus",
+                    "Prometheus 检测到库存服务的进程内瞬态故障指标为 1",
                 ),
-                Evidence(
-                    source="loki",
-                    query="search_loki",
-                    finding="Loki 日志显示 transient_runtime_fault 已启用且需要重启清除",
-                    raw=observations.get("loki", {}),
+                (
+                    "search_loki",
+                    "loki",
+                    "Loki 日志显示 transient_runtime_fault 已启用且需要重启清除",
                 ),
-                Evidence(
-                    source="kubernetes.rollout",
-                    query="get_rollout_history",
-                    finding="Kubernetes 发布历史没有出现与本次故障对应的新 revision",
-                    raw=observations.get("rollout", {}),
+                (
+                    "get_rollout_history",
+                    "rollout",
+                    "Kubernetes 发布历史没有出现与本次故障对应的新 revision",
                 ),
             ]
             root_cause = "库存服务进程内的瞬态故障状态导致所有预留请求返回 HTTP 503"
-            hypothesis = "进程内异常状态而非发布变更导致库存服务不可用"
         elif scenario == "inventory_faulty_rollout":
-            evidence = [
-                Evidence(
-                    source="prometheus",
-                    query="query_prometheus",
-                    finding="库存服务请求指标中出现 HTTP 503 响应",
-                    raw=observations.get("prometheus", {}),
-                ),
-                Evidence(
-                    source="loki",
-                    query="search_loki",
-                    finding="库存服务日志记录了合成的预留超时",
-                    raw=observations.get("loki", {}),
-                ),
-                Evidence(
-                    source="tempo",
-                    query="get_trace",
-                    finding="失败的结账链路经过库存服务并在此发生错误",
-                    raw=observations.get("trace", {}),
-                ),
-                Evidence(
-                    source="kubernetes.rollout",
-                    query="get_rollout_history",
-                    finding=f"产生错误的配置来自 Deployment revision {current_revision}",
-                    raw=observations.get("rollout", {}),
+            candidates = [
+                ("get_pod_logs", "logs", "库存服务日志记录了合成的预留超时"),
+                ("get_service_metrics", "metrics", "工作负载指标显示库存服务错误率升高"),
+                ("query_prometheus", "prometheus", "库存服务请求指标中出现 HTTP 503 响应"),
+                ("search_loki", "loki", "Loki 日志记录了合成的预留超时"),
+                ("get_trace", "trace", "失败的结账链路经过库存服务并在此发生错误"),
+                (
+                    "get_rollout_history",
+                    "rollout",
+                    f"产生错误的配置来自 Deployment revision {current_revision}",
                 ),
             ]
             root_cause = (
                 f"库存服务 Deployment revision {current_revision} 启用了合成预留故障"
             )
-            hypothesis = "最新的库存服务配置发布引入了 HTTP 503 错误"
         elif scenario == "bad_rollout":
-            evidence = [
-                Evidence(
-                    source="kubernetes.events",
-                    query="list_events",
-                    finding="新 Pod 在发布后立即进入 CrashLoopBackOff",
-                    raw=observations.get("events", {}),
+            candidates = [
+                ("list_events", "events", "新 Pod 在发布后立即进入 CrashLoopBackOff"),
+                (
+                    "get_rollout_history",
+                    "rollout",
+                    f"错误峰值从 Deployment revision {current_revision} 发布后开始",
                 ),
-                Evidence(
-                    source="kubernetes.rollout",
-                    query="get_rollout_history",
-                    finding=f"错误峰值从 Deployment revision {current_revision} 发布后开始",
-                    raw=observations.get("rollout", {}),
-                ),
+                ("get_pod_logs", "logs", "Pod 日志显示发布后的启动配置错误"),
             ]
             root_cause = f"Deployment revision {current_revision} 包含损坏的应用镜像"
-            hypothesis = "最新一次发布引入了本次事故"
         else:
-            evidence = [
-                Evidence(
-                    source="kubernetes.logs",
-                    query="get_pod_logs",
-                    finding="请求在获取数据库连接时失败",
-                    raw=observations.get("logs", {}),
-                ),
-                Evidence(
-                    source="metrics",
-                    query="get_service_metrics",
-                    finding="数据库连接池利用率达到 100%",
-                    raw=observations.get("metrics", {}),
-                ),
+            candidates = [
+                ("get_pod_logs", "logs", "请求在获取数据库连接时失败"),
+                ("get_service_metrics", "metrics", "数据库连接池利用率达到 100%"),
+                ("list_pods", "pods", "Pod 仍可运行但请求处理能力下降"),
             ]
             root_cause = "订单服务的数据库连接池已耗尽"
-            hypothesis = "订单服务耗尽了可用数据库连接"
+
+        evidence = [
+            reference
+            for tool, raw_key, finding in candidates
+            if (
+                reference := self._catalog_evidence(
+                    observations,
+                    tool=tool,
+                    raw_key=raw_key,
+                    finding=finding,
+                )
+            )
+            is not None
+        ]
 
         changes = observations.get("changes", {})
         if changes.get("correlation_status") in {
@@ -199,20 +181,47 @@ class RuleBasedProvider:
             "no_code_change",
             "current_commit_verified",
         }:
-            evidence.append(
-                Evidence(
-                    source="git.change",
-                    query="get_change_evidence",
-                    finding=str(changes.get("correlation_summary")),
-                    raw=changes,
-                )
+            change_reference = self._catalog_evidence(
+                observations,
+                tool="get_change_evidence",
+                raw_key="changes",
+                finding=str(changes.get("correlation_summary")),
             )
+            if change_reference is not None:
+                evidence.append(change_reference)
 
         return Diagnosis(
             root_cause=root_cause,
             confidence=0.94,
-            hypotheses=[Hypothesis(statement=hypothesis, confidence=0.94, evidence=evidence)],
+            hypotheses=[Hypothesis(statement=root_cause, confidence=0.94, evidence=evidence)],
             evidence_summary=[item.finding for item in evidence],
+        )
+
+    @staticmethod
+    def _catalog_evidence(
+        observations: dict[str, Any],
+        *,
+        tool: str,
+        raw_key: str,
+        finding: str,
+    ) -> Evidence | None:
+        matches: list[EvidenceCatalogEntry] = []
+        for payload in observations.get("evidence_catalog", {}).values():
+            try:
+                entry = EvidenceCatalogEntry.model_validate(payload)
+            except (TypeError, ValueError):
+                continue
+            if entry.tool == tool and entry.success:
+                matches.append(entry)
+        if not matches:
+            return None
+        entry = matches[-1]
+        return Evidence(
+            evidence_id=entry.evidence_id,
+            source=entry.source,
+            query=entry.tool,
+            finding=finding,
+            raw=observations.get(raw_key, {}),
         )
 
     def _plan(self, scenario: str, payload: dict[str, Any]) -> RemediationPlan:
@@ -243,7 +252,10 @@ class RuleBasedProvider:
         elif scenario == "bad_rollout":
             action = RemediationAction(
                 tool_name="rollback_deployment",
-                arguments={"name": "order-service", "revision": previous_revision},
+                arguments={
+                    "name": payload["alert"]["service"],
+                    "revision": previous_revision,
+                },
                 rationale=(
                     f"事故与 revision {current_revision} 强相关，并且该版本的 Pod 不健康"
                 ),
@@ -255,7 +267,7 @@ class RuleBasedProvider:
         else:
             action = RemediationAction(
                 tool_name="restart_deployment",
-                arguments={"name": "order-service"},
+                arguments={"name": payload["alert"]["service"]},
                 rationale="在保留期望状态的同时回收泄漏的数据库连接",
                 expected_outcome=(
                     "连接池利用率和请求错误率回到基线"

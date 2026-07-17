@@ -12,6 +12,13 @@ from kubernetes import client, config
 from kubernetes.config.config_exception import ConfigException
 
 from sentinelops.domain import ToolResult
+from sentinelops.revision_health import (
+    build_health_proof_annotations,
+    revision_subject,
+    runtime_image_fingerprint,
+    verify_health_proof,
+)
+from sentinelops.tools.base import tool_call_fingerprint
 
 
 class KubernetesBackend:
@@ -136,9 +143,18 @@ class KubernetesBackend:
             _request_timeout=self._api_timeout(),
         )
         owned = self._owned_replica_sets(deployment, replica_sets.items)
+        deployment_annotations = getattr(deployment.metadata, "annotations", None) or {}
         return {
             "deployment": name,
+            "namespace": self.namespace,
+            "deployment_uid": str(deployment.metadata.uid),
             "generation": deployment.metadata.generation,
+            "resource_version": str(deployment.metadata.resource_version),
+            "desired_replicas": deployment.spec.replicas or 0,
+            "paused": bool(deployment.spec.paused),
+            "current_revision": int(
+                deployment_annotations.get("deployment.kubernetes.io/revision", "0")
+            ),
             "observed_generation": deployment.status.observed_generation,
             "revisions": [self._replica_set_summary(rs) for rs in owned],
         }
@@ -150,7 +166,9 @@ class KubernetesBackend:
             replica_set
             for replica_set in replica_sets
             if any(
-                owner.uid == deployment_uid and owner.kind == "Deployment"
+                owner.uid == deployment_uid
+                and owner.kind == "Deployment"
+                and getattr(owner, "controller", False) is True
                 for owner in (replica_set.metadata.owner_references or [])
             )
         ]
@@ -168,16 +186,134 @@ class KubernetesBackend:
         annotations = replica_set.metadata.annotations or {}
         template_annotations = replica_set.spec.template.metadata.annotations or {}
         containers = replica_set.spec.template.spec.containers or []
+        labels = replica_set.metadata.labels or {}
+        owners = replica_set.metadata.owner_references or []
+        deployment_owner = next(
+            (
+                owner
+                for owner in owners
+                if owner.kind == "Deployment" and getattr(owner, "controller", False) is True
+            ),
+            None,
+        )
+        revision = annotations.get("deployment.kubernetes.io/revision", "0")
+        proof = verify_health_proof(
+            annotations,
+            deployment_uid=str(getattr(deployment_owner, "uid", "")),
+            replica_set_uid=str(replica_set.metadata.uid or ""),
+            revision=revision,
+            template_hash=labels.get("pod-template-hash", ""),
+            containers=[(container.name, container.image) for container in containers],
+            git_commit=template_annotations.get("sentinelops.io/git-commit", ""),
+        )
         return {
             "name": replica_set.metadata.name,
-            "revision": int(annotations.get("deployment.kubernetes.io/revision", "0")),
+            "uid": str(replica_set.metadata.uid),
+            "template_hash": labels.get("pod-template-hash", ""),
+            "revision": int(revision),
             "images": [container.image for container in containers],
             "change_cause": template_annotations.get("sentinelops.io/change-cause"),
+            "health_status": proof["status"],
+            "health_proof": proof,
             "git_commit": template_annotations.get("sentinelops.io/git-commit"),
             "repository": template_annotations.get("sentinelops.io/repository"),
             "source_path": template_annotations.get("sentinelops.io/source-path"),
             "replicas": replica_set.status.replicas or 0,
             "ready_replicas": replica_set.status.ready_replicas or 0,
+        }
+
+    def _attest_current_revision_healthy(
+        self,
+        name: str,
+        *,
+        verifier: str = "sentinelops-demo-controller",
+    ) -> dict[str, Any]:
+        """Write a health proof to the exact ready ReplicaSet, never its Pod template."""
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
+        if not owned:
+            raise RuntimeError(f"No owned ReplicaSet found for {name}")
+        target = owned[-1]
+        desired = target.spec.replicas or 0
+        if desired <= 0 or (target.status.ready_replicas or 0) != desired:
+            raise RuntimeError(f"Current ReplicaSet for {name} is not fully ready")
+
+        labels = target.metadata.labels or {}
+        template_hash = labels.get("pod-template-hash", "")
+        if not template_hash:
+            raise RuntimeError(f"Current ReplicaSet for {name} has no pod-template-hash")
+        pods = self.core.list_namespaced_pod(
+            self.namespace,
+            label_selector=f"app={name},pod-template-hash={template_hash}",
+            _request_timeout=self._api_timeout(),
+        )
+        ready_image_ids: dict[str, set[str]] = {}
+        ready_pods = 0
+        for pod in pods.items:
+            if not any(
+                owner.uid == target.metadata.uid
+                and owner.kind == "ReplicaSet"
+                and getattr(owner, "controller", False) is True
+                for owner in (pod.metadata.owner_references or [])
+            ):
+                continue
+            statuses = pod.status.container_statuses or []
+            if not statuses or not all(status.ready and status.image_id for status in statuses):
+                continue
+            ready_pods += 1
+            for status in statuses:
+                ready_image_ids.setdefault(status.name, set()).add(status.image_id)
+        if ready_pods < desired:
+            raise RuntimeError(f"Ready Pods for {name} do not provide complete runtime image IDs")
+
+        containers = target.spec.template.spec.containers or []
+        expected_names = {container.name for container in containers}
+        if set(ready_image_ids) != expected_names or any(
+            len(image_ids) != 1 for image_ids in ready_image_ids.values()
+        ):
+            raise RuntimeError(f"Runtime images for {name} are incomplete or inconsistent")
+        runtime_images = runtime_image_fingerprint(
+            [
+                (container_name, next(iter(image_ids)))
+                for container_name, image_ids in ready_image_ids.items()
+            ]
+        )
+        annotations = target.metadata.annotations or {}
+        revision = annotations.get("deployment.kubernetes.io/revision", "0")
+        template_annotations = target.spec.template.metadata.annotations or {}
+        subject = revision_subject(
+            deployment_uid=str(deployment.metadata.uid),
+            replica_set_uid=str(target.metadata.uid),
+            revision=revision,
+            template_hash=template_hash,
+            containers=[(container.name, container.image) for container in containers],
+            runtime_images=runtime_images,
+            git_commit=template_annotations.get("sentinelops.io/git-commit", ""),
+        )
+        proof_annotations = build_health_proof_annotations(
+            subject,
+            verified_at=datetime.now(UTC),
+            verifier=verifier,
+        )
+        self.apps.patch_namespaced_replica_set(
+            target.metadata.name,
+            self.namespace,
+            {"metadata": {"annotations": proof_annotations}},
+            _request_timeout=self._api_timeout(),
+        )
+        return {
+            "replica_set": target.metadata.name,
+            "revision": int(revision),
+            "health_proof": {"valid": True, "status": "healthy"},
         }
 
     def _tool_get_service_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -192,6 +328,131 @@ class KubernetesBackend:
             "availability": available / desired if desired else 0,
             "note": "Connect Prometheus MCP for request-level SLI metrics",
         }
+
+    def _validated_write_context(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        expected_tool_name: str,
+    ) -> tuple[Any, list[Any]]:
+        precondition = arguments.get("_precondition")
+        if not isinstance(precondition, dict):
+            raise RuntimeError("Missing host-generated execution precondition")
+        public_arguments = {
+            key: value for key, value in arguments.items() if key != "_precondition"
+        }
+        if (
+            precondition.get("guarded_tool_name") != expected_tool_name
+            or precondition.get("public_arguments_fingerprint")
+            != tool_call_fingerprint(expected_tool_name, public_arguments)
+        ):
+            raise RuntimeError(
+                "Execution precondition failed: guarded tool or arguments changed"
+            )
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        replica_sets = self.apps.list_namespaced_replica_set(
+            self.namespace,
+            label_selector=f"app={name}",
+            _request_timeout=self._api_timeout(),
+        )
+        owned = self._owned_replica_sets(deployment, replica_sets.items)
+        summaries = [self._replica_set_summary(item) for item in owned]
+        deployment_annotations = getattr(deployment.metadata, "annotations", None) or {}
+        declared_revision = int(
+            deployment_annotations.get("deployment.kubernetes.io/revision", "0")
+        )
+        current = next(
+            (item for item in summaries if int(item["revision"]) == declared_revision),
+            None,
+        )
+        if current is None:
+            active = [
+                item
+                for item in summaries
+                if (item.get("replicas") or 0) > 0
+                or (item.get("ready_replicas") or 0) > 0
+            ]
+            current = (
+                max(active, key=lambda item: int(item["revision"])) if active else None
+            )
+        if current is None:
+            raise RuntimeError("Execution precondition failed: current revision is unknown")
+        actual = {
+            "namespace": self.namespace,
+            "target": name,
+            "deployment_uid": str(deployment.metadata.uid),
+            "generation": int(deployment.metadata.generation),
+            "resource_version": str(deployment.metadata.resource_version),
+            "desired_replicas": int(deployment.spec.replicas or 0),
+            "paused": bool(deployment.spec.paused),
+            "current_revision": int(current["revision"]),
+            "current_replica_set_uid": current["uid"],
+            "current_template_hash": current["template_hash"],
+            "current_replicas": int(current["replicas"]),
+            "current_ready_replicas": int(current["ready_replicas"]),
+        }
+        changed = [
+            key
+            for key, value in actual.items()
+            if precondition.get(key) != value
+        ]
+        if changed:
+            raise RuntimeError(
+                "Execution precondition failed: " + ", ".join(changed)
+            )
+
+        rollback_target = precondition.get("rollback_target")
+        if expected_tool_name == "rollback_deployment" and not isinstance(
+            rollback_target, dict
+        ):
+            raise RuntimeError(
+                "Execution precondition failed: rollback health proof is missing"
+            )
+        if rollback_target is not None:
+            if (
+                expected_tool_name != "rollback_deployment"
+                or int(rollback_target.get("revision", -1))
+                != int(public_arguments.get("revision", -2))
+            ):
+                raise RuntimeError(
+                    "Execution precondition failed: rollback target changed"
+                )
+            target = next(
+                (
+                    item
+                    for item in summaries
+                    if int(item["revision"]) == int(rollback_target["revision"])
+                ),
+                None,
+            )
+            expected_proof = rollback_target.get("health_proof")
+            actual_proof = target.get("health_proof") if target else None
+            proof_identity = (
+                {
+                    "subject": actual_proof.get("subject"),
+                    "version": actual_proof.get("version"),
+                    "verified_at": actual_proof.get("verified_at"),
+                    "verifier": actual_proof.get("verifier"),
+                }
+                if isinstance(actual_proof, dict)
+                else None
+            )
+            if (
+                target is None
+                or target["uid"] != rollback_target.get("replica_set_uid")
+                or not isinstance(actual_proof, dict)
+                or actual_proof.get("valid") is not True
+                or actual_proof.get("status") != "healthy"
+                or proof_identity != expected_proof
+            ):
+                raise RuntimeError(
+                    "Execution precondition failed: rollback health proof changed"
+                )
+        return deployment, owned
 
     def _tool_inject_demo_fault(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Inject the portfolio demo fault without exposing it as an Agent tool."""
@@ -225,6 +486,7 @@ class KubernetesBackend:
                             "sentinelops.io/change-cause": (
                                 "enable-every-third-inventory-failure"
                             ),
+                            "sentinelops.io/health-status": None,
                             "sentinelops.io/fault-injected-at": injected_at,
                         }
                     },
@@ -275,7 +537,11 @@ class KubernetesBackend:
 
     def _tool_restart_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
+        deployment, _ = self._validated_write_context(
+            name, arguments, "restart_deployment"
+        )
         body = {
+            "metadata": {"resourceVersion": deployment.metadata.resource_version},
             "spec": {
                 "template": {
                     "metadata": {
@@ -298,6 +564,7 @@ class KubernetesBackend:
                     "metadata": {
                         "annotations": {
                             "sentinelops.io/change-cause": "healthy-baseline",
+                            "sentinelops.io/health-status": None,
                             "sentinelops.io/baseline-restored-at": restored_at,
                         }
                     },
@@ -336,10 +603,12 @@ class KubernetesBackend:
             ):
                 history = self._tool_get_rollout_history({"name": name})
                 active = [item for item in history["revisions"] if item["replicas"] > 0]
+                proof = self._attest_current_revision_healthy(name)
                 return {
                     "deployment": name,
                     "baseline_restored": True,
-                    "revision": active[-1]["revision"] if active else None,
+                    "revision": proof["revision"] if active else None,
+                    "health_proof": proof["health_proof"],
                 }
             time.sleep(0.5)
         raise RuntimeError(f"Timed out waiting for the healthy baseline rollout on {name}")
@@ -347,15 +616,11 @@ class KubernetesBackend:
     def _tool_rollback_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         target_revision = int(arguments["revision"])
-        deployment = self.apps.read_namespaced_deployment(name, self.namespace)
+        deployment, owned = self._validated_write_context(
+            name, arguments, "rollback_deployment"
+        )
         if deployment.spec.paused:
             raise RuntimeError("Cannot rollback a paused deployment")
-
-        replica_sets = self.apps.list_namespaced_replica_set(
-            self.namespace,
-            label_selector=f"app={name}",
-        )
-        owned = self._owned_replica_sets(deployment, replica_sets.items)
         target = next(
             (
                 replica_set
@@ -377,6 +642,7 @@ class KubernetesBackend:
 
         deployment.spec.template = copy.deepcopy(target.spec.template)
         annotations = deployment.spec.template.metadata.annotations or {}
+        annotations.pop("sentinelops.io/health-status", None)
         annotations["sentinelops.io/rolledBackAt"] = datetime.now(UTC).isoformat()
         deployment.spec.template.metadata.annotations = annotations
         self.apps.replace_namespaced_deployment(
@@ -394,7 +660,15 @@ class KubernetesBackend:
     def _tool_scale_deployment(self, arguments: dict[str, Any]) -> dict[str, Any]:
         name = arguments["name"]
         replicas = int(arguments["replicas"])
+        deployment, _ = self._validated_write_context(
+            name, arguments, "scale_deployment"
+        )
         self.apps.patch_namespaced_deployment_scale(
-            name, self.namespace, {"spec": {"replicas": replicas}}
+            name,
+            self.namespace,
+            {
+                "metadata": {"resourceVersion": deployment.metadata.resource_version},
+                "spec": {"replicas": replicas},
+            },
         )
         return {"deployment": name, "replicas": replicas}

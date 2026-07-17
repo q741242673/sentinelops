@@ -19,6 +19,7 @@ export interface Alert {
 }
 
 export interface Evidence {
+  evidence_id: string;
   source: string;
   query: string;
   finding: string;

@@ -47,11 +47,19 @@ class Alert(BaseModel):
 
 
 class Evidence(BaseModel):
+    evidence_id: str = Field(min_length=1)
     source: str
     query: str
     finding: str
     supports_hypothesis: bool = True
     raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvidenceCatalogEntry(BaseModel):
+    evidence_id: str
+    source: str
+    tool: str
+    success: bool
 
 
 class Hypothesis(BaseModel):
@@ -110,6 +118,8 @@ class ApprovalRequest(BaseModel):
     incident_id: str
     action: RemediationAction
     reason: str
+    preflight_snapshot: dict[str, Any]
+    expires_at: datetime
 
 
 class ToolResult(BaseModel):

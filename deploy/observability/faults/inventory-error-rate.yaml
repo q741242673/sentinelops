@@ -3,6 +3,7 @@ spec:
     metadata:
       annotations:
         sentinelops.io/change-cause: enable-every-third-inventory-failure
+        sentinelops.io/health-status: null
     spec:
       containers:
         - name: inventory-service

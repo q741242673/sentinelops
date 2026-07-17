@@ -68,7 +68,7 @@ REPOSITORY="$(basename "${ROOT_DIR}")"
 for deployment in inventory-service order-service; do
   kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
     patch "deployment/${deployment}" --type merge \
-    --patch "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"sentinelops.io/git-commit\":\"${GIT_COMMIT}\",\"sentinelops.io/repository\":\"${REPOSITORY}\",\"sentinelops.io/source-path\":\"demo/services\"}}}}}"
+    --patch "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"sentinelops.io/git-commit\":\"${GIT_COMMIT}\",\"sentinelops.io/repository\":\"${REPOSITORY}\",\"sentinelops.io/source-path\":\"demo/services\",\"sentinelops.io/health-status\":null}}}}}"
 done
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout restart deployment/prometheus
@@ -85,6 +85,14 @@ fi
 
 for deployment in loki tempo alertmanager prometheus otel-collector inventory-service order-service; do
   wait_for_deployment "${deployment}"
+done
+
+for deployment in inventory-service order-service; do
+  python3 "${ROOT_DIR}/scripts/attest_revision_health.py" \
+    --context "${CONTEXT}" \
+    --namespace sentinelops-demo \
+    --deployment "${deployment}" \
+    --verifier sentinelops-observability-bootstrap
 done
 
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo get pods

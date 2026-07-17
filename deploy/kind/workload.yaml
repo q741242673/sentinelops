@@ -28,6 +28,7 @@ spec:
         app: order-service
       annotations:
         sentinelops.io/version: "1.0.0"
+        sentinelops.io/change-cause: "healthy-baseline"
     spec:
       containers:
         - name: order-service
@@ -61,4 +62,3 @@ spec:
     - name: http
       port: 80
       targetPort: http
-

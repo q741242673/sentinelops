@@ -27,6 +27,10 @@ class IncidentRunbook:
         """Return trusted runbook guidance to append to the planning system prompt."""
         return None
 
+    def additional_remediation_targets(self, state: IncidentState) -> set[str]:
+        """Return explicitly trusted targets in addition to the alerted service."""
+        return set()
+
     def plan_feedback(
         self,
         state: IncidentState,
@@ -35,4 +39,3 @@ class IncidentRunbook:
     ) -> str | None:
         """Reject a plan that violates this trusted runbook."""
         return None
-

@@ -40,15 +40,16 @@ flowchart LR
     K --> L["生成事故报告"]
 ```
 
-简单说，就是下面 7 步：
+简单说，就是下面 8 步：
 
 1. Alertmanager 把告警推给 SentinelOps。
 2. SentinelOps 查询 Kubernetes、Prometheus、Loki、Tempo 和 Git。
-3. Agent 根据查到的内容分析根因，每个结论都要能指向证据。
+3. 后端给每次成功查询生成证据编号，Agent 分析根因时必须引用这些编号。
 4. 如果证据不够，只继续查询，不修改集群；达到设定的补查次数后仍不够，就停止并交给人工。
 5. 如果证据足够，Agent 只能从提前允许的修复工具里选择动作。
-6. 回滚、扩容等高风险操作必须由人批准；低风险操作是否自动执行由服务端策略决定。
-7. 执行后重新检查 Pod、测试请求、错误率、告警和新调用链。只有这些检查都通过，事故才会被标记为已恢复。
+6. 回滚、扩容等高风险操作必须由人批准；批准会绑定当时的 Deployment 和 revision 快照。
+7. 真正写入前会重新读取集群。审批期间如果发布了新版本、修改了副本数、当前版本的就绪副本发生变化、删除了健康证明或读取失败，旧审批立即失效，不执行写操作。
+8. 执行后重新检查 Pod、测试请求、错误率、告警和新调用链。只有这些检查都通过，事故才会被标记为已恢复。
 
 ## 整体结构
 
@@ -64,7 +65,8 @@ flowchart TB
     READ --> TEMPO["Tempo"]
     READ --> GIT["Git 变更记录"]
     AGENT --> POLICY["风险检查和人工审批"]
-    POLICY --> WRITE["受限的集群操作"]
+    POLICY --> PREFLIGHT["执行前重新读取集群"]
+    PREFLIGHT --> WRITE["带版本条件的集群操作"]
     WRITE --> K8S
     K8S --> VERIFY["恢复检查"]
     PROM --> VERIFY
@@ -104,12 +106,15 @@ flowchart TB
 
 SentinelOps 给大模型加了几条硬限制：
 
-1. **没有证据就不能下结论**：根因必须能对应到实际查询结果。
+1. **没有证据就不能下结论**：模型引用的证据必须对应后端实际执行成功的查询；编号不存在、查询失败或来源不一致都会被拒绝。
 2. **证据不足就不写集群**：达到设定的补查次数后仍不确定，就交给人工处理。
 3. **模型不能随便调用命令**：系统没有把 Shell 交给模型，只开放少量提前定义好的工具。
 4. **模型不能给自己提权**：审批规则由服务端控制，告警标签和模型回答都不能改变权限。
-5. **高风险操作必须有人确认**：回滚和扩容默认停在人工审批门。
+5. **高风险操作必须有人确认**：回滚和扩容默认停在人工审批门；审批 15 分钟后过期，并绑定当时的 Deployment UID、generation、当前 revision、ReplicaSet 和健康证明。
 6. **模型不能宣布自己修好了**：恢复结果由 Pod 状态、测试请求、错误率、告警和新调用链一起判断。
+7. **模型不能修改无关服务**：重启、回滚和扩缩容默认只能作用于当前告警对应的服务，参数不合法时会在调用 Kubernetes 前被拒绝；回滚目标还必须带有服务端认可的明确健康标记。
+8. **旧审批不能覆盖新状态**：批准后会重新查询 rollout history。新版本发布、副本配置变化，或同一版本的副本数、就绪副本数发生变化，都会让旧审批失效；通过后写操作仍会再次检查当前状态，并携带最新 resourceVersion，防止校验与写入之间的并发覆盖。
+9. **MCP 只能读取证据**：MCP Server 不公开重启、回滚和扩缩容。所有集群写入必须经过 IncidentAgent 的规划、审批和执行前复查；普通工具入口也会拒绝写操作。
 
 ## 快速运行：不需要 Kubernetes 和模型 Key
 
@@ -219,6 +224,28 @@ kubectl apply -f deploy/rbac.yaml
 ```
 
 请在接入生产集群前检查并缩小权限范围。当前工具支持读取 Pod、事件、日志和发布历史，以及滚动重启、回滚和扩缩容。模型本身拿不到任意 Shell、Secret 或特权 Pod 权限。
+
+如果把 SentinelOps 作为 MCP Server 接给其他 Agent，它只会公开 Kubernetes、Prometheus、Loki 和 Tempo 的只读证据查询：
+
+```bash
+python -m pip install -e ".[mcp]"
+sentinelops-mcp
+```
+
+MCP 不直接公开滚动重启、回滚或扩缩容。修复动作必须进入 SentinelOps 的事故流程，由服务端完成证据检查、风险审批和 fresh preflight 后才能调用 Kubernetes。
+
+如果希望 Agent 自动提出回滚，发布流水线需要先完成就绪检查，再给这一次发布对应的 ReplicaSet 写入健康证明：
+
+```bash
+python3 scripts/attest_revision_health.py \
+  --namespace sentinelops-demo \
+  --deployment order-service \
+  --verifier production-release-pipeline
+```
+
+证明会绑定 Deployment UID、ReplicaSet UID、revision、Pod 模板哈希、镜像引用、实际运行的镜像 ID、Git commit 和验证时间。它只写在这个 ReplicaSet 自己的 metadata 上，不会跟着 Deployment 模板传播到未来版本。证明缺失、被复制、字段不完整或与当前 revision 不一致时都会被当成未知状态，Agent 不会自动回滚到它。
+
+生产环境建议使用不可变镜像 digest，并让独立的发布验证身份拥有写证明权限；Agent 自己只读这些证明。示例 RBAC 仍然没有给 Agent 修改 ReplicaSet 的权限。这里的可信边界是 Kubernetes 的 RBAC 和审计日志，并不是独立的数字签名；如果多个不可信主体都能修改 ReplicaSet annotation，应再接外部签名或准入控制，不能只依赖这组注解。
 
 ## 配置监控和代码变更证据
 

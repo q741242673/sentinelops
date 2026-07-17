@@ -49,21 +49,6 @@ def create_server():
         return await invoke("get_rollout_history", {"name": name})
 
     @server.tool()
-    async def restart_deployment(name: str) -> dict[str, Any]:
-        """Trigger a rolling restart. The host must enforce human approval."""
-        return await invoke("restart_deployment", {"name": name})
-
-    @server.tool()
-    async def rollback_deployment(name: str, revision: int) -> dict[str, Any]:
-        """Restore a deployment revision. The host must enforce human approval."""
-        return await invoke("rollback_deployment", {"name": name, "revision": revision})
-
-    @server.tool()
-    async def scale_deployment(name: str, replicas: int) -> dict[str, Any]:
-        """Scale a deployment. The host must enforce human approval."""
-        return await invoke("scale_deployment", {"name": name, "replicas": replicas})
-
-    @server.tool()
     async def query_prometheus(query: str, time: str = "") -> dict[str, Any]:
         """Run a bounded, read-only Prometheus instant query."""
         arguments = {"query": query}
