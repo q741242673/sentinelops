@@ -452,3 +452,131 @@ async def test_demo_reset_job_records_failure(
 
         missing = await client.get("/api/v1/demo/resets/missing")
         assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_demo_reset_invalidates_inflight_fault_and_writes_baseline_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    injection_started = asyncio.Event()
+    release_injection = asyncio.Event()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=True),
+    )
+
+    async def reset(settings):
+        calls.append("reset")
+        return {"baseline_restored": True, "deployment": "inventory-service"}
+
+    async def inject(settings):
+        calls.append("inject:start")
+        injection_started.set()
+        await release_injection.wait()
+        calls.append("inject:end")
+        return {"fault_active": True}
+
+    async def inject_queued(settings):
+        calls.append("queued-inject")
+        return {"fault_active": True}
+
+    monkeypatch.setattr(api_module, "reset_demo_environment", reset)
+    monkeypatch.setattr(api_module, "inject_demo_fault", inject)
+    monkeypatch.setattr(api_module, "inject_auto_demo_fault", inject_queued)
+    api_module.demo_fault_jobs.clear()
+    api_module.demo_fault_generations.clear()
+    api_module.demo_reset_jobs.clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        fault_response = await client.post("/api/v1/demo/faults")
+        fault_id = fault_response.json()["id"]
+        await injection_started.wait()
+        queued_response = await client.post("/api/v1/demo/auto-faults")
+        queued_fault_id = queued_response.json()["id"]
+
+        reset_response = await client.post("/api/v1/demo/reset")
+        assert reset_response.status_code == 202
+        reset_id = reset_response.json()["id"]
+
+        invalidated = await client.get(f"/api/v1/demo/faults/{fault_id}")
+        assert invalidated.json()["status"] == "failed"
+        assert "恢复请求取消" in invalidated.json()["error"]
+        invalidated_queued = await client.get(
+            f"/api/v1/demo/faults/{queued_fault_id}"
+        )
+        assert invalidated_queued.json()["status"] == "failed"
+
+        release_injection.set()
+        for _ in range(30):
+            completed = await client.get(f"/api/v1/demo/resets/{reset_id}")
+            if completed.json()["status"] != "resetting":
+                break
+            await asyncio.sleep(0)
+
+        assert completed.json()["status"] == "succeeded"
+        assert completed.json()["result"]["baseline_restored"] is True
+        final_fault = await client.get(f"/api/v1/demo/faults/{fault_id}")
+        assert final_fault.json()["status"] == "failed"
+        final_queued = await client.get(f"/api/v1/demo/faults/{queued_fault_id}")
+        assert final_queued.json()["status"] == "failed"
+        assert calls == ["reset", "inject:start", "inject:end", "reset"]
+
+
+@pytest.mark.asyncio
+async def test_demo_fault_is_rejected_during_reset_then_allowed_afterward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset_started = asyncio.Event()
+    release_reset = asyncio.Event()
+
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(demo_enabled=True),
+    )
+
+    async def slow_reset(settings):
+        reset_started.set()
+        await release_reset.wait()
+        return {"baseline_restored": True}
+
+    async def inject(settings):
+        return {"fault_active": True}
+
+    monkeypatch.setattr(api_module, "reset_demo_environment", slow_reset)
+    monkeypatch.setattr(api_module, "inject_demo_fault", inject)
+    api_module.demo_fault_jobs.clear()
+    api_module.demo_fault_generations.clear()
+    api_module.demo_reset_jobs.clear()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        reset_response = await client.post("/api/v1/demo/reset")
+        reset_id = reset_response.json()["id"]
+        await reset_started.wait()
+
+        rejected = await client.post("/api/v1/demo/faults")
+        assert rejected.status_code == 409
+        assert "正在恢复健康基线" in rejected.json()["detail"]
+
+        release_reset.set()
+        for _ in range(30):
+            completed = await client.get(f"/api/v1/demo/resets/{reset_id}")
+            if completed.json()["status"] != "resetting":
+                break
+            await asyncio.sleep(0)
+        assert completed.json()["status"] == "succeeded"
+
+        accepted = await client.post("/api/v1/demo/faults")
+        assert accepted.status_code == 202
+        fault_id = accepted.json()["id"]
+        for _ in range(30):
+            fault = await client.get(f"/api/v1/demo/faults/{fault_id}")
+            if fault.json()["status"] != "injecting":
+                break
+            await asyncio.sleep(0)
+        assert fault.json()["status"] == "active"

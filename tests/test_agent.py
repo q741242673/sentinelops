@@ -1803,6 +1803,85 @@ def test_server_predicates_ignore_query_metadata_and_negated_failures() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "No invalid configuration was detected",
+        "invalid configuration was not detected",
+        "service started without invalid configuration",
+        "we never observed invalid configuration",
+        "monitor did not report invalid configuration",
+        "未发现 invalid configuration",
+        "没有 inventory_reservation_failed",
+        "无 synthetic_timeout",
+    ],
+)
+def test_log_failure_predicate_rejects_negated_assertions(line: str) -> None:
+    assert not IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "FATAL: required environment variable DATABASE_URL is missing",
+        "ERROR: timeout acquiring database connection from pool",
+        "invalid configuration was detected",
+        "inventory_reservation_failed reason=synthetic_timeout",
+        "transient_runtime_fault_enabled restart_required=true",
+    ],
+)
+def test_log_failure_predicate_preserves_asserted_failures(line: str) -> None:
+    assert IncidentAgent._logs_have_explicit_failure({"lines": [line]})
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("No invalid configuration was detected", False),
+        ("invalid configuration was not detected", False),
+        ("service started without invalid configuration", False),
+        ("we never observed invalid configuration", False),
+        ("monitor did not report invalid configuration", False),
+        ("未发现 invalid configuration", False),
+        ("FATAL: required environment variable DATABASE_URL is missing", True),
+        ("ERROR: timeout acquiring database connection from pool", True),
+        ("inventory_reservation_failed reason=synthetic_timeout", True),
+        ("transient_runtime_fault_enabled restart_required=true", True),
+    ],
+)
+def test_rollback_causal_gate_requires_an_asserted_log_failure(
+    line: str, expected: bool
+) -> None:
+    current = {
+        "revision": 2,
+        "replicas": 1,
+        "ready_replicas": 1,
+        "status": "stable",
+        "change_cause": "bad-rollout",
+    }
+    observations = {
+        "pods": {"items": []},
+        "logs": {"lines": [line]},
+        "metrics": {"error_rate": 0.0, "p95_ms": 100},
+        "events": {"items": []},
+    }
+
+    assert IncidentAgent._rollback_has_causal_evidence(  # type: ignore[arg-type]
+        observations, current
+    ) is expected
+
+
+def test_negation_does_not_suppress_a_later_positive_log_assertion() -> None:
+    assert IncidentAgent._logs_have_explicit_failure(
+        {
+            "lines": [
+                "No invalid configuration was detected. "
+                "FATAL: required environment variable DATABASE_URL is missing"
+            ]
+        }
+    )
+
+
 def test_evidence_id_resolves_its_immutable_snapshot_after_follow_up() -> None:
     healthy_logs = {"lines": ["INFO: service healthy"]}
     failed_logs = {"lines": ["FATAL: application configuration is invalid"]}

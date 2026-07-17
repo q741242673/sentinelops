@@ -86,6 +86,26 @@ EVIDENCE_SOURCE_BY_TOOL = {
     "get_change_evidence": "git_changes",
 }
 
+_ASSERTION_BOUNDARY = re.compile(r"[.;!?\n\r。；！？]+")
+_NEGATION_BEFORE_FAILURE = re.compile(
+    r"(?:"
+    r"\b(?:no|not|never|without)\b|"
+    r"\b(?:did|does|do|was|were|is|are|has|have|had)\s+not\b|"
+    r"没有|并未|未曾|未发现|未检测到|无"
+    r")(?:[\s\w_=/,:-]{0,80})$",
+    re.IGNORECASE,
+)
+_NEGATION_AFTER_FAILURE = re.compile(
+    r"^(?:[\s,:=-]{0,8})"
+    r"(?:"
+    r"(?:(?:was|were|is|are|has|have|had)\s+)?(?:not|never)\s+"
+    r"(?:detected|found|observed|seen|present|reported|reproduced|confirmed)|"
+    r"(?:未被|没有被|并未被)(?:检测到|发现|观察到|确认|复现)|"
+    r"(?:不存在|未发生)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _event(event_type: str, message: str, **data: Any) -> dict[str, Any]:
     return TimelineEvent(type=event_type, message=message, data=data).model_dump(mode="json")
@@ -1101,21 +1121,6 @@ class IncidentAgent:
     @staticmethod
     def _line_has_explicit_failure(line: str) -> bool:
         text = line.casefold().strip()
-        negated = (
-            "no request failure",
-            "no failures",
-            "no error",
-            "no exception",
-            "no timeout",
-            "not failed",
-            "without error",
-            "error budget is healthy",
-            "未出现故障",
-            "没有故障",
-            "无故障",
-        )
-        if any(marker in text for marker in negated):
-            return False
         fault_flag = re.search(r"(?<![\w])([a-z0-9_]*fault_enabled)(?![\w])", text)
         if fault_flag:
             flag_name = re.escape(fault_flag.group(1))
@@ -1144,21 +1149,31 @@ class IncidentAgent:
                     text,
                 )
             )
-        return any(
-            marker in text
-            for marker in (
-                "fatal:",
-                "error:",
-                "exception:",
-                "crashloopbackoff",
-                "timeout acquiring",
-                "connection pool exhausted",
-                "required environment variable",
-                "invalid configuration",
-                "inventory_reservation_failed",
-                "synthetic_timeout",
-            )
+        markers = (
+            "fatal:",
+            "error:",
+            "exception:",
+            "crashloopbackoff",
+            "timeout acquiring",
+            "connection pool exhausted",
+            "required environment variable",
+            "invalid configuration",
+            "inventory_reservation_failed",
+            "synthetic_timeout",
         )
+        for assertion in _ASSERTION_BOUNDARY.split(text):
+            for marker in markers:
+                offset = 0
+                while (index := assertion.find(marker, offset)) >= 0:
+                    prefix = assertion[max(0, index - 80) : index]
+                    suffix = assertion[index + len(marker) : index + len(marker) + 80]
+                    if not (
+                        _NEGATION_BEFORE_FAILURE.search(prefix)
+                        or _NEGATION_AFTER_FAILURE.search(suffix)
+                    ):
+                        return True
+                    offset = index + len(marker)
+        return False
 
     @classmethod
     def _logs_have_explicit_failure(cls, payload: Any) -> bool:

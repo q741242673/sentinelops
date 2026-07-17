@@ -603,7 +603,12 @@ function App() {
               </section>
               <div className="workspace-grid">
                 <ExecutionFlow incident={selected} />
-                <ResultPanel incident={selected} busy={actionBusy} onDecide={decide} onReset={resetBaseline} />
+                <ResultPanel
+                  incident={selected}
+                  busy={faultBusy || actionBusy}
+                  onDecide={decide}
+                  onReset={resetBaseline}
+                />
               </div>
             </>
           )}
