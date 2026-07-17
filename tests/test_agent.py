@@ -202,6 +202,33 @@ class BlockingPreflightSimulator(RecordingSimulator):
         return await super().call(name, arguments)
 
 
+class BlockingFailedVerificationSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_completed = False
+        self.verify_started = asyncio.Event()
+        self.release_verify = asyncio.Event()
+        self.blocked_once = False
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "rollback_deployment":
+            result = await super().call(name, arguments)
+            self.write_completed = True
+            return result
+        if name == "get_service_metrics" and self.write_completed:
+            self.calls.append(name)
+            if not self.blocked_once:
+                self.blocked_once = True
+                self.verify_started.set()
+                await self.release_verify.wait()
+            return ToolResult(
+                tool_name=name,
+                success=True,
+                content={"error_rate": 0.5, "availability": 0.5},
+            )
+        return await super().call(name, arguments)
+
+
 class CrossNamespaceAlertSimulator(RecordingSimulator):
     def __init__(self) -> None:
         super().__init__()
@@ -1032,6 +1059,55 @@ async def test_resolved_during_write_records_unknown_outcome() -> None:
     assert current.timeline[-1].type == "alertmanager.resolved"
     assert current.timeline[-1].data["execution_outcome"] == "unknown"
     assert "未执行写操作" not in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_resolved_during_verification_preserves_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingFailedVerificationSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    original_sleep = asyncio.sleep
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(engine_module.asyncio, "sleep", no_sleep)
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.verify_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved during verification")
+    )
+    await original_sleep(0)
+    assert not invalidate_task.done()
+
+    backend.release_verify.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.FAILED
+    assert len(current.execution_results) == 1
+    assert any(event.type == "action.executed" for event in current.timeline)
+    recovery = next(event for event in current.timeline if event.type == "recovery.verified")
+    assert recovery.message == "恢复标准未满足"
+    assert current.postmortem is not None
+    assert "状态：修复失败" in current.postmortem
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert "保持原有终态" in current.timeline[-1].message
 
 
 @pytest.mark.asyncio
@@ -2094,6 +2170,19 @@ def test_empty_or_unknown_trace_has_no_valid_span() -> None:
     assert not IncidentAgent._trace_has_valid_span({"trace": {}})
     assert not IncidentAgent._trace_has_valid_span(
         {"trace": {"batches": [{"scopeSpans": []}]}}
+    )
+    assert not IncidentAgent._trace_has_valid_span(
+        {
+            "trace": {
+                "resourceSpans": [
+                    {
+                        "scopeSpans": [
+                            {"spans": [{"traceId": "0123456789abcdef"}]}
+                        ]
+                    }
+                ]
+            }
+        }
     )
 
 

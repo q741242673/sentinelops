@@ -594,7 +594,10 @@ class IncidentAgent:
 
     def _apply_progress_update(self, incident_id: str, output: dict[str, Any]) -> None:
         record = self.records[incident_id]
-        if incident_id in self._invalidated_incidents:
+        if (
+            incident_id in self._invalidated_incidents
+            and incident_id not in self._write_dispatched_incidents
+        ):
             return
         if output.get("status"):
             record.status = IncidentStatus(output["status"])
@@ -1501,17 +1504,13 @@ class IncidentAgent:
 
     @staticmethod
     def _looks_like_otlp_span(span: dict[str, Any]) -> bool:
-        normalized_keys = {str(key).casefold() for key in span}
+        trace_id = span.get("traceId", span.get("trace_id"))
+        span_id = span.get("spanId", span.get("span_id"))
         return bool(
-            normalized_keys.intersection(
-                {"traceid", "trace_id", "spanid", "span_id"}
-            )
-            or (
-                "name" in normalized_keys
-                and normalized_keys.intersection(
-                    {"status", "attributes", "starttimeunixnano", "start_time_unix_nano"}
-                )
-            )
+            isinstance(trace_id, str)
+            and trace_id.strip()
+            and isinstance(span_id, str)
+            and span_id.strip()
         )
 
     @classmethod
@@ -3076,7 +3075,7 @@ class IncidentAgent:
         record = self.records[incident_id]
         if (
             incident_id in self._invalidated_incidents
-            and incident_id not in self._invalidated_during_write
+            and incident_id not in self._write_dispatched_incidents
         ):
             record.status = IncidentStatus.RESOLVED
             record.approval = None
