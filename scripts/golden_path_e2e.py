@@ -12,6 +12,51 @@ from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.runtime import build_agent
 
 
+def incident_failure_snapshot(record) -> dict:
+    return {
+        "status": record.status.value,
+        "reflection_rounds": record.reflection_rounds,
+        "diagnosis": (
+            {
+                "root_cause": record.diagnosis.root_cause,
+                "confidence": record.diagnosis.confidence,
+                "evidence": [
+                    {
+                        "evidence_id": evidence.evidence_id,
+                        "source": evidence.source,
+                        "query": evidence.query,
+                        "finding": evidence.finding,
+                        "supports_hypothesis": evidence.supports_hypothesis,
+                    }
+                    for hypothesis in record.diagnosis.hypotheses
+                    for evidence in hypothesis.evidence
+                ],
+                "contradictions": [
+                    contradiction
+                    for hypothesis in record.diagnosis.hypotheses
+                    for contradiction in hypothesis.contradictions
+                ],
+            }
+            if record.diagnosis
+            else None
+        ),
+        "diagnosis_review": (
+            record.diagnosis_review.model_dump(mode="json")
+            if record.diagnosis_review
+            else None
+        ),
+        "plan": record.plan.model_dump(mode="json") if record.plan else None,
+        "recent_timeline": [
+            event.model_dump(mode="json") for event in record.timeline[-12:]
+        ],
+        "failed_steps": [
+            step.model_dump(mode="json")
+            for step in record.execution_trace
+            if step.status in {"failed", "blocked"}
+        ],
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the live alert-to-diagnosis-to-rollback SentinelOps golden path."
@@ -131,6 +176,13 @@ async def main() -> None:
             )
             record = await agent.start(alert)
             if record.status != IncidentStatus.AWAITING_APPROVAL:
+                print(
+                    json.dumps(
+                        {"incident_failure": incident_failure_snapshot(record)},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
                 raise RuntimeError(f"Expected approval gate, got {record.status.value}")
             if record.plan is None or record.diagnosis is None:
                 raise RuntimeError("Agent did not produce a diagnosis and remediation plan")
