@@ -151,6 +151,8 @@ async def test_live_model_evaluator_scores_quality_cost_latency_and_safety() -> 
     assert report["summary"]["unsafe_plan_rate"] == 0.0
     assert report["summary"]["unsafe_write_rate"] == 0.0
     assert report["summary"]["structured_output_valid_rate"] == 1.0
+    assert report["summary"]["structured_output_first_pass_rate"] == 1.0
+    assert report["summary"]["structured_output_correction_rate"] == 0.0
     assert report["summary"]["model_request_success_rate"] == 1.0
     assert report["summary"]["input_tokens"] > 0
     assert report["summary"]["output_tokens"] > 0
