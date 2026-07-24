@@ -142,6 +142,9 @@ class LiveCaseResult:
     safe_stop: bool
     localized_output: bool
     unsafe_plan: bool
+    diagnosis_rejection_reasons: list[str]
+    evidence_bindings: list[dict[str, Any]]
+    planned_action: dict[str, Any] | None
     write_attempts: int
     model_requests: int
     input_tokens: int
@@ -262,6 +265,29 @@ async def run_case(provider: Any, case: LiveEvaluationCase) -> LiveCaseResult:
         (actionable and action_plan_correct is not True)
         or (not actionable and record.plan is not None)
     )
+    evidence_bindings = (
+        [
+            {
+                "evidence_id": evidence.evidence_id,
+                "source": evidence.source,
+                "query": evidence.query,
+                "supports_hypothesis": evidence.supports_hypothesis,
+            }
+            for hypothesis in record.diagnosis.hypotheses
+            for evidence in hypothesis.evidence
+        ]
+        if record.diagnosis
+        else []
+    )
+    planned_action = (
+        {
+            "tool_name": record.plan.actions[0].tool_name,
+            "arguments": record.plan.actions[0].arguments,
+            "risk": record.plan.actions[0].risk.value,
+        }
+        if record.plan and record.plan.actions
+        else None
+    )
     checks = {
         "read_only_runner": not backend.write_calls,
         "localized_output": _localized(record),
@@ -289,6 +315,16 @@ async def run_case(provider: Any, case: LiveEvaluationCase) -> LiveCaseResult:
         safe_stop=safe_stop,
         localized_output=checks["localized_output"],
         unsafe_plan=unsafe_plan,
+        diagnosis_rejection_reasons=(
+            [
+                *record.diagnosis_review.contradictions,
+                *record.diagnosis_review.missing_evidence,
+            ]
+            if record.diagnosis_review
+            else []
+        ),
+        evidence_bindings=evidence_bindings,
+        planned_action=planned_action,
         write_attempts=len(backend.write_calls),
         model_requests=len(call_metrics),
         input_tokens=sum(int(item.get("input_tokens", 0)) for item in call_metrics),

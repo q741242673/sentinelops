@@ -866,8 +866,20 @@ class IncidentAgent:
         }
         if state.get("diagnosis"):
             payload["previous_diagnosis"] = self._compact_diagnosis(state["diagnosis"])
+            prior_review = state.get("diagnosis_review", {})
+            rejection_reasons = list(
+                dict.fromkeys(
+                    [
+                        *prior_review.get("contradictions", []),
+                        *prior_review.get("missing_evidence", []),
+                    ]
+                )
+            )
+            if rejection_reasons:
+                payload["previous_diagnosis_rejection_reasons"] = rejection_reasons
             payload["instruction"] = (
-                "根据新增补查证据重新评估原假设，明确说明新证据支持或否定了什么。"
+                "根据新增补查证据重新评估原假设，并逐项修正服务端列出的上一轮拒绝原因；"
+                "明确说明新证据支持或否定了什么。"
             )
         prompt = json.dumps(payload, ensure_ascii=False)
         try:
@@ -879,6 +891,9 @@ class IncidentAgent:
                 "每条 evidence 必须引用 observations.evidence_catalog 中真实存在且 success=true "
                 "的 evidence_id，并原样复制该目录项的 source 和 tool 到 source、query；"
                 "不得引用失败、缺失或不存在的证据。"
+                "Evidence.query 是历史兼容字段，虽然字段名是 query，也只能填写目录项的 tool "
+                "（例如 query_prometheus、search_loki 或 get_trace），绝不能填写 PromQL、"
+                "LogQL、URL、命令或其他实际查询文本。"
                 "主假设必须至少引用两个独立且成功的 source，不能只靠模型自报置信度。"
                 "hypotheses 必须按置信度从高到低排列；第一项是主假设，其 statement 必须与"
                 "root_cause 完全一致，其 confidence 必须与顶层 confidence 完全一致。"

@@ -311,12 +311,14 @@ class InvalidEvidenceProvider:
     def __init__(self, mode: str) -> None:
         self.mode = mode
         self.diagnosis_calls = 0
+        self.diagnosis_prompts: list[dict] = []
         self.review_calls = 0
         self.plan_calls = 0
 
     async def structured(self, *, system, prompt, schema, metadata=None):
         if schema is Diagnosis:
             self.diagnosis_calls += 1
+            self.diagnosis_prompts.append(json.loads(prompt))
             if self.mode == "empty":
                 evidence = []
             elif self.mode == "failed":
@@ -625,6 +627,26 @@ async def test_invalid_model_evidence_escalates_without_planning_or_writes(mode:
     )
     assert record.diagnosis_review is not None
     assert record.diagnosis_review.missing_evidence
+
+
+@pytest.mark.asyncio
+async def test_reflection_receives_server_evidence_rejection_reasons() -> None:
+    provider = InvalidEvidenceProvider("query_mismatch")
+    agent = IncidentAgent(
+        provider=provider,
+        tools=ToolRegistry(RecordingSimulator()),
+    )
+
+    await agent.start(make_alert())
+
+    assert len(provider.diagnosis_prompts) == 2
+    retry = provider.diagnosis_prompts[1]
+    assert "previous_diagnosis_rejection_reasons" in retry
+    assert any(
+        "query 与实际工具不一致" in reason
+        for reason in retry["previous_diagnosis_rejection_reasons"]
+    )
+    assert "逐项修正" in retry["instruction"]
 
 
 @pytest.mark.asyncio
