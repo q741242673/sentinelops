@@ -25,6 +25,14 @@ def test_soak_workflow_is_bounded_fail_closed_and_keeps_evidence() -> None:
     assert "python scripts/soak_gate.py" in workflow
     assert "continue-on-error: true" in workflow
     assert workflow.count("retention-days: 90") == 3
+    assert "--retry 5" in workflow
+    assert "--retry-all-errors" in workflow
+    assert "--max-time 180" in workflow
+    assert "sha256sum --check" in workflow
+    assert (
+        "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54"
+        in workflow
+    )
     assert CHECKOUT_SHA in workflow
     assert SETUP_PYTHON_SHA in workflow
     assert UPLOAD_ARTIFACT_SHA in workflow
