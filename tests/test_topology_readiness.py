@@ -301,9 +301,15 @@ def test_security_manifests_separate_identity_and_anchor_trust_domains() -> None
     assert jwks["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
     assert publisher["spec"]["replicas"] == 2
     assert publisher["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+    publisher_container = publisher["spec"]["template"]["spec"]["containers"][0]
+    for probe_name in ("startupProbe", "readinessProbe", "livenessProbe"):
+        assert (
+            publisher_container[probe_name]["exec"]["command"][0]
+            == "sentinelops-anchor-health"
+        )
 
     publisher_env = {
-        item["name"]: item for item in publisher["spec"]["template"]["spec"]["containers"][0]["env"]
+        item["name"]: item for item in publisher_container["env"]
     }
     assert publisher_env["SENTINELOPS_AUDIT_ANCHOR_SOURCE_ID"]["value"] == ("kind-security-e2e")
     assert (
