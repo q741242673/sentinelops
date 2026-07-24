@@ -41,7 +41,7 @@ spec:
               app.kubernetes.io/name: sentinelops-api
       containers:
         - name: api
-          image: ghcr.io/your-org/sentinelops:0.1.0
+          image: ghcr.io/your-org/sentinelops:0.1.0-rc.1
           imagePullPolicy: IfNotPresent
           args: ["serve", "--host", "0.0.0.0", "--port", "8000"]
           envFrom:

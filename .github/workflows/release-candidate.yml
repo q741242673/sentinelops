@@ -1,0 +1,82 @@
+name: release-candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Release candidate version declared by the repository
+        required: true
+        default: "0.1.0-rc.1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install build and test dependencies
+        run: python -m pip install -e ".[dev]" build
+      - name: Bind repository versions to the requested candidate
+        run: >-
+          python scripts/release_version.py
+          --release-version "${{ inputs.release_version }}"
+          --output artifacts/release-version.json
+      - run: ruff check .
+      - run: pytest -q
+      - name: Build wheel and source archive from this exact commit
+        run: python -m build --outdir artifacts/package
+      - name: Record immutable source identity and checksums
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "schema_version": "sentinelops.release-candidate.v1",
+              "release_version": os.environ["RELEASE_VERSION"],
+              "git_commit": os.environ["GITHUB_SHA"],
+              "github_run_id": os.environ["GITHUB_RUN_ID"],
+              "github_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }
+          Path("artifacts/release-candidate.json").write_text(
+              json.dumps(metadata, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cd artifacts/package
+          sha256sum * > SHA256SUMS
+      - name: Verify wheel in a clean environment
+        run: |
+          python -m venv /tmp/sentinelops-rc
+          /tmp/sentinelops-rc/bin/python -m pip install artifacts/package/*.whl
+          /tmp/sentinelops-rc/bin/sentinelops --help
+          /tmp/sentinelops-rc/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+          import sentinelops
+
+          expected = json.loads(
+              Path("artifacts/release-version.json").read_text(encoding="utf-8")
+          )["python_version"]
+          assert sentinelops.__version__ == expected
+          PY
+      - name: Upload candidate package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sentinelops-${{ inputs.release_version }}-${{ github.sha }}
+          path: |
+            artifacts/package
+            artifacts/release-version.json
+            artifacts/release-candidate.json
+          if-no-files-found: error
+          retention-days: 90

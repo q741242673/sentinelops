@@ -1,0 +1,145 @@
+name: soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      kubernetes_rounds:
+        description: Real Kubernetes fault-and-recovery rounds
+        required: true
+        default: "20"
+        type: string
+      postgres_rounds:
+        description: PostgreSQL rounds per concurrency scenario
+        required: true
+        default: "100"
+        type: string
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sentinelops-soak-main
+  cancel-in-progress: false
+
+env:
+  KUBERNETES_ROUNDS: ${{ github.event_name == 'workflow_dispatch' && inputs.kubernetes_rounds || '20' }}
+  POSTGRES_ROUNDS: ${{ github.event_name == 'workflow_dispatch' && inputs.postgres_rounds || '100' }}
+
+jobs:
+  postgres-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sentinelops
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sentinelops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SENTINELOPS_BENCHMARK_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/sentinelops_soak
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e .
+      - name: Create isolated benchmark database
+        env:
+          PGPASSWORD: postgres
+        run: >-
+          psql
+          --host 127.0.0.1
+          --username postgres
+          --dbname sentinelops
+          --command "CREATE DATABASE sentinelops_soak"
+      - name: Run PostgreSQL concurrency and failover soak
+        run: >-
+          python scripts/production_readiness.py
+          --rounds "$POSTGRES_ROUNDS"
+          --concurrency 16
+          --output artifacts/postgres-soak.json
+      - name: Upload PostgreSQL soak evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: postgres-soak
+          path: artifacts/postgres-soak.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  kubernetes-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install kind
+        run: |
+          curl --fail --location --output kind \
+            https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+      - run: python -m pip install -e .
+      - name: Run repeated real Kubernetes recovery loops
+        env:
+          SENTINELOPS_KUBERNETES_READINESS_ROUNDS: ${{ env.KUBERNETES_ROUNDS }}
+          SENTINELOPS_KUBERNETES_READINESS_OUTPUT: artifacts/kubernetes-soak.json
+        run: scripts/run-kubernetes-readiness.sh
+      - name: Upload Kubernetes soak evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kubernetes-soak
+          path: artifacts/kubernetes-soak.json
+          if-no-files-found: warn
+          retention-days: 90
+
+  acceptance:
+    if: always()
+    needs:
+      - postgres-soak
+      - kubernetes-soak
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download Kubernetes evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: kubernetes-soak
+          path: artifacts/kubernetes
+      - name: Download PostgreSQL evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: postgres-soak
+          path: artifacts/postgres
+      - name: Apply fail-closed release-candidate gates
+        run: >-
+          python scripts/soak_gate.py
+          --kubernetes-report artifacts/kubernetes/kubernetes-soak.json
+          --postgres-report artifacts/postgres/postgres-soak.json
+          --expected-kubernetes-rounds "$KUBERNETES_ROUNDS"
+          --expected-postgres-rounds "$POSTGRES_ROUNDS"
+          --max-p95-recovery-ms 60000
+          --output artifacts/soak-acceptance.json
+      - name: Upload acceptance decision
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: soak-acceptance
+          path: artifacts/soak-acceptance.json
+          if-no-files-found: error
+          retention-days: 90

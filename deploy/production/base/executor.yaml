@@ -41,7 +41,7 @@ spec:
               app.kubernetes.io/name: sentinelops-executor
       containers:
         - name: executor
-          image: ghcr.io/your-org/sentinelops:0.1.0
+          image: ghcr.io/your-org/sentinelops:0.1.0-rc.1
           imagePullPolicy: IfNotPresent
           args: ["executor"]
           envFrom:
