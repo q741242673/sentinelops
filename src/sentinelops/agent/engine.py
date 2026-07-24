@@ -894,6 +894,8 @@ class IncidentAgent:
                 "Evidence.query 是历史兼容字段，虽然字段名是 query，也只能填写目录项的 tool "
                 "（例如 query_prometheus、search_loki 或 get_trace），绝不能填写 PromQL、"
                 "LogQL、URL、命令或其他实际查询文本。"
+                "Evidence.raw 是服务端专有字段，必须保持为空对象 {}；不得复制、摘要、改写或"
+                "猜测原始观测，后端会使用自己的不可变快照进行验证。"
                 "主假设必须至少引用两个独立且成功的 source，不能只靠模型自报置信度。"
                 "hypotheses 必须按置信度从高到低排列；第一项是主假设，其 statement 必须与"
                 "root_cause 完全一致，其 confidence 必须与顶层 confidence 完全一致。"
@@ -931,6 +933,7 @@ class IncidentAgent:
                         "node": "diagnose_localization",
                     },
                 )
+            diagnosis = self._discard_untrusted_evidence_raw(diagnosis)
             diagnosis_generation_failed = False
         except (RuntimeError, TypeError, ValueError):
             diagnosis = Diagnosis(
@@ -2133,6 +2136,21 @@ class IncidentAgent:
     @staticmethod
     def _route_after_plan(state: IncidentState) -> str:
         return "prepare_approval" if state.get("plan") else "escalate"
+
+    @staticmethod
+    def _discard_untrusted_evidence_raw(diagnosis: Diagnosis) -> Diagnosis:
+        hypotheses = [
+            hypothesis.model_copy(
+                update={
+                    "evidence": [
+                        evidence.model_copy(update={"raw": {}})
+                        for evidence in hypothesis.evidence
+                    ]
+                }
+            )
+            for hypothesis in diagnosis.hypotheses
+        ]
+        return diagnosis.model_copy(update={"hypotheses": hypotheses})
 
     @staticmethod
     def _compact_diagnosis(diagnosis: dict[str, Any]) -> dict[str, Any]:

@@ -2042,6 +2042,34 @@ def test_model_supplied_raw_cannot_replace_server_observation() -> None:
     assert "证据 events 的 raw 与服务端原始观测不一致" in issues
 
 
+def test_model_evidence_raw_is_discarded_before_server_snapshot_validation() -> None:
+    diagnosis = Diagnosis(
+        root_cause="容器启动失败",
+        confidence=0.95,
+        hypotheses=[
+            Hypothesis(
+                statement="容器启动失败",
+                confidence=0.95,
+                evidence=[
+                    Evidence(
+                        evidence_id="events",
+                        source="kubernetes_events",
+                        query="list_events",
+                        finding="事件明确显示 CrashLoopBackOff",
+                        raw={"items": [{"message": "model-controlled summary"}]},
+                    )
+                ],
+            )
+        ],
+        evidence_summary=[],
+    )
+
+    sanitized = IncidentAgent._discard_untrusted_evidence_raw(diagnosis)
+
+    assert sanitized.hypotheses[0].evidence[0].raw == {}
+    assert diagnosis.hypotheses[0].evidence[0].raw != {}
+
+
 def test_server_predicates_ignore_query_metadata_and_negated_failures() -> None:
     assert not IncidentAgent._loki_has_explicit_failure(
         {
