@@ -25,9 +25,9 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection, Engine, make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from sentinelops.domain import IncidentRecord, IncidentStatus, TimelineEvent
 from sentinelops.storage.anchor import (
@@ -333,8 +333,30 @@ class SqlIncidentStore:
         *,
         audit_hmac_key: str | None = None,
         audit_key_id: str = "development-unkeyed",
+        operation_timeout_seconds: float = 15,
     ) -> None:
-        self.engine: AsyncEngine = create_async_engine(database_url, pool_pre_ping=True)
+        if operation_timeout_seconds <= 0:
+            raise ValueError("database operation timeout must be positive")
+        engine_options: dict[str, Any] = {"pool_pre_ping": True}
+        url = make_url(database_url)
+        if (
+            url.get_backend_name() == "postgresql"
+            and url.get_driver_name() == "asyncpg"
+        ):
+            timeout_ms = max(1, int(operation_timeout_seconds * 1000))
+            engine_options.update(
+                {
+                    "pool_timeout": operation_timeout_seconds,
+                    "connect_args": {
+                        "command_timeout": operation_timeout_seconds,
+                        "server_settings": {
+                            "statement_timeout": str(timeout_ms),
+                            "lock_timeout": str(timeout_ms),
+                        },
+                    },
+                }
+            )
+        self.engine = create_async_engine(database_url, **engine_options)
         self.audit_hmac_key = audit_hmac_key.encode() if audit_hmac_key else None
         self.audit_key_id = audit_key_id
         self.audit_auth_algorithm = (

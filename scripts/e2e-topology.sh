@@ -23,12 +23,16 @@ OUTPUT="${SENTINELOPS_TOPOLOGY_READINESS_OUTPUT:-${DEFAULT_REPORT}}"
 PYTHON="${PYTHON:-python}"
 PORT_FORWARD_PIDS=""
 TEMP_ROOT=""
+CURRENT_PHASE="initialization"
+E2E_MODE="topology"
 CHAOS_ARGS=()
 SECURITY_ARGS=()
 if [[ "${CONTROL_PLANE_CHAOS}" == "true" ]]; then
+  E2E_MODE="control-plane-chaos"
   CHAOS_ARGS+=(--control-plane-chaos)
 fi
 if [[ "${SECURITY_E2E}" == "true" ]]; then
+  E2E_MODE="security"
   SECURITY_ARGS+=(
     --security-e2e
     --anchor-gate-started-blocked
@@ -45,6 +49,10 @@ diagnose() {
     logs deployment/sentinelops-executor --all-pods --all-containers --tail=200 || true
   kubectl --context "${CONTEXT}" --namespace sentinelops-system \
     logs deployment/postgres --all-containers --tail=100 || true
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    describe deployment/sentinelops-anchor-publisher || true
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    get events --sort-by=.lastTimestamp | tail -n 100 || true
   if [[ "${SECURITY_E2E}" == "true" ]]; then
     kubectl --context "${CONTEXT}" --namespace sentinelops-system \
       logs deployment/sentinelops-anchor-publisher \
@@ -68,6 +76,13 @@ cleanup() {
   fi
   if [[ "${status}" -ne 0 ]]; then
     diagnose
+    if [[ ! -s "${OUTPUT}" ]]; then
+      "${PYTHON}" "${ROOT_DIR}/scripts/e2e_bootstrap_failure.py" \
+        --output "${OUTPUT}" \
+        --phase "${CURRENT_PHASE}" \
+        --mode "${E2E_MODE}" \
+        --exit-status "${status}" || true
+    fi
   fi
   if [[ "${SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER:-false}" != "true" ]]; then
     "${ROOT_DIR}/scripts/observability-down.sh"
@@ -103,8 +118,10 @@ start_port_forward() {
   PORT_FORWARD_PIDS="${PORT_FORWARD_PIDS} $!"
 }
 
+CURRENT_PHASE="observability-bootstrap"
 "${ROOT_DIR}/scripts/observability-up.sh"
 
+CURRENT_PHASE="control-plane-image-build"
 docker build --tag "${IMAGE}" "${ROOT_DIR}"
 kind load docker-image "${IMAGE}" --name "${CLUSTER_NAME}"
 NODE_CONTAINER="${CLUSTER_NAME}-control-plane"
@@ -121,10 +138,12 @@ docker save "${POSTGRES_IMAGE}" |
 
 kubectl --context "${CONTEXT}" \
   delete namespace/sentinelops-system --ignore-not-found --wait=true
+CURRENT_PHASE="topology-base"
 kubectl --context "${CONTEXT}" apply \
   --filename "${ROOT_DIR}/deploy/topology-e2e/base.yaml"
 
 if [[ "${SECURITY_E2E}" == "true" ]]; then
+  CURRENT_PHASE="security-dependencies"
   TEMP_ROOT="$(mktemp -d)"
   "${PYTHON}" "${ROOT_DIR}/scripts/generate_security_e2e_material.py" \
     --output-dir "${TEMP_ROOT}/material"
@@ -221,6 +240,7 @@ fi
 
 kubectl --context "${CONTEXT}" apply \
   --filename "${ROOT_DIR}/deploy/topology-e2e/control-plane.yaml"
+CURRENT_PHASE="control-plane-rollout"
 if [[ "${SECURITY_E2E}" == "true" ]]; then
   for deployment in sentinelops-api sentinelops-executor; do
     kubectl --context "${CONTEXT}" --namespace sentinelops-system \
@@ -239,8 +259,10 @@ if [[ "${SECURITY_E2E}" == "true" ]]; then
   fi
   kubectl --context "${CONTEXT}" apply \
     --filename "${ROOT_DIR}/deploy/security-e2e/anchor-publisher.yaml"
+  CURRENT_PHASE="anchor-publisher-rollout"
   kubectl --context "${CONTEXT}" --namespace sentinelops-system \
     rollout status deployment/sentinelops-anchor-publisher --timeout=5m
+  CURRENT_PHASE="anchor-gate-initial-reconciliation"
   for _ in $(seq 1 90); do
     SECURITY_STATE="$(
       kubectl --context "${CONTEXT}" --namespace sentinelops-system \
@@ -260,6 +282,7 @@ if [[ "${SECURITY_E2E}" == "true" ]]; then
   fi
   kubectl --context "${CONTEXT}" --namespace sentinelops-security \
     scale deployment/anchor-service --replicas=0
+  CURRENT_PHASE="anchor-outage-fail-closed"
   kubectl --context "${CONTEXT}" --namespace sentinelops-security \
     rollout status deployment/anchor-service --timeout=2m
   for _ in $(seq 1 50); do
@@ -281,6 +304,7 @@ if [[ "${SECURITY_E2E}" == "true" ]]; then
   fi
   kubectl --context "${CONTEXT}" --namespace sentinelops-security \
     scale deployment/anchor-service --replicas=1
+  CURRENT_PHASE="anchor-recovery-reconciliation"
   kubectl --context "${CONTEXT}" --namespace sentinelops-security \
     rollout status deployment/anchor-service --timeout=5m
   for _ in $(seq 1 90); do
@@ -360,6 +384,7 @@ READINESS_ARGS=(
   --api-url http://127.0.0.1:18101 \
   --output "${OUTPUT}"
 )
+CURRENT_PHASE="topology-benchmark"
 if [[ "${CONTROL_PLANE_CHAOS}" == "true" ]]; then
   READINESS_ARGS+=("${CHAOS_ARGS[@]}")
 fi

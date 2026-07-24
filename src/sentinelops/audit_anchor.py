@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -24,6 +25,9 @@ from sentinelops.storage import (
 )
 from sentinelops.storage.anchor import anchor_id
 from sentinelops.storage.audit import canonical_payload_hash
+from sentinelops.worker_health import run_with_health_pulse
+
+logger = logging.getLogger(__name__)
 
 REQUEST_PROTOCOL = "sentinelops.audit-anchor.v1"
 RECEIPT_PROTOCOL = "sentinelops.audit-anchor-receipt.v1"
@@ -578,6 +582,7 @@ class AuditAnchorPublisher:
         reconciler: AuditAnchorReconciler | None = None,
         reconcile_interval_seconds: float = 60,
         health_callback: Callable[[], None] | None = None,
+        health_interval_seconds: float = 5,
     ) -> None:
         self.store = store
         self.sink = sink
@@ -589,6 +594,7 @@ class AuditAnchorPublisher:
         self.reconciler = reconciler
         self.reconcile_interval_seconds = reconcile_interval_seconds
         self.health_callback = health_callback
+        self.health_interval_seconds = health_interval_seconds
 
     async def run_once(self) -> bool:
         claim = await self.store.claim_audit_anchor(
@@ -629,20 +635,73 @@ class AuditAnchorPublisher:
         return True
 
     async def run_forever(self) -> None:
+        await run_with_health_pulse(
+            self._run_work_loop(),
+            callback=self.health_callback,
+            interval_seconds=self.health_interval_seconds,
+        )
+
+    async def _run_work_loop(self) -> None:
         next_reconcile_at = 0.0
         while True:
             now = asyncio.get_running_loop().time()
             if self.reconciler is not None and now >= next_reconcile_at:
-                await self.reconciler.reconcile_once()
+                try:
+                    await self.reconciler.reconcile_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "audit anchor reconciliation failed safely: %s",
+                        type(exc).__name__,
+                    )
+                    await self._close_write_gate_after_reconcile_failure(exc)
                 next_reconcile_at = now + self.reconcile_interval_seconds
-            processed = await self.run_once()
+            try:
+                processed = await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "audit anchor publisher iteration failed safely: %s",
+                    type(exc).__name__,
+                )
+                processed = False
             if not processed:
                 if self.reconciler is not None:
-                    await self.reconciler.reconcile_unlock_once(
-                        owner_id=f"{self.owner_id}:unlock",
-                        lease_ttl_seconds=self.claim_ttl_seconds,
-                    )
+                    try:
+                        await self.reconciler.reconcile_unlock_once(
+                            owner_id=f"{self.owner_id}:unlock",
+                            lease_ttl_seconds=self.claim_ttl_seconds,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "audit anchor unlock reconciliation failed safely: %s",
+                            type(exc).__name__,
+                        )
                 await asyncio.sleep(self.poll_interval_seconds)
+
+    async def _close_write_gate_after_reconcile_failure(
+        self,
+        exc: Exception,
+    ) -> None:
+        try:
+            await self.store.set_audit_anchor_security_state(
+                status="degraded",
+                write_blocked=True,
+                reason=(
+                    "publisher_reconciliation_failed:"
+                    f"{type(exc).__name__}"
+                ),
+                successful=False,
+            )
+        except Exception as gate_exc:
+            logger.error(
+                "audit anchor write gate could not be persisted: %s",
+                type(gate_exc).__name__,
+            )
 
     async def _verify_claim(self, claim: AuditAnchorClaim) -> None:
         anchor = claim.anchor

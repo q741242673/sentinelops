@@ -17,6 +17,7 @@ from sentinelops.storage.base import (
     LeaseToken,
 )
 from sentinelops.tools.registry import ToolRegistry
+from sentinelops.worker_health import run_with_health_pulse
 
 
 class DirectActionExecutor(ActionExecutor):
@@ -132,6 +133,7 @@ class ExecutorWorker:
         claim_ttl_seconds: float = 60,
         poll_interval_seconds: float = 0.5,
         health_callback: Callable[[], None] | None = None,
+        health_interval_seconds: float = 5,
     ) -> None:
         self.store = store
         self.tools = tools
@@ -139,6 +141,7 @@ class ExecutorWorker:
         self.claim_ttl_seconds = claim_ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.health_callback = health_callback
+        self.health_interval_seconds = health_interval_seconds
 
     async def run_once(self) -> bool:
         claim = await self.store.claim_action_execution(
@@ -180,16 +183,19 @@ class ExecutorWorker:
         return True
 
     async def run_forever(self) -> None:
+        await run_with_health_pulse(
+            self._run_work_loop(),
+            callback=self.health_callback,
+            interval_seconds=self.health_interval_seconds,
+        )
+
+    async def _run_work_loop(self) -> None:
         while True:
-            if self.health_callback is not None:
-                self.health_callback()
             try:
                 worked = await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 worked = False
-            if self.health_callback is not None:
-                self.health_callback()
             if not worked:
                 await asyncio.sleep(self.poll_interval_seconds)

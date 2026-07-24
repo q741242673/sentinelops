@@ -25,6 +25,15 @@ class RecordingWriteBackend:
         )
 
 
+class BlockingExecutorStore:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def claim_action_execution(self, **_kwargs):
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
 async def _queued_intent(tmp_path, *, suffix: str = "a"):
     agent = build_agent(
         Settings(tool_backend="simulator", model_provider="rule_based")
@@ -89,6 +98,32 @@ async def test_executor_is_the_only_component_that_calls_write_backend(tmp_path)
     assert len(backend.calls) == 1
     assert backend.calls[0][0] == record.approval.action.tool_name
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_executor_health_pulse_continues_while_store_call_is_blocked() -> None:
+    store = BlockingExecutorStore()
+    pulses = 0
+
+    def health() -> None:
+        nonlocal pulses
+        pulses += 1
+
+    worker = ExecutorWorker(
+        store,  # type: ignore[arg-type]
+        ToolRegistry(RecordingWriteBackend()),
+        owner_id="executor-health-test",
+        health_callback=health,
+        health_interval_seconds=0.01,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    await asyncio.wait_for(store.entered.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert pulses >= 3
 
 
 @pytest.mark.asyncio
@@ -189,11 +224,11 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
     claim = await store.claim_action_execution(
         owner_id="executor-a",
         attempt_id="immutable-attempt",
-        ttl_seconds=0.1,
+        ttl_seconds=1,
     )
     assert claim is not None
     await store.mark_action_dispatched(claim)
-    await asyncio.sleep(1.1)
+    await asyncio.sleep(1.2)
 
     assert (
         await store.claim_action_execution(

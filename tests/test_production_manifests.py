@@ -69,6 +69,9 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     assert runtime["SENTINELOPS_ENVIRONMENT"] == "production"
     assert runtime["SENTINELOPS_TOOL_BACKEND"] == "kubernetes"
     assert runtime["SENTINELOPS_DATABASE_AUTO_CREATE"] == "false"
+    assert 1 <= int(
+        runtime["SENTINELOPS_DATABASE_OPERATION_TIMEOUT_SECONDS"]
+    ) <= 120
     assert runtime["SENTINELOPS_EXECUTOR_MODE"] == "external"
     assert runtime["SENTINELOPS_DATABASE_URL_FILE"].startswith("/var/run/secrets/")
     assert runtime["SENTINELOPS_AUDIT_HMAC_KEY_FILE"].startswith(

@@ -475,6 +475,7 @@ SENTINELOPS_MAX_REFLECTION_ROUNDS=1
 
 ```dotenv
 SENTINELOPS_DATABASE_URL=postgresql+asyncpg://sentinelops:replace-me@127.0.0.1:5432/sentinelops
+SENTINELOPS_DATABASE_OPERATION_TIMEOUT_SECONDS=15
 SENTINELOPS_ALERTMANAGER_SOURCE_ID=prod-cluster-a
 SENTINELOPS_ALERTMANAGER_WEBHOOK_AUTH_MODE=bearer
 SENTINELOPS_ALERTMANAGER_WEBHOOK_BEARER_TOKEN=replace-with-at-least-32-random-bytes
@@ -485,6 +486,11 @@ SENTINELOPS_EXECUTOR_MODE=external
 SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS=60
 SENTINELOPS_EXECUTOR_RESULT_TIMEOUT_SECONDS=120
 ```
+
+数据库 deadline 同时限制连接池等待、SQL 执行和锁等待，避免后台 Worker
+因为一条没有上限的数据库调用长期卡住。Executor 和审计锚点 Publisher
+使用独立进程心跳；外部依赖异常时审计安全闸门仍会关闭，但 Kubernetes
+不会因为一次慢调用反复重启仍然存活的进程。
 
 先把数据库升级到当前版本并检查版本，再分别启动 API 和独立 Executor：
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -22,6 +23,39 @@ AUDIT_KEY = "anchor-audit-key-000000000000000001"
 AUDIT_KEY_ID = "anchor-test-v1"
 SOURCE_ID = "test-cluster-a"
 TOKEN = "anchor-delivery-token-000000000001"
+
+
+class BlockingAnchorStore:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def claim_audit_anchor(self, **_kwargs):
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+class FailingReconcileStore:
+    def __init__(self) -> None:
+        self.gate_updates: list[dict[str, object]] = []
+
+    async def claim_audit_anchor(self, **_kwargs):
+        return None
+
+    async def set_audit_anchor_security_state(self, **kwargs):
+        self.gate_updates.append(kwargs)
+        return object()
+
+
+class FailingReconciler:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def reconcile_once(self):
+        self.entered.set()
+        raise TimeoutError("simulated database deadline")
+
+    async def reconcile_unlock_once(self, **_kwargs):
+        return "degraded"
 
 
 def _database_url(tmp_path) -> str:
@@ -324,6 +358,67 @@ async def test_retryable_delivery_failure_keeps_only_error_hash(tmp_path) -> Non
     assert row["last_error_sha256"] == canonical_payload_hash("http_500")
     assert TOKEN not in str(dict(row))
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_publisher_health_pulse_continues_while_store_call_is_blocked() -> None:
+    store = BlockingAnchorStore()
+    pulses = 0
+
+    def health() -> None:
+        nonlocal pulses
+        pulses += 1
+
+    publisher = AuditAnchorPublisher(
+        store,  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        owner_id="publisher-health-test",
+        claim_ttl_seconds=60,
+        poll_interval_seconds=0.1,
+        retry_base_seconds=1,
+        retry_max_seconds=10,
+        health_callback=health,
+        health_interval_seconds=0.01,
+    )
+    task = asyncio.create_task(publisher.run_forever())
+    await asyncio.wait_for(store.entered.wait(), timeout=1)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert pulses >= 3
+
+
+@pytest.mark.asyncio
+async def test_publisher_reconciliation_failure_closes_write_gate() -> None:
+    store = FailingReconcileStore()
+    reconciler = FailingReconciler()
+    publisher = AuditAnchorPublisher(
+        store,  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        owner_id="publisher-fail-closed-test",
+        claim_ttl_seconds=60,
+        poll_interval_seconds=0.01,
+        retry_base_seconds=1,
+        retry_max_seconds=10,
+        reconciler=reconciler,  # type: ignore[arg-type]
+        reconcile_interval_seconds=60,
+    )
+    task = asyncio.create_task(publisher.run_forever())
+    await asyncio.wait_for(reconciler.entered.wait(), timeout=1)
+    await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert store.gate_updates
+    assert store.gate_updates[0]["status"] == "degraded"
+    assert store.gate_updates[0]["write_blocked"] is True
+    assert (
+        store.gate_updates[0]["reason"]
+        == "publisher_reconciliation_failed:TimeoutError"
+    )
 
 
 @pytest.mark.asyncio

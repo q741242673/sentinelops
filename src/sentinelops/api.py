@@ -647,6 +647,9 @@ async def initialize_persistence(
             database_url,
             audit_hmac_key=audit_hmac_key,
             audit_key_id=settings.audit_key_id,
+            operation_timeout_seconds=(
+                settings.database_operation_timeout_seconds
+            ),
         )
         should_create = (
             settings.database_auto_create if create_schema is None else create_schema

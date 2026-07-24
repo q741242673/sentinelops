@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     database_url: str | None = None
     database_url_file: str | None = None
     database_auto_create: bool = False
+    database_operation_timeout_seconds: float = Field(
+        default=15,
+        ge=1,
+        le=120,
+    )
     audit_hmac_key: SecretStr | None = None
     audit_hmac_key_file: str | None = None
     audit_key_id: str = Field(default="development-unkeyed", min_length=1, max_length=64)

@@ -113,7 +113,10 @@ async def check_database() -> None:
     database_url = settings.resolved_database_url()
     if not database_url:
         raise SystemExit("Set SENTINELOPS_DATABASE_URL before running db-check")
-    store = SqlIncidentStore(database_url)
+    store = SqlIncidentStore(
+        database_url,
+        operation_timeout_seconds=settings.database_operation_timeout_seconds,
+    )
     try:
         revision = await require_current_schema(store)
     finally:
@@ -142,6 +145,7 @@ async def run_executor() -> None:
         database_url,
         audit_hmac_key=audit_hmac_key,
         audit_key_id=settings.audit_key_id,
+        operation_timeout_seconds=settings.database_operation_timeout_seconds,
     )
     owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
     worker = ExecutorWorker(
@@ -261,6 +265,7 @@ async def run_anchor_publisher() -> None:
         database_url,
         audit_hmac_key=audit_hmac_key,
         audit_key_id=settings.audit_key_id,
+        operation_timeout_seconds=settings.database_operation_timeout_seconds,
     )
     try:
         sink = HttpAuditAnchorSink(
@@ -390,6 +395,7 @@ async def verify_audit(incident_id: str) -> None:
         database_url,
         audit_hmac_key=settings.resolved_audit_hmac_key(),
         audit_key_id=settings.audit_key_id,
+        operation_timeout_seconds=settings.database_operation_timeout_seconds,
     )
     try:
         await require_current_schema(store)
