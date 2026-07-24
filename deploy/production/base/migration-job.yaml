@@ -28,7 +28,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          image: ghcr.io/your-org/sentinelops:0.1.0
+          image: ghcr.io/your-org/sentinelops:0.1.0-rc.1
           imagePullPolicy: IfNotPresent
           args: ["db-init"]
           env:

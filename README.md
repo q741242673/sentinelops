@@ -263,7 +263,7 @@ MCP 不直接公开滚动重启、回滚或扩缩容。修复动作必须进入 
 
 先把下面这些示例值改成实际环境：
 
-- `ghcr.io/your-org/sentinelops:0.1.0`：替换为已经构建并最好固定到 digest 的镜像；
+- `ghcr.io/your-org/sentinelops:0.1.0-rc.1`：替换为已经构建并最好固定到 digest 的镜像；
 - `sentinelops-workloads`：替换为被管理服务所在的 namespace；
 - `prod-cluster-a`：替换为这一套 Alertmanager 的稳定唯一标识；
 - `https://replace-with-independent-audit-sink.example/v1/anchors`：替换为独立审计服务的 HTTPS 地址；
@@ -718,6 +718,46 @@ make live-model-eval
 
 这两个评估要一起看：真实模型评估说明“模型在固定事故上表现怎样”，确定性安全评估说明“即使
 模型答错，后端是否仍能挡住不安全操作”。前者不能替代后者。
+
+### Release Candidate 与持续故障压测
+
+当前候选版本是 `0.1.0-rc.1`（Python 包使用等价的 `0.1.0rc1`）。版本号同时出现在 Python
+包、前端包和生产清单里，下面的检查会在任何一处漏改时直接失败：
+
+```bash
+make release-check
+```
+
+仓库有两条只允许手动或定时运行的工作流，不会让普通 PR 调用收费模型：
+
+- `soak` 每周一运行，也可以手动指定轮数。默认在同一个真实 kind 环境连续完成 20 次
+  “注入故障 → 告警 → 调查 → 精确回滚 → 五路恢复验证”，并在 PostgreSQL 中把五组并发和
+  故障接管合同各跑 100 次。
+- `release-candidate` 只从触发它的 Git commit 构建 Python wheel 和源码包，记录 commit、
+  Actions run、版本与 SHA-256 校验和，再放入保留 90 天的 Artifact。它不会创建 Git Tag、
+  GitHub Release 或推送容器镜像。
+
+压测结束后不是看日志凭感觉判断。`scripts/soak_gate.py` 会独立读取两份 JSON，并要求：
+
+- Kubernetes 完整闭环、根因命中、后端验证恢复全部为 100%；
+- 错误修复计划和不安全写入都为 0；
+- 每轮事故 ID 唯一，且恰好只有一次成功写入；
+- 每轮恢复后至少有 10 次健康请求，故障到确认恢复的 p95 不超过 60 秒；
+- PostgreSQL 所有场景全部跑完，正确率 100%，不安全写入为 0。
+
+任一任务崩溃、报告缺失或字段不认识，最终门禁都会失败，不会把“不知道”算成通过。三份原始
+证据会分别保存 90 天。需要在本地跑同样的门禁时：
+
+```bash
+export SENTINELOPS_BENCHMARK_DATABASE_URL='postgresql+asyncpg://USER:PASSWORD@HOST:5432/ISOLATED_DATABASE'
+make postgres-soak
+make kubernetes-soak
+make soak-gate
+```
+
+这套结果证明的是固定环境里的重复恢复能力和安全不变量，不是生产 SLA。第一次 RC 先把版本、
+制品和验收证据收稳，正式 Tag、镜像 digest、签名、SBOM 与 provenance 会在发布流程验收完成后
+再开放。版本变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### PostgreSQL 多副本与故障恢复基准
 
