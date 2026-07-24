@@ -55,8 +55,7 @@ spec:
           startupProbe:
             exec:
               command:
-                - sentinelops
-                - anchor-health
+                - sentinelops-anchor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 5
@@ -65,8 +64,7 @@ spec:
           livenessProbe:
             exec:
               command:
-                - sentinelops
-                - anchor-health
+                - sentinelops-anchor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 20
@@ -75,8 +73,7 @@ spec:
           readinessProbe:
             exec:
               command:
-                - sentinelops
-                - anchor-health
+                - sentinelops-anchor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 10

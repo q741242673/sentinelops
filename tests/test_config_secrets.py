@@ -6,11 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from sentinelops.cli import (
-    _touch_executor_health_file,
-    check_executor_health,
-)
+from sentinelops.cli import _touch_executor_health_file
 from sentinelops.config import Settings
+from sentinelops.healthcheck import check_heartbeat
 
 
 def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None:
@@ -70,12 +68,12 @@ def test_executor_health_file_detects_fresh_missing_and_stale(
 ) -> None:
     health_file = tmp_path / "health" / "heartbeat"
     _touch_executor_health_file(str(health_file))
-    check_executor_health(str(health_file), max_age_seconds=10)
+    check_heartbeat(str(health_file), max_age_seconds=10)
 
     old_timestamp = time.time() - 30
     os.utime(health_file, (old_timestamp, old_timestamp))
     with pytest.raises(SystemExit, match="stale"):
-        check_executor_health(str(health_file), max_age_seconds=10)
+        check_heartbeat(str(health_file), max_age_seconds=10)
 
     with pytest.raises(SystemExit, match="missing"):
-        check_executor_health(str(tmp_path / "missing"), max_age_seconds=10)
+        check_heartbeat(str(tmp_path / "missing"), max_age_seconds=10)

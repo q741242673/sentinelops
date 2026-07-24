@@ -141,10 +141,22 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
     assert api_container["livenessProbe"]["httpGet"]["path"] == "/health"
     assert api_container["readinessProbe"]["httpGet"]["path"] == "/ready"
     assert api_container["startupProbe"]["httpGet"]["path"] == "/health"
-    assert "executor-health" in executor_container["livenessProbe"]["exec"]["command"]
-    assert "executor-health" in executor_container["readinessProbe"]["exec"]["command"]
-    assert "anchor-health" in publisher_container["livenessProbe"]["exec"]["command"]
-    assert "anchor-health" in publisher_container["readinessProbe"]["exec"]["command"]
+    assert (
+        executor_container["livenessProbe"]["exec"]["command"][0]
+        == "sentinelops-executor-health"
+    )
+    assert (
+        executor_container["readinessProbe"]["exec"]["command"][0]
+        == "sentinelops-executor-health"
+    )
+    assert (
+        publisher_container["livenessProbe"]["exec"]["command"][0]
+        == "sentinelops-anchor-health"
+    )
+    assert (
+        publisher_container["readinessProbe"]["exec"]["command"][0]
+        == "sentinelops-anchor-health"
+    )
     assert executor_container["startupProbe"]["timeoutSeconds"] >= 5
     assert publisher_container["startupProbe"]["timeoutSeconds"] >= 5
     assert api_container["image"] == executor_container["image"] == publisher_container["image"]

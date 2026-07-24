@@ -5,7 +5,6 @@ import asyncio
 import json
 import os
 import socket
-import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,6 +26,7 @@ from sentinelops.audit_anchor import (
 from sentinelops.config import Settings, get_settings
 from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.executor import ExecutorWorker
+from sentinelops.healthcheck import check_heartbeat
 from sentinelops.lab_profiles import build_simulated_lab_agent
 from sentinelops.migration import require_current_schema, upgrade_database
 from sentinelops.runtime import build_agent
@@ -38,15 +38,6 @@ def _touch_executor_health_file(file_path: str) -> None:
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
-
-
-def check_executor_health(file_path: str, *, max_age_seconds: float) -> None:
-    try:
-        age_seconds = time.time() - Path(file_path).stat().st_mtime
-    except OSError as exc:
-        raise SystemExit("Executor health heartbeat is missing") from exc
-    if age_seconds < 0 or age_seconds > max_age_seconds:
-        raise SystemExit("Executor health heartbeat is stale")
 
 
 async def run_demo(scenario: str, approve: bool) -> None:
@@ -512,7 +503,7 @@ def main() -> None:
         file_path = args.file or settings.executor_health_file
         if not file_path:
             raise SystemExit("Set SENTINELOPS_EXECUTOR_HEALTH_FILE or pass --file")
-        check_executor_health(
+        check_heartbeat(
             file_path,
             max_age_seconds=args.max_age_seconds,
         )
@@ -523,7 +514,7 @@ def main() -> None:
             raise SystemExit(
                 "Set SENTINELOPS_AUDIT_ANCHOR_HEALTH_FILE or pass --file"
             )
-        check_executor_health(
+        check_heartbeat(
             file_path,
             max_age_seconds=args.max_age_seconds,
         )

@@ -53,8 +53,7 @@ spec:
           startupProbe:
             exec:
               command:
-                - sentinelops
-                - executor-health
+                - sentinelops-executor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 5
@@ -63,8 +62,7 @@ spec:
           livenessProbe:
             exec:
               command:
-                - sentinelops
-                - executor-health
+                - sentinelops-executor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 20
@@ -73,8 +71,7 @@ spec:
           readinessProbe:
             exec:
               command:
-                - sentinelops
-                - executor-health
+                - sentinelops-executor-health
                 - --max-age-seconds
                 - "120"
             periodSeconds: 10

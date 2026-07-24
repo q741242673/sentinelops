@@ -39,6 +39,8 @@ dev = [
 [project.scripts]
 sentinelops = "sentinelops.cli:main"
 sentinelops-mcp = "sentinelops.mcp_server:main"
+sentinelops-executor-health = "sentinelops.healthcheck:executor_main"
+sentinelops-anchor-health = "sentinelops.healthcheck:anchor_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sentinelops"]
