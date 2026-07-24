@@ -13,6 +13,42 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  live-model-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SENTINELOPS_MODEL_PROVIDER: openai_compatible
+      SENTINELOPS_MODEL_NAME: deepseek-chat
+      SENTINELOPS_MODEL_BASE_URL: https://api.deepseek.com
+      SENTINELOPS_MODEL_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      SENTINELOPS_MODEL_TIMEOUT_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check DeepSeek secret
+        run: |
+          if [[ -z "$SENTINELOPS_MODEL_API_KEY" ]]; then
+            echo "Repository secret DEEPSEEK_API_KEY is not configured" >&2
+            exit 1
+          fi
+      - name: Install SentinelOps
+        run: python -m pip install -e "."
+      - name: Run read-only live model evaluation
+        run: >-
+          python evals/live_run.py
+          --output artifacts/live-model-evaluation.json
+          --max-p95-case-latency-ms 120000
+      - name: Upload live model evaluation report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: live-model-evaluation-report
+          path: artifacts/live-model-evaluation.json
+          if-no-files-found: warn
+          retention-days: 30
+
   deepseek-kind-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 25
