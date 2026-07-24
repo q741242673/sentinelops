@@ -86,11 +86,21 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install kind
+        env:
+          KIND_SHA256: 50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54
         run: |
-          curl --fail --location --output kind \
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 10 \
+            --max-time 180 \
+            --output kind \
             https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
-          chmod +x kind
-          sudo mv kind /usr/local/bin/kind
+          echo "${KIND_SHA256}  kind" | sha256sum --check
+          sudo install --mode 0755 kind /usr/local/bin/kind
       - run: python -m pip install -e .
       - name: Run repeated real Kubernetes recovery loops
         env:
