@@ -17,5 +17,19 @@ export SENTINELOPS_TOOL_BACKEND=kubernetes
 export SENTINELOPS_MODEL_PROVIDER=rule_based
 export SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 
-sentinelops investigate --approve
+OUTPUT_FILE="$(mktemp)"
+trap 'rm -f "${OUTPUT_FILE}"; cleanup' EXIT
 
+set +e
+sentinelops investigate --approve | tee "${OUTPUT_FILE}"
+INVESTIGATE_STATUS=${PIPESTATUS[0]}
+set -e
+
+if [[ "${INVESTIGATE_STATUS}" -ne 2 ]]; then
+  echo "Expected strict verification to escalate without observability, exit=${INVESTIGATE_STATUS}" >&2
+  exit 1
+fi
+
+grep --quiet '"tool_name": "rollback_deployment"' "${OUTPUT_FILE}"
+grep --quiet '"type": "action.executed"' "${OUTPUT_FILE}"
+grep --quiet '"type": "recovery.verification_incomplete"' "${OUTPUT_FILE}"

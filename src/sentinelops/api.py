@@ -35,6 +35,7 @@ app = FastAPI(
 incident_agents: dict[str, IncidentAgent] = {}
 incident_records: dict[str, IncidentRecord] = {}
 alert_fingerprints: dict[str, str] = {}
+resolved_incident_ids: set[str] = set()
 incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
 lab_profiles = LabProfileCoordinator()
@@ -167,6 +168,11 @@ async def _investigate_alert(
             progress_callback=_publish_incident,
         )
         incident_agents[incident_id] = agent
+        if incident_id in resolved_incident_ids:
+            await agent.invalidate_pending_approval(
+                incident_id,
+                reason="Alertmanager 在调查启动前发送 resolved",
+            )
         if profile and profile.enrich_failed_trace:
             alert = await enrich_alert_with_failed_trace(settings, alert)
             current = incident_records[incident_id].model_copy(deep=True)
@@ -490,6 +496,34 @@ async def receive_alertmanager_webhook(payload: AlertmanagerPayload) -> dict[str
         fingerprint = _fingerprint(item)
         if item.status == "resolved":
             incident_id = alert_fingerprints.pop(fingerprint, None)
+            if incident_id:
+                resolved_incident_ids.add(incident_id)
+                agent = incident_agents.get(incident_id)
+                updated: IncidentRecord | None = None
+                if agent is not None:
+                    updated = await agent.invalidate_pending_approval(
+                        incident_id,
+                        reason=f"Alertmanager fingerprint {fingerprint} 已 resolved",
+                    )
+                if updated is None and incident_id in incident_records:
+                    current = incident_records[incident_id].model_copy(deep=True)
+                    current.status = IncidentStatus.RESOLVED
+                    current.approval = None
+                    current.active_step_id = None
+                    now = datetime.now(UTC)
+                    for step in current.execution_trace:
+                        if step.status == "running":
+                            step.status = "skipped"
+                            step.completed_at = now
+                            step.detail = "上游告警已恢复，调查任务已取消"
+                    current.timeline.append(
+                        TimelineEvent(
+                            type="alertmanager.resolved",
+                            message="告警已恢复，尚未执行任何修复操作",
+                            data={"fingerprint": fingerprint},
+                        )
+                    )
+                    _publish_incident(current)
             accepted.append(
                 {"fingerprint": fingerprint, "status": "resolved", "incident_id": incident_id}
             )

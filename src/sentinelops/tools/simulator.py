@@ -51,12 +51,26 @@ class SimulatedKubernetesBackend:
         }
 
     def _tool_list_events(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        service = arguments.get("name", "order-service")
         message = (
             "Back-off restarting failed container after deployment revision 2"
             if self.scenario == "bad_rollout" and not self.resolved
             else "No warning events"
         )
-        return {"scenario": self.scenario, "items": [{"type": "Warning", "message": message}]}
+        return {
+            "scenario": self.scenario,
+            "target_service": service,
+            "items": [
+                {
+                    "type": "Warning",
+                    "message": message,
+                    "object": f"{service}-7b9d8",
+                    "object_kind": "Pod",
+                    "object_uid": f"sim-pod-{service}",
+                    "target_bound": True,
+                }
+            ],
+        }
 
     def _tool_get_pod_logs(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.scenario == "bad_rollout" and not self.resolved:

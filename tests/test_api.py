@@ -221,9 +221,9 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
     assert api_module.incident_records[incident_id].execution_profile_id == (
         "lab.bounded-reflection.v1:test-run"
     )
-    assert api_module.incident_records[incident_id].status == "investigating"
-    assert api_module.incident_records[incident_id].active_step_id == "enrich_trace:1"
-    assert api_module.incident_records[incident_id].execution_trace[-1].status == "running"
+    assert api_module.incident_records[incident_id].status == "resolved"
+    assert api_module.incident_records[incident_id].active_step_id is None
+    assert api_module.incident_records[incident_id].execution_trace[-1].status == "skipped"
     assert api_module.lab_profiles.consume(
         alert_name="HighInventoryErrorRate",
         service="inventory-service",
@@ -231,6 +231,57 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
     ) is None
     assert resolved.json()["accepted"][0]["status"] == "resolved"
     assert "demo-fingerprint" not in api_module.alert_fingerprints
+
+
+@pytest.mark.asyncio
+async def test_resolved_alert_invalidates_pending_approval_before_write() -> None:
+    api_module.alert_fingerprints.clear()
+    api_module.resolved_incident_ids.clear()
+    api_module.incident_records.clear()
+    api_module.incident_agents.clear()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/api/v1/incidents",
+            json={
+                "name": "HighInventoryErrorRate",
+                "namespace": "sentinelops-demo",
+                "service": "inventory-service",
+                "severity": "critical",
+                "summary": "Inventory error rate is high",
+            },
+        )
+        incident = created.json()
+        api_module.alert_fingerprints["stale-approval"] = incident["id"]
+
+        resolved = await client.post(
+            "/api/v1/webhooks/alertmanager",
+            json={
+                "alerts": [
+                    {
+                        "status": "resolved",
+                        "fingerprint": "stale-approval",
+                        "labels": {},
+                    }
+                ]
+            },
+        )
+        approval = await client.post(
+            f"/api/v1/incidents/{incident['id']}/approval",
+            json={
+                "approval_id": incident["approval"]["approval_id"],
+                "approval_version": incident["approval"]["version"],
+                "approved": True,
+            },
+        )
+        current = await client.get(f"/api/v1/incidents/{incident['id']}")
+
+    assert resolved.status_code == 202
+    assert approval.status_code == 409
+    assert current.json()["status"] == "resolved"
+    assert current.json()["approval"] is None
+    assert current.json()["execution_results"] == []
+    assert current.json()["timeline"][-1]["type"] == "alertmanager.resolved"
 
 
 @pytest.mark.asyncio

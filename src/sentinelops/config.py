@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     loki_url: str | None = None
     tempo_url: str | None = None
     observability_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    verification_probe_url: str | None = None
     demo_order_url: str | None = None
     demo_inventory_url: str | None = None
     demo_alert_timeout_seconds: float = Field(default=45.0, gt=0, le=120)

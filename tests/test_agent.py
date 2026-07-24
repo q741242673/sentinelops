@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import sentinelops.agent.engine as engine_module
 from sentinelops.agent import IncidentAgent
 from sentinelops.agent.runbook import IncidentRunbook
 from sentinelops.config import Settings
@@ -29,7 +30,11 @@ from sentinelops.lab_profiles import (
 )
 from sentinelops.llm.rule_based import RuleBasedProvider
 from sentinelops.tools.base import CompositeBackend, ToolSpec
-from sentinelops.tools.registry import KUBERNETES_TOOL_SPECS, ToolRegistry
+from sentinelops.tools.registry import (
+    KUBERNETES_TOOL_SPECS,
+    OBSERVABILITY_TOOL_SPECS,
+    ToolRegistry,
+)
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
 
@@ -179,6 +184,84 @@ class BlockingRollbackSimulator(RecordingSimulator):
         self.rollback_started.set()
         await self.never_finish.wait()
         return result
+
+
+class BlockingPreflightSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rollout_reads = 0
+        self.preflight_started = asyncio.Event()
+        self.release_preflight = asyncio.Event()
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "get_rollout_history":
+            self.rollout_reads += 1
+            if self.rollout_reads == 3:
+                self.preflight_started.set()
+                await self.release_preflight.wait()
+        return await super().call(name, arguments)
+
+
+class BlockingFailedVerificationSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.write_completed = False
+        self.verify_started = asyncio.Event()
+        self.release_verify = asyncio.Event()
+        self.blocked_once = False
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "rollback_deployment":
+            result = await super().call(name, arguments)
+            self.write_completed = True
+            return result
+        if name == "get_service_metrics" and self.write_completed:
+            self.calls.append(name)
+            if not self.blocked_once:
+                self.blocked_once = True
+                self.verify_started.set()
+                await self.release_verify.wait()
+            return ToolResult(
+                tool_name=name,
+                success=True,
+                content={"error_rate": 0.5, "availability": 0.5},
+            )
+        return await super().call(name, arguments)
+
+
+class CrossNamespaceAlertSimulator(RecordingSimulator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.alert_queries: list[str] = []
+
+    async def call(self, name, arguments) -> ToolResult:
+        if name == "query_prometheus":
+            self.calls.append(name)
+            query = arguments["query"]
+            if query.startswith("ALERTS{"):
+                self.alert_queries.append(query)
+                return ToolResult(
+                    tool_name=name,
+                    success=True,
+                    content={
+                        "result": [
+                            {
+                                "metric": {
+                                    "alertname": "HighErrorRate",
+                                    "alertstate": "firing",
+                                    "service": "order-service",
+                                    "namespace": "other-namespace",
+                                },
+                                "value": [0, "1"],
+                            }
+                        ]
+                    },
+                )
+            return ToolResult(tool_name=name, success=True, content={"result": []})
+        if name in {"search_loki", "get_trace"}:
+            self.calls.append(name)
+            return ToolResult(tool_name=name, success=True, content={"result": []})
+        return await super().call(name, arguments)
 
 
 class ScaleEvidenceSimulator(SimulatedKubernetesBackend):
@@ -819,6 +902,7 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -854,6 +938,7 @@ async def test_approval_is_invalidated_when_fresh_preflight_changes(
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -898,6 +983,165 @@ async def test_alert_namespace_mismatch_is_rejected_before_approval_or_write() -
         event for event in record.timeline if event.type == "approval.invalidated"
     )
     assert "namespace" in invalidated.data["reason"]
+
+
+@pytest.mark.asyncio
+async def test_resolved_signal_cancels_before_waiting_for_resume_lock() -> None:
+    backend = BlockingPreflightSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.preflight_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved")
+    )
+    await asyncio.sleep(0)
+    assert not invalidate_task.done()
+
+    backend.release_preflight.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.RESOLVED
+    assert backend.calls.count("rollback_deployment") == 0
+    assert not any(event.type == "action.executed" for event in current.timeline)
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert "未执行集群写入" in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_resolved_during_write_records_unknown_outcome() -> None:
+    backend = BlockingRollbackSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.rollback_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved")
+    )
+    await asyncio.sleep(0)
+    assert not invalidate_task.done()
+
+    backend.never_finish.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.ESCALATED
+    unknown = next(event for event in current.timeline if event.type == "action.outcome_unknown")
+    assert unknown.data["execution_outcome"] == "unknown"
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert current.timeline[-1].data["execution_outcome"] == "unknown"
+    assert "未执行写操作" not in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_resolved_during_verification_preserves_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = BlockingFailedVerificationSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(backend),
+        verification_policy="offline",
+    )
+    record = await agent.start(make_alert())
+    assert record.approval is not None
+    original_sleep = asyncio.sleep
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(engine_module.asyncio, "sleep", no_sleep)
+    resume_task = asyncio.create_task(
+        agent.resume(
+            record.id,
+            approval_id=record.approval.approval_id,
+            approval_version=record.approval.version,
+            approved=True,
+        )
+    )
+    await asyncio.wait_for(backend.verify_started.wait(), timeout=1)
+    invalidate_task = asyncio.create_task(
+        agent.invalidate_pending_approval(record.id, reason="alert resolved during verification")
+    )
+    await original_sleep(0)
+    assert not invalidate_task.done()
+
+    backend.release_verify.set()
+    await resume_task
+    current = await invalidate_task
+
+    assert current is not None
+    assert current.status == IncidentStatus.FAILED
+    assert len(current.execution_results) == 1
+    assert any(event.type == "action.executed" for event in current.timeline)
+    recovery = next(event for event in current.timeline if event.type == "recovery.verified")
+    assert recovery.message == "恢复标准未满足"
+    assert current.postmortem is not None
+    assert "状态：修复失败" in current.postmortem
+    assert current.timeline[-1].type == "alertmanager.resolved"
+    assert "保持原有终态" in current.timeline[-1].message
+
+
+@pytest.mark.asyncio
+async def test_cross_namespace_alert_cannot_authorize_preflight() -> None:
+    backend = CrossNamespaceAlertSimulator()
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(
+            backend,
+            [*KUBERNETES_TOOL_SPECS, *OBSERVABILITY_TOOL_SPECS],
+        ),
+        verification_policy="strict",
+    )
+    alert = make_alert().model_copy(
+        update={"labels": {"source": "alertmanager"}}
+    )
+    record = await agent.start(alert)
+    assert record.approval is not None
+
+    record = await agent.resume(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+    )
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert backend.calls.count("rollback_deployment") == 0
+    assert backend.alert_queries
+    assert 'namespace="sentinelops-demo"' in backend.alert_queries[-1]
+    invalidated = next(
+        event for event in record.timeline if event.type == "approval.invalidated"
+    )
+    assert "原告警仍处于 firing" in invalidated.data["reason"]
 
 
 @pytest.mark.asyncio
@@ -1038,6 +1282,7 @@ async def test_status_only_resource_version_change_does_not_invalidate_approval(
     agent = IncidentAgent(
         provider=RuleBasedProvider(),
         tools=ToolRegistry(backend),
+        verification_policy="offline",
     )
 
     record = await agent.start(make_alert())
@@ -1144,6 +1389,7 @@ async def test_verified_transient_fault_ignores_non_causal_revision_contradictio
         tools=ToolRegistry(backend),
         auto_approve_max_risk=RiskLevel.MEDIUM,
         runbook=VerifiedRuntimeStateRunbook(confidence_threshold=0.8),
+        verification_policy="offline",
     )
     alert = Alert(
         name="InventoryTransientRuntimeFault",
@@ -1803,6 +2049,217 @@ def test_server_predicates_ignore_query_metadata_and_negated_failures() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_strict_verification_escalates_when_required_capabilities_are_missing() -> None:
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(SimulatedKubernetesBackend()),
+        verification_policy="strict",
+    )
+
+    result = await agent._verify(  # type: ignore[arg-type]
+        {
+            "incident_id": "strict-verification",
+            "alert": {
+                "name": "HighOrderServiceErrorRate",
+                "service": "order-service",
+                "labels": {},
+            },
+        }
+    )
+
+    assert result["status"] == IncidentStatus.ESCALATED.value
+    assert result["timeline"][0]["type"] == "recovery.verification_incomplete"
+    assert result["timeline"][0]["data"]["missing_capabilities"] == [
+        "prometheus",
+        "active_probe",
+        "tempo",
+    ]
+
+
+def test_unbound_cross_service_event_cannot_authorize_rollback() -> None:
+    events = {
+        "items": [
+            {
+                "type": "Warning",
+                "reason": "Unhealthy",
+                "message": "revision 7 readiness probe failed",
+                "object": "unrelated-api-abc",
+                "object_uid": "unrelated-uid",
+            }
+        ]
+    }
+    observations = {
+        "pods": {"items": []},
+        "logs": {"lines": ["ERROR: timeout acquiring database connection from pool"]},
+        "metrics": {"error_rate": 0.2},
+        "events": events,
+    }
+    current = {"revision": 7, "status": "stable", "change_cause": "ordinary release"}
+
+    assert not IncidentAgent._events_have_explicit_failure(events)
+    assert not IncidentAgent._rollback_has_causal_evidence(observations, current)
+
+
+def test_trace_failure_predicate_parses_false_and_active_values() -> None:
+    healthy = {
+        "trace": {
+            "attributes": {
+                "inventory_reservation_failed": False,
+                "synthetic_timeout": "disabled",
+            }
+        }
+    }
+    failed = {
+        "trace": {
+            "attributes": {
+                "inventory_reservation_failed": True,
+                "synthetic_timeout": "active",
+            }
+        }
+    }
+
+    assert not IncidentAgent._trace_has_explicit_failure(healthy)
+    assert IncidentAgent._trace_has_explicit_failure(failed)
+
+
+@pytest.mark.parametrize(
+    "span",
+    [
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "status": {"code": 2},
+        },
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "attributes": [
+                {
+                    "key": "inventory_reservation_failed",
+                    "value": {"boolValue": True},
+                }
+            ],
+        },
+        {
+            "traceId": "0123456789abcdef",
+            "spanId": "0123456789abcdef",
+            "attributes": [
+                {
+                    "key": "http.response.status_code",
+                    "value": {"intValue": "503"},
+                }
+            ],
+        },
+    ],
+)
+def test_trace_failure_predicate_parses_otlp_spans(span: dict) -> None:
+    payload = {
+        "trace": {
+            "resourceSpans": [
+                {"scopeSpans": [{"spans": [span]}]}
+            ]
+        }
+    }
+
+    assert IncidentAgent._trace_has_valid_span(payload)
+    assert IncidentAgent._trace_has_explicit_failure(payload)
+
+
+def test_empty_or_unknown_trace_has_no_valid_span() -> None:
+    assert not IncidentAgent._trace_has_valid_span({"trace": {}})
+    assert not IncidentAgent._trace_has_valid_span(
+        {"trace": {"batches": [{"scopeSpans": []}]}}
+    )
+    assert not IncidentAgent._trace_has_valid_span(
+        {
+            "trace": {
+                "resourceSpans": [
+                    {
+                        "scopeSpans": [
+                            {"spans": [{"traceId": "0123456789abcdef"}]}
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_verification_escalates_on_empty_tempo_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyTraceBackend:
+        async def call(self, name, arguments) -> ToolResult:
+            if name == "get_service_metrics":
+                content = {"availability": 1.0, "error_rate": 0.0}
+            elif name == "list_pods":
+                content = {"items": [{"name": "order-1", "ready": True}]}
+            elif name == "get_trace":
+                content = {"trace": {}}
+            elif name == "query_prometheus":
+                query = arguments["query"]
+                if query.startswith("ALERTS{"):
+                    content = {"result": []}
+                elif query.startswith("sum(rate"):
+                    content = {"result": [{"value": [0, "1"]}]}
+                else:
+                    content = {"result": [{"value": [0, "0"]}]}
+            else:
+                content = {}
+            return ToolResult(tool_name=name, success=True, content=content)
+
+    class ProbeResponse:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, str]:
+            return {"trace_id": "0123456789abcdef"}
+
+    class ProbeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def post(self, url: str) -> ProbeResponse:
+            return ProbeResponse()
+
+        async def aclose(self) -> None:
+            pass
+
+    async def no_sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(engine_module.httpx, "AsyncClient", ProbeClient)
+    monkeypatch.setattr(engine_module.asyncio, "sleep", no_sleep)
+    agent = IncidentAgent(
+        provider=RuleBasedProvider(),
+        tools=ToolRegistry(
+            EmptyTraceBackend(),
+            [*KUBERNETES_TOOL_SPECS, *OBSERVABILITY_TOOL_SPECS],
+        ),
+        verification_policy="strict",
+        verification_probe_url="http://probe",
+    )
+
+    result = await agent._verify(  # type: ignore[arg-type]
+        {
+            "incident_id": "empty-trace",
+            "alert": {
+                "name": "HighErrorRate",
+                "namespace": "sentinelops-demo",
+                "service": "order-service",
+                "labels": {},
+            },
+        }
+    )
+
+    assert result["status"] == IncidentStatus.ESCALATED.value
+    assert result["timeline"][0]["type"] == "recovery.verification_incomplete"
+    assert result["timeline"][0]["data"]["trace_structure_valid"] is False
+    assert result["timeline"][0]["data"]["successful_trace_verified"] is False
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -2120,6 +2577,7 @@ def test_root_cause_and_confidence_binding_rules_are_independent(
                         "type": "Warning",
                         "reason": "BackOff",
                         "message": "Back-off restarting failed container",
+                        "target_bound": True,
                     }
                 ]
             },
@@ -2233,6 +2691,7 @@ def test_each_evidence_authenticity_rule_is_enforced_independently(
                         "type": "Warning",
                         "reason": "BackOff",
                         "message": "Back-off restarting failed container",
+                        "target_bound": True,
                     }
                 ]
             },

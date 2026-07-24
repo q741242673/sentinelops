@@ -439,3 +439,60 @@ def test_reset_demo_baseline_sets_known_healthy_config() -> None:
         {"name": "FAIL_EVERY", "value": "0"}
     ]
     backend._attest_current_revision_healthy.assert_called_once_with("inventory-service")
+
+
+def test_list_events_keeps_only_objects_owned_by_target_deployment() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    backend.core = Mock()
+    deployment = ns(metadata=ns(uid="deployment-uid"))
+    target_replica_set = replica_set(7)
+    target_pod = ns(
+        metadata=ns(
+            uid="target-pod-uid",
+            owner_references=[ns(uid=target_replica_set.metadata.uid, kind="ReplicaSet")],
+        )
+    )
+    unrelated_pod = ns(
+        metadata=ns(
+            uid="unrelated-pod-uid",
+            owner_references=[ns(uid="other-rs", kind="ReplicaSet")],
+        )
+    )
+    target_event = ns(
+        type="Warning",
+        reason="Unhealthy",
+        message="revision 7 readiness probe failed",
+        involved_object=ns(
+            name="order-service-7-abc",
+            kind="Pod",
+            uid="target-pod-uid",
+        ),
+    )
+    unrelated_event = ns(
+        type="Warning",
+        reason="Unhealthy",
+        message="revision 7 readiness probe failed",
+        involved_object=ns(
+            name="unrelated-api-abc",
+            kind="Pod",
+            uid="unrelated-pod-uid",
+        ),
+    )
+    backend.apps.read_namespaced_deployment.return_value = deployment
+    backend.apps.list_namespaced_replica_set.return_value = ns(
+        items=[target_replica_set]
+    )
+    backend.core.list_namespaced_pod.return_value = ns(
+        items=[target_pod, unrelated_pod]
+    )
+    backend.core.list_namespaced_event.return_value = ns(
+        items=[target_event, unrelated_event]
+    )
+
+    result = backend._tool_list_events({"name": "order-service"})
+
+    assert result["target_service"] == "order-service"
+    assert [item["object"] for item in result["items"]] == ["order-service-7-abc"]
+    assert result["items"][0]["target_bound"] is True

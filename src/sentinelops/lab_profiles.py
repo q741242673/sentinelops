@@ -37,6 +37,7 @@ def build_simulated_lab_agent(
         auto_approve_max_risk=(
             auto_approve_max_risk or RiskLevel(settings.auto_approve_max_risk)
         ),
+        verification_policy="offline",
         diagnosis_confidence_threshold=settings.diagnosis_confidence_threshold,
         max_reflection_rounds=settings.max_reflection_rounds,
         runbook=runbook,
