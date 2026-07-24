@@ -128,6 +128,22 @@ async def test_registry_plain_call_rejects_write_tools_even_with_valid_arguments
 
 
 @pytest.mark.asyncio
+async def test_agent_read_registry_cannot_cross_guarded_write_boundary() -> None:
+    backend = AsyncMock()
+    registry = ToolRegistry(backend, allow_guarded_writes=False)
+
+    result = await registry.call_guarded(
+        "rollback_deployment",
+        {"name": "order-service", "revision": 1},
+        {"resource_version": "17"},
+    )
+
+    assert result.success is False
+    assert "does not hold the cluster-write capability" in str(result.error)
+    backend.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_registry_preserves_existing_read_tool_argument_compatibility() -> None:
     backend = AsyncMock()
     backend.call.return_value = ToolResult(tool_name="get_pod_logs", success=True)

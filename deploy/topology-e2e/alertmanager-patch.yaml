@@ -1,0 +1,14 @@
+spec:
+  template:
+    spec:
+      containers:
+        - name: alertmanager
+          volumeMounts:
+            - name: sentinelops-webhook-token
+              mountPath: /etc/sentinelops-webhook
+              readOnly: true
+      volumes:
+        - name: sentinelops-webhook-token
+          secret:
+            secretName: sentinelops-topology-webhook
+            defaultMode: 292

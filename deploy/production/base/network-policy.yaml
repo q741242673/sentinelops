@@ -1,0 +1,55 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sentinelops-api-ingress
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              sentinelops.io/api-access: "true"
+      ports:
+        - protocol: TCP
+          port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              sentinelops.io/metrics-access: "true"
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sentinelops-executor-deny-ingress
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-executor
+  policyTypes: ["Ingress"]
+  ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sentinelops-anchor-publisher-deny-ingress
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-anchor-publisher
+  policyTypes: ["Ingress"]
+  ingress: []

@@ -1,0 +1,158 @@
+{
+  "schema_version": "sentinelops.topology-readiness.v1",
+  "run_id": "7961479b7cbb493ea6769c18bcf28eaf",
+  "generated_at": "2026-07-24T09:51:00.420436+00:00",
+  "environment": {
+    "python": "3.13.3",
+    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "kubernetes": "kind",
+    "api_replicas": 2,
+    "executor_replicas": 2,
+    "database": "PostgreSQL 16",
+    "model_provider": "rule_based"
+  },
+  "scope": "staging acceptance topology with ephemeral credentials; enterprise OIDC and external audit anchoring remain production deployment requirements",
+  "thresholds": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1
+  },
+  "summary": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1,
+    "audit_events": 23,
+    "duration_ms": 27898.795
+  },
+  "latency_ms": {
+    "fault_rollout": {
+      "p50": 3997.26,
+      "p95": 3997.26,
+      "max": 3997.26
+    },
+    "fault_to_prometheus_firing": {
+      "p50": 8170.549,
+      "p95": 8170.549,
+      "max": 8170.549
+    },
+    "prometheus_firing_to_webhook_incident": {
+      "p50": 17.858,
+      "p95": 17.858,
+      "max": 17.858
+    },
+    "webhook_to_approval_plan": {
+      "p50": 9.296,
+      "p95": 9.296,
+      "max": 9.296
+    },
+    "approval_to_verified_recovery": {
+      "p50": 14773.555,
+      "p95": 14773.555,
+      "max": 14773.555
+    },
+    "fault_to_verified_recovery": {
+      "p50": 22992.136,
+      "p95": 22992.136,
+      "max": 22992.136
+    },
+    "fault_to_alert_cleared": {
+      "p50": 23233.487,
+      "p95": 23233.487,
+      "max": 23233.487
+    }
+  },
+  "trial": {
+    "passed": true,
+    "incident_id": "ba6d6ea6-d3b2-4a8e-a857-f47410973428",
+    "incident_status": "resolved",
+    "injected_revision": 115,
+    "expected_revision": 114,
+    "root_cause": "库存服务 Deployment revision 115 启用了合成预留故障",
+    "evidence_sources": [
+      "kubernetes_logs",
+      "loki",
+      "prometheus"
+    ],
+    "failed_trace_id": "7e058fa4430f81e0ecda19cbbdd1c7c4",
+    "approving_api_url": "http://127.0.0.1:18100",
+    "executor_id": "sentinelops-executor-65846f94f-zsbtg:1:9136339e-3e27-413a-81c7-b19eb1223c7c",
+    "action_intents": 1,
+    "audit_events": 23,
+    "failed_requests_before_recovery": 21,
+    "healthy_requests_after_recovery": 10,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "timings_ms": {
+      "fault_rollout": 3997.26,
+      "fault_to_prometheus_firing": 8170.549,
+      "prometheus_firing_to_webhook_incident": 17.858,
+      "webhook_to_approval_plan": 9.296,
+      "approval_to_verified_recovery": 14773.555,
+      "fault_to_verified_recovery": 22992.136,
+      "fault_to_alert_cleared": 23233.487
+    },
+    "checks": {
+      "two_api_replicas_ready": true,
+      "two_executor_replicas_ready": true,
+      "baseline_traffic_healthy": true,
+      "alertmanager_webhook_received": true,
+      "approval_gate_reached": true,
+      "root_cause_matches_injected_fault": true,
+      "grounded_observability_evidence": true,
+      "expected_remediation_selected": true,
+      "durable_snapshot_visible_on_all_api_replicas": true,
+      "one_succeeded_action_intent": true,
+      "independent_executor_claimed_action": true,
+      "approval_persisted": true,
+      "hmac_audit_chain_persisted": true,
+      "migration_head_applied": true,
+      "agent_resolved": true,
+      "deployment_restored": true,
+      "recovered_traffic_healthy": true,
+      "strict_recovery_evidence_present": true,
+      "resolved_webhook_persisted": true,
+      "final_state_visible_on_all_api_replicas": true
+    },
+    "database_snapshot": {
+      "schema_revision": "0008_anchor_unlock_workflow",
+      "action_intents": [
+        {
+          "status": "succeeded",
+          "executor_id": "sentinelops-executor-65846f94f-zsbtg:1:9136339e-3e27-413a-81c7-b19eb1223c7c",
+          "executor_generation": 1,
+          "attempt_id": "25e2b601-5523-4225-900a-bd45eb0da03a",
+          "action": {
+            "tool_name": "rollback_deployment",
+            "arguments": {
+              "name": "inventory-service",
+              "revision": 114
+            },
+            "rationale": "revision 115 引入库存服务 HTTP 503，而 revision 114 已知健康",
+            "expected_outcome": "库存服务不再返回 HTTP 503，结账流量恢复",
+            "risk": "high"
+          },
+          "result": {
+            "tool_name": "rollback_deployment",
+            "success": true,
+            "content": {
+              "deployment": "inventory-service",
+              "rolled_back": true,
+              "source_revision": 114,
+              "source_replica_set": "inventory-service-546c569db7"
+            },
+            "error": null,
+            "duration_ms": 38.64883299684152
+          }
+        }
+      ],
+      "approval_status": "approved",
+      "alert_binding_status": "resolved",
+      "audit_events": 23,
+      "hmac_audit_events": 23
+    },
+    "error_type": null,
+    "error": null
+  }
+}

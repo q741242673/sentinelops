@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops-topology-e2e
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-system
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-migrator
+  namespace: sentinelops-system
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-topology-runtime
+  namespace: sentinelops-system
+data:
+  SENTINELOPS_ENVIRONMENT: staging
+  SENTINELOPS_TOOL_BACKEND: kubernetes
+  SENTINELOPS_KUBERNETES_NAMESPACE: sentinelops-demo
+  SENTINELOPS_DATABASE_AUTO_CREATE: "false"
+  SENTINELOPS_AUDIT_KEY_ID: topology-e2e-v1
+  SENTINELOPS_AUDIT_ANCHOR_ENFORCEMENT_REQUIRED: "false"
+  SENTINELOPS_EXECUTOR_MODE: external
+  SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS: "20"
+  SENTINELOPS_EXECUTOR_POLL_INTERVAL_SECONDS: "0.1"
+  SENTINELOPS_EXECUTOR_RESULT_TIMEOUT_SECONDS: "120"
+  SENTINELOPS_WORKER_LEASE_TTL_SECONDS: "20"
+  SENTINELOPS_WORKER_LEASE_HEARTBEAT_SECONDS: "5"
+  SENTINELOPS_WORKER_RECONCILIATION_INTERVAL_SECONDS: "1"
+  SENTINELOPS_ALERTMANAGER_SOURCE_ID: kind-topology-e2e
+  SENTINELOPS_ALERTMANAGER_WEBHOOK_AUTH_MODE: bearer
+  SENTINELOPS_OPERATOR_AUTH_MODE: disabled
+  SENTINELOPS_MODEL_PROVIDER: rule_based
+  SENTINELOPS_MODEL_NAME: deterministic-topology-e2e
+  SENTINELOPS_PROMETHEUS_URL: http://prometheus.sentinelops-demo.svc.cluster.local:9090
+  SENTINELOPS_LOKI_URL: http://loki.sentinelops-demo.svc.cluster.local:3100
+  SENTINELOPS_TEMPO_URL: http://tempo.sentinelops-demo.svc.cluster.local:3200
+  SENTINELOPS_VERIFICATION_PROBE_URL: http://order-service.sentinelops-demo.svc.cluster.local:8000
+  SENTINELOPS_OBSERVABILITY_TIMEOUT_SECONDS: "10"
+  SENTINELOPS_DIAGNOSIS_CONFIDENCE_THRESHOLD: "0.8"
+  SENTINELOPS_MAX_REFLECTION_ROUNDS: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: sentinelops-system
+spec:
+  selector:
+    app.kubernetes.io/name: sentinelops-topology-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-topology-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-topology-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-topology-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: postgres-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: postgres-password
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: postgres-database
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-topology-api-readonly
+  namespace: sentinelops-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/status", "deployments/scale", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-topology-executor-write
+  namespace: sentinelops-demo
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/status", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-topology-api-readonly
+  namespace: sentinelops-demo
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-api
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-topology-api-readonly
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-topology-executor-write
+  namespace: sentinelops-demo
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-executor
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-topology-executor-write

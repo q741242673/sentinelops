@@ -18,6 +18,12 @@ from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from sentinelops.agent.execution import (
+    ActionExecutionRejected,
+    ActionExecutor,
+    ActionJournal,
+    ActionOutcomeUnknown,
+)
 from sentinelops.agent.policy import ActionPolicy
 from sentinelops.agent.runbook import IncidentRunbook
 from sentinelops.agent.state import IncidentState
@@ -39,6 +45,7 @@ from sentinelops.domain import (
     TimelineEvent,
     ToolResult,
 )
+from sentinelops.executor import DirectActionExecutor
 from sentinelops.llm.base import LLMProvider
 from sentinelops.tools.registry import ToolRegistry
 
@@ -130,9 +137,13 @@ class IncidentAgent:
         verification_policy: Literal["strict", "offline"] = "strict",
         diagnosis_confidence_threshold: float = 0.8,
         max_reflection_rounds: int = 1,
+        verification_max_attempts: int = 30,
+        verification_interval_seconds: float = 1.0,
         runbook: IncidentRunbook | None = None,
         profile_id: str = "production-default",
         progress_callback: ProgressCallback | None = None,
+        action_journal: ActionJournal | None = None,
+        action_executor: ActionExecutor | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
@@ -143,9 +154,21 @@ class IncidentAgent:
         self.verification_policy = verification_policy
         self.diagnosis_confidence_threshold = diagnosis_confidence_threshold
         self.max_reflection_rounds = max_reflection_rounds
+        if verification_max_attempts < 1:
+            raise ValueError("verification_max_attempts must be at least 1")
+        if verification_interval_seconds < 0:
+            raise ValueError(
+                "verification_interval_seconds cannot be negative"
+            )
+        self.verification_max_attempts = verification_max_attempts
+        self.verification_interval_seconds = (
+            verification_interval_seconds
+        )
         self.runbook = runbook or IncidentRunbook()
         self.profile_id = profile_id
         self.progress_callback = progress_callback
+        self.action_journal = action_journal
+        self.action_executor = action_executor or DirectActionExecutor(tools)
         self.checkpointer = MemorySaver()
         self.graph = self._build_graph()
         self.records: dict[str, IncidentRecord] = {}
@@ -156,6 +179,12 @@ class IncidentAgent:
         self._writes_in_flight: set[str] = set()
         self._write_dispatched_incidents: set[str] = set()
         self._invalidated_during_write: set[str] = set()
+
+    def set_action_journal(self, journal: ActionJournal | None) -> None:
+        self.action_journal = journal
+
+    def set_action_executor(self, executor: ActionExecutor) -> None:
+        self.action_executor = executor
 
     def _build_graph(self):
         builder = StateGraph(IncidentState)
@@ -283,6 +312,56 @@ class IncidentAgent:
         record = self._sync_record(record.id, result)
         self._publish(record)
         return record
+
+    async def export_state(self, incident_id: str) -> dict[str, object]:
+        """Return a JSON-compatible graph state for a durable pause boundary."""
+
+        if incident_id not in self.records:
+            raise KeyError(incident_id)
+        snapshot = await self.graph.aget_state(self._config(incident_id))
+        return dict(snapshot.values)
+
+    async def restore(
+        self,
+        record: IncidentRecord,
+        graph_state: dict[str, object],
+    ) -> None:
+        """Restore an approval-paused incident into a fresh process.
+
+        Only the human approval boundary is recoverable in this first durable
+        workflow slice. Replaying an investigating or remediating incident could
+        duplicate external reads or writes and is deliberately rejected.
+        """
+
+        if (
+            record.status != IncidentStatus.AWAITING_APPROVAL
+            or record.approval is None
+        ):
+            raise RuntimeError("只有等待审批且尚未执行写操作的事故可以自动恢复")
+        if graph_state.get("incident_id") != record.id:
+            raise RuntimeError("持久化执行状态与事故标识不一致")
+        request = graph_state.get("approval_request")
+        if not isinstance(request, dict):
+            raise RuntimeError("持久化执行状态缺少审批暂停点")
+        restored_request = ApprovalRequest.model_validate(request)
+        if (
+            restored_request.approval_id != record.approval.approval_id
+            or restored_request.version != record.approval.version
+        ):
+            raise RuntimeError("持久化审批与执行状态不一致")
+
+        self.records[record.id] = record.model_copy(deep=True)
+        self._resume_locks.setdefault(record.id, asyncio.Lock())
+        self._approval_versions[record.id] = record.approval.version
+        await self.graph.aupdate_state(
+            self._config(record.id),
+            graph_state,
+            as_node="prepare_approval",
+        )
+        snapshot = await self.graph.aget_state(self._config(record.id))
+        if snapshot.next != ("human_gate",):
+            self.records.pop(record.id, None)
+            raise RuntimeError("无法恢复到可信的人工审批暂停点")
 
     async def resume(
         self,
@@ -2734,25 +2813,81 @@ class IncidentAgent:
             )
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         self.policy.validate(action)
+        intent_key: str | None = None
+        if self.action_journal is not None:
+            try:
+                intent = await self.action_journal.prepare(
+                    incident_id,
+                    action=action,
+                    precondition=state.get("execution_precondition") or {},
+                )
+            except Exception as exc:
+                return self._preflight_rejected(
+                    f"无法持久化受限操作意图，已阻止集群写入：{exc}"
+                )
+            if intent.status != "prepared":
+                return self._preflight_rejected(
+                    f"操作意图已经处于 {intent.status}，禁止自动重复执行"
+                )
+            intent_key = intent.idempotency_key
         # The final cancellation check and in-flight marker are consecutive with
         # no await between them. A resolved signal therefore either prevents the
         # dispatch or observes that the write may already have started.
         invalidation_reason = self._invalidated_incidents.get(incident_id)
         if invalidation_reason:
+            if self.action_journal is not None and intent_key is not None:
+                await self.action_journal.cancel(
+                    intent_key,
+                    reason=invalidation_reason,
+                )
             return self._preflight_rejected(
                 f"工具调用前告警已经恢复，已阻止集群操作：{invalidation_reason}"
             )
+        # From this point the Agent only submits an immutable intent. In durable
+        # mode an independent Executor owns the Kubernetes write credential and
+        # performs the final claim/fencing checks.
         self._writes_in_flight.add(incident_id)
         self._write_dispatched_incidents.add(incident_id)
         try:
-            result = await self._call_tool_traced(
-                state,
-                parent_name="execute",
-                key=action.tool_name,
-                tool_name=action.tool_name,
-                arguments=action.arguments,
-                precondition=state.get("execution_precondition"),
+            result = await self.action_executor.execute(
+                incident_id,
+                idempotency_key=intent_key,
+                action=action,
+                precondition=state.get("execution_precondition") or {},
             )
+        except ActionExecutionRejected as exc:
+            return self._preflight_rejected(
+                f"独立 Executor 在写入前拒绝了操作：{exc}"
+            )
+        except ActionOutcomeUnknown as exc:
+            return {
+                "status": IncidentStatus.ESCALATED.value,
+                "preflight_passed": False,
+                "approval_request": None,
+                "timeline": [
+                    _event(
+                        "action.outcome_unknown",
+                        "独立 Executor 可能已经派发集群写操作，结果未知且禁止自动重放",
+                        execution_outcome="unknown",
+                        reason=str(exc),
+                        tool_name=action.tool_name,
+                    )
+                ],
+            }
+        except Exception as exc:
+            return {
+                "status": IncidentStatus.ESCALATED.value,
+                "preflight_passed": False,
+                "approval_request": None,
+                "timeline": [
+                    _event(
+                        "executor.failed_closed",
+                        "独立 Executor 调用失败，已停止自动处置",
+                        reason=str(exc),
+                        tool_name=action.tool_name,
+                    )
+                ],
+            }
         finally:
             self._writes_in_flight.discard(incident_id)
         invalidated_during_write = incident_id in self._invalidated_during_write
@@ -2859,7 +2994,10 @@ class IncidentAgent:
             httpx.AsyncClient(timeout=3, trust_env=False) if self.verification_probe_url else None
         )
         try:
-            for attempt_index in range(1, 31):
+            for attempt_index in range(
+                1,
+                self.verification_max_attempts + 1,
+            ):
                 attempts = attempt_index
                 if probe_client:
                     try:
@@ -2978,7 +3116,7 @@ class IncidentAgent:
                 healthy = healthy_windows >= required_windows
                 if healthy:
                     break
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.verification_interval_seconds)
         finally:
             if probe_client:
                 await probe_client.aclose()

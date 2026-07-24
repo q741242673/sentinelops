@@ -1,0 +1,203 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-api
+    spec:
+      serviceAccountName: sentinelops-api
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          args: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom:
+            - configMapRef:
+                name: sentinelops-topology-runtime
+          env:
+            - name: SENTINELOPS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: database-url
+            - name: SENTINELOPS_AUDIT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: audit-hmac-key
+            - name: SENTINELOPS_ALERTMANAGER_WEBHOOK_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: webhook-bearer-token
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+spec:
+  selector:
+    app.kubernetes.io/name: sentinelops-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-executor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-executor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-executor
+    spec:
+      serviceAccountName: sentinelops-executor
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: executor
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          args: ["executor"]
+          envFrom:
+            - configMapRef:
+                name: sentinelops-topology-runtime
+          env:
+            - name: SENTINELOPS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: database-url
+            - name: SENTINELOPS_AUDIT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: audit-hmac-key
+            - name: SENTINELOPS_EXECUTOR_HEALTH_FILE
+              value: /var/run/sentinelops/health/heartbeat
+          startupProbe:
+            exec:
+              command:
+                - sentinelops
+                - executor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - sentinelops
+                - executor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sentinelops
+                - executor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+          volumeMounts:
+            - name: health
+              mountPath: /var/run/sentinelops/health
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: health
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-migrator
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-anchor-publisher
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-runtime
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  SENTINELOPS_ENVIRONMENT: production
+  SENTINELOPS_TOOL_BACKEND: kubernetes
+  SENTINELOPS_KUBERNETES_NAMESPACE: sentinelops-workloads
+  SENTINELOPS_DATABASE_AUTO_CREATE: "false"
+  SENTINELOPS_DATABASE_URL_FILE: /var/run/secrets/sentinelops/database-url
+  SENTINELOPS_AUDIT_HMAC_KEY_FILE: /var/run/secrets/sentinelops/audit-hmac-key
+  SENTINELOPS_AUDIT_KEY_ID: prod-audit-v1
+  SENTINELOPS_AUDIT_ANCHOR_ENFORCEMENT_REQUIRED: "true"
+  SENTINELOPS_EXECUTOR_MODE: external
+  SENTINELOPS_ALERTMANAGER_SOURCE_ID: prod-cluster-a
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-anchor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  SENTINELOPS_AUDIT_ANCHOR_URL: https://replace-with-independent-audit-sink.example/v1/anchors
+  SENTINELOPS_AUDIT_ANCHOR_INVENTORY_URL: https://replace-with-independent-audit-sink.example/v1/anchor-inventory
+  SENTINELOPS_AUDIT_ANCHOR_SOURCE_ID: prod-cluster-a
+  SENTINELOPS_AUDIT_ANCHOR_BEARER_TOKEN_FILE: /var/run/secrets/sentinelops/audit-anchor-token
+  SENTINELOPS_AUDIT_ANCHOR_RECONCILE_BEARER_TOKEN_FILE: /var/run/secrets/sentinelops/audit-anchor-reconcile-token
+  SENTINELOPS_AUDIT_ANCHOR_TRUSTED_RECEIVER_ID: replace-with-receiver-id
+  SENTINELOPS_AUDIT_ANCHOR_RECEIPT_PUBLIC_KEYS_FILE: /etc/sentinelops-anchor/receipt-public-keys.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-anchor-public-keys
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  receipt-public-keys.json: '{"replace-key-id":"replace-base64url-ed25519-public-key"}'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  SENTINELOPS_DEMO_ENABLED: "false"
+  SENTINELOPS_MODEL_PROVIDER: openai_compatible
+  SENTINELOPS_MODEL_NAME: replace-with-model-name
+  SENTINELOPS_MODEL_BASE_URL: http://model-gateway.sentinelops-dependencies.svc.cluster.local/v1
+  SENTINELOPS_MODEL_API_KEY_FILE: /var/run/secrets/sentinelops/model-api-key
+  SENTINELOPS_PROMETHEUS_URL: http://prometheus.sentinelops-dependencies.svc.cluster.local:9090
+  SENTINELOPS_LOKI_URL: http://loki.sentinelops-dependencies.svc.cluster.local:3100
+  SENTINELOPS_TEMPO_URL: http://tempo.sentinelops-dependencies.svc.cluster.local:3200
+  SENTINELOPS_VERIFICATION_PROBE_URL: http://order-service.sentinelops-workloads.svc.cluster.local
+  SENTINELOPS_ALERTMANAGER_WEBHOOK_AUTH_MODE: bearer
+  SENTINELOPS_ALERTMANAGER_WEBHOOK_BEARER_TOKEN_FILE: /var/run/secrets/sentinelops/webhook-bearer-token
+  SENTINELOPS_OPERATOR_AUTH_MODE: oidc
+  SENTINELOPS_OIDC_ISSUER: https://replace-with-company-idp.example
+  SENTINELOPS_OIDC_AUDIENCE: sentinelops-api
+  SENTINELOPS_OIDC_JWKS_URL: https://replace-with-company-idp.example/.well-known/jwks.json
+  SENTINELOPS_OIDC_ROLES_CLAIM: roles
+  SENTINELOPS_OIDC_HUMAN_CLAIM: sentinelops_actor_type
+  SENTINELOPS_OIDC_HUMAN_VALUE: human

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: sentinelops-demo
+data:
+  alertmanager.yml: |
+    route:
+      receiver: sentinelops
+      group_by: [alertname, namespace, service]
+      group_wait: 0s
+      group_interval: 5s
+      repeat_interval: 1m
+    receivers:
+      - name: sentinelops
+        webhook_configs:
+          - url: http://sentinelops-api.sentinelops-system.svc.cluster.local:8000/api/v1/webhooks/alertmanager
+            send_resolved: true
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/sentinelops-webhook/token

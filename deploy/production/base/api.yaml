@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-api
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-api
+        app.kubernetes.io/part-of: sentinelops
+    spec:
+      serviceAccountName: sentinelops-api
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sentinelops-api
+      containers:
+        - name: api
+          image: ghcr.io/your-org/sentinelops:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom:
+            - configMapRef:
+                name: sentinelops-runtime
+            - configMapRef:
+                name: sentinelops-api
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: runtime-secret
+              mountPath: /var/run/secrets/sentinelops
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime-secret
+          projected:
+            defaultMode: 288
+            sources:
+              - secret:
+                  name: sentinelops-runtime
+                  items:
+                    - key: database-url
+                      path: database-url
+                    - key: audit-hmac-key
+                      path: audit-hmac-key
+                    - key: webhook-bearer-token
+                      path: webhook-bearer-token
+                    - key: model-api-key
+                      path: model-api-key
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-api
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: sentinelops-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

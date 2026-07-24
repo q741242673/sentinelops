@@ -1,0 +1,81 @@
+name: live-model-eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: OpenAI-compatible model name
+        required: true
+        type: string
+      model_base_url:
+        description: OpenAI-compatible API base URL
+        required: true
+        type: string
+      input_cost_per_million:
+        description: Optional USD cost per million input tokens
+        required: false
+        type: string
+      output_cost_per_million:
+        description: Optional USD cost per million output tokens
+        required: false
+        type: string
+      max_p95_case_latency_ms:
+        description: Maximum accepted p95 case latency in milliseconds
+        required: true
+        default: "120000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-model-eval
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SENTINELOPS_MODEL_PROVIDER: openai_compatible
+      SENTINELOPS_MODEL_NAME: ${{ inputs.model_name }}
+      SENTINELOPS_MODEL_BASE_URL: ${{ inputs.model_base_url }}
+      SENTINELOPS_MODEL_API_KEY: ${{ secrets.SENTINELOPS_LIVE_EVAL_API_KEY || secrets.DEEPSEEK_API_KEY }}
+      SENTINELOPS_MODEL_TIMEOUT_SECONDS: "60"
+      INPUT_COST_PER_MILLION: ${{ inputs.input_cost_per_million }}
+      OUTPUT_COST_PER_MILLION: ${{ inputs.output_cost_per_million }}
+      MAX_P95_CASE_LATENCY_MS: ${{ inputs.max_p95_case_latency_ms }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - name: Check live evaluation credential
+        run: |
+          if [[ -z "$SENTINELOPS_MODEL_API_KEY" ]]; then
+            echo "Configure SENTINELOPS_LIVE_EVAL_API_KEY as a repository secret."
+            exit 1
+          fi
+      - name: Run read-only live model evaluation
+        shell: bash
+        run: |
+          args=(
+            --output artifacts/live-model-evaluation.json
+            --max-p95-case-latency-ms "$MAX_P95_CASE_LATENCY_MS"
+          )
+          if [[ -n "$INPUT_COST_PER_MILLION" ]]; then
+            args+=(--input-cost-per-million "$INPUT_COST_PER_MILLION")
+          fi
+          if [[ -n "$OUTPUT_COST_PER_MILLION" ]]; then
+            args+=(--output-cost-per-million "$OUTPUT_COST_PER_MILLION")
+          fi
+          python evals/live_run.py "${args[@]}"
+      - name: Upload live model evaluation report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: live-model-evaluation-report
+          path: artifacts/live-model-evaluation.json
+          if-no-files-found: warn
+          retention-days: 30

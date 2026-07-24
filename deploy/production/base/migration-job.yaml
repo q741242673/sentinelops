@@ -1,0 +1,66 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sentinelops-db-migrate
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-migrator
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  activeDeadlineSeconds: 600
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-migrator
+        app.kubernetes.io/part-of: sentinelops
+    spec:
+      serviceAccountName: sentinelops-migrator
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/your-org/sentinelops:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["db-init"]
+          env:
+            - name: SENTINELOPS_DATABASE_URL_FILE
+              value: /var/run/secrets/sentinelops/database-url
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: runtime-secret
+              mountPath: /var/run/secrets/sentinelops
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime-secret
+          projected:
+            defaultMode: 288
+            sources:
+              - secret:
+                  name: sentinelops-runtime
+                  items:
+                    - key: database-url
+                      path: database-url
+        - name: tmp
+          emptyDir: {}

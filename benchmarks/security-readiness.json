@@ -1,0 +1,233 @@
+{
+  "schema_version": "sentinelops.security-readiness.v1",
+  "run_id": "58f76dc0667c46c0b4ba0ef82ddd4450",
+  "generated_at": "2026-07-24T11:45:36.776298+00:00",
+  "environment": {
+    "python": "3.13.3",
+    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "kubernetes": "kind",
+    "api_replicas": 2,
+    "executor_replicas": 2,
+    "database": "PostgreSQL 16",
+    "model_provider": "rule_based",
+    "control_plane_chaos": false,
+    "security_e2e": true
+  },
+  "scope": "staging security acceptance topology with an ephemeral signed OIDC issuer and an independently persisted, signed audit anchor",
+  "thresholds": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1
+  },
+  "summary": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1,
+    "audit_events": 22,
+    "control_plane_chaos": false,
+    "security_e2e": true,
+    "duration_ms": 27212.538
+  },
+  "latency_ms": {
+    "fault_rollout": {
+      "p50": 2005.18,
+      "p95": 2005.18,
+      "max": 2005.18
+    },
+    "fault_to_prometheus_firing": {
+      "p50": 9172.931,
+      "p95": 9172.931,
+      "max": 9172.931
+    },
+    "prometheus_firing_to_webhook_incident": {
+      "p50": 6.864,
+      "p95": 6.864,
+      "max": 6.864
+    },
+    "webhook_to_approval_plan": {
+      "p50": 7.029,
+      "p95": 7.029,
+      "max": 7.029
+    },
+    "approval_to_verified_recovery": {
+      "p50": 13547.218,
+      "p95": 13547.218,
+      "max": 13547.218
+    },
+    "fault_to_verified_recovery": {
+      "p50": 22767.87,
+      "p95": 22767.87,
+      "max": 22767.87
+    },
+    "fault_to_alert_cleared": {
+      "p50": 23000.602,
+      "p95": 23000.602,
+      "max": 23000.602
+    }
+  },
+  "trial": {
+    "passed": true,
+    "incident_id": "a0cfab74-420c-4d21-886e-2f28408f5730",
+    "incident_status": "resolved",
+    "injected_revision": 9,
+    "expected_revision": 8,
+    "root_cause": "库存服务 Deployment revision 9 启用了合成预留故障",
+    "evidence_sources": [
+      "kubernetes_logs",
+      "loki",
+      "prometheus"
+    ],
+    "failed_trace_id": "29c08c176077a62bc30fc4436e0721b5",
+    "approving_api_url": "http://127.0.0.1:18100",
+    "executor_id": "sentinelops-executor-65846f94f-s5tf6:1:f736f1d0-d0b6-4496-8cd7-0ec4ebd6f12a",
+    "action_intents": 1,
+    "audit_events": 22,
+    "failed_requests_before_recovery": 22,
+    "healthy_requests_after_recovery": 10,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "timings_ms": {
+      "fault_rollout": 2005.18,
+      "fault_to_prometheus_firing": 9172.931,
+      "prometheus_firing_to_webhook_incident": 6.864,
+      "webhook_to_approval_plan": 7.029,
+      "approval_to_verified_recovery": 13547.218,
+      "fault_to_verified_recovery": 22767.87,
+      "fault_to_alert_cleared": 23000.602
+    },
+    "checks": {
+      "anchor_gate_started_blocked": true,
+      "anchor_outage_failed_closed": true,
+      "two_api_replicas_ready": true,
+      "two_executor_replicas_ready": true,
+      "two_anchor_publishers_ready": true,
+      "anchor_gate_healthy_before_remediation": true,
+      "baseline_traffic_healthy": true,
+      "alertmanager_webhook_received": true,
+      "approval_gate_reached": true,
+      "root_cause_matches_injected_fault": true,
+      "grounded_observability_evidence": true,
+      "expected_remediation_selected": true,
+      "durable_snapshot_visible_on_all_api_replicas": true,
+      "missing_operator_token_rejected": true,
+      "invalid_oidc_token_rejected": true,
+      "viewer_cannot_approve": true,
+      "one_succeeded_action_intent": true,
+      "independent_executor_claimed_action": true,
+      "approval_persisted": true,
+      "hmac_audit_chain_persisted": true,
+      "migration_head_applied": true,
+      "agent_resolved": true,
+      "deployment_restored": true,
+      "recovered_traffic_healthy": true,
+      "strict_recovery_evidence_present": true,
+      "resolved_webhook_persisted": true,
+      "final_state_visible_on_all_api_replicas": true,
+      "verified_oidc_approval_audited": true,
+      "all_audit_anchors_delivered": true,
+      "signed_external_anchor_matches_local_head": true,
+      "anchor_gate_remained_healthy": true
+    },
+    "database_snapshot": {
+      "schema_revision": "0008_anchor_unlock_workflow",
+      "action_intents": [
+        {
+          "status": "succeeded",
+          "executor_id": "sentinelops-executor-65846f94f-s5tf6:1:f736f1d0-d0b6-4496-8cd7-0ec4ebd6f12a",
+          "executor_generation": 1,
+          "attempt_id": "3d9ec9e5-f67e-4a5c-a402-ad524966eb57",
+          "action": {
+            "tool_name": "rollback_deployment",
+            "arguments": {
+              "name": "inventory-service",
+              "revision": 8
+            },
+            "rationale": "revision 9 引入库存服务 HTTP 503，而 revision 8 已知健康",
+            "expected_outcome": "库存服务不再返回 HTTP 503，结账流量恢复",
+            "risk": "high"
+          },
+          "result": {
+            "tool_name": "rollback_deployment",
+            "success": true,
+            "content": {
+              "deployment": "inventory-service",
+              "rolled_back": true,
+              "source_revision": 8,
+              "source_replica_set": "inventory-service-5c858c84db"
+            },
+            "error": null,
+            "duration_ms": 26.15795799999887
+          }
+        }
+      ],
+      "approval_status": "approved",
+      "alert_binding_status": "resolved",
+      "audit_events": 22,
+      "hmac_audit_events": 22,
+      "approval_audit_events": [
+        {
+          "actor_id": "74904155e587ad50380b05e6c625491c12eb240a218c50c7318bf482c9ec45fe",
+          "actor_assurance": "oidc-human",
+          "actor_type": "operator"
+        }
+      ],
+      "audit_head_sequence": 22,
+      "audit_head_hash": "8c4cc2c744b34fce210d0191218ca4829957e8c9a05132e571b61c96aeef099d",
+      "anchor_outbox_total": 22,
+      "anchor_outbox_undelivered": 0,
+      "latest_anchor_receipt": {
+        "protocol_version": "sentinelops.audit-anchor-receipt.v2",
+        "anchor_id": "b6cd33882baf4b48da69b44097622cb0f3a441497793136d123b4dea98d47822",
+        "source_id": "kind-security-e2e",
+        "incident_id": "a0cfab74-420c-4d21-886e-2f28408f5730",
+        "sequence": 22,
+        "head_hash": "8c4cc2c744b34fce210d0191218ca4829957e8c9a05132e571b61c96aeef099d",
+        "head_auth_tag": "52ebe1d4aa45a9ea71fae46e75a157cdee0713a6f1092a852bc2400ce673e598",
+        "head_committed_at": "2026-07-24T11:45:35.899426+00:00",
+        "audit": {
+          "auth_algorithm": "hmac-sha256",
+          "key_id": "topology-e2e-v1"
+        },
+        "previous_anchor_id": "7b4cd16f2233c2263bd618fe6793def424fb626cc2c1f44534f20dccb62166c3",
+        "bootstrap_checkpoint": false,
+        "status": "accepted",
+        "receipt_id": "c25544832a249adfe5037f02e3fd273faa018c7a48c1abcf299b91e02268436b",
+        "request_sha256": "25d294088bfa86cd8c61021ba0ebe52eb71248f0b4cfdf7a2b5ebf2f7d05e630",
+        "receiver_id": "kind-security-anchor",
+        "signature_algorithm": "ed25519",
+        "receipt_key_id": "security-e2e-ed25519-v1",
+        "receipt_signature": "4syAj-R5ZcKW5LJ9z3sqVfP6jV14rOsl-a0qus58nHhWjgcpP7evh-_LU9Kic23x9uZdQEwN_RV7TC1lf130CQ",
+        "accepted_at": "2026-07-24T11:45:35.926339+00:00"
+      },
+      "anchor_security_status": "healthy",
+      "anchor_security_write_blocked": 0,
+      "action_claim_events": [
+        {
+          "actor_id": "sentinelops-executor-65846f94f-s5tf6:1:f736f1d0-d0b6-4496-8cd7-0ec4ebd6f12a",
+          "payload": {
+            "executor_generation": 1,
+            "attempt_id": "3d9ec9e5-f67e-4a5c-a402-ad524966eb57",
+            "lease_expires_at": "2026-07-24T11:45:41.554846+00:00"
+          }
+        }
+      ],
+      "action_requeue_events": []
+    },
+    "chaos": {},
+    "security": {
+      "enabled": true,
+      "operator_auth_mode": "oidc",
+      "approval_actor_assurance": "oidc-human",
+      "approval_actor_id": "74904155e587ad50380b05e6c625491c12eb240a218c50c7318bf482c9ec45fe",
+      "anchor_source_id": "kind-security-e2e",
+      "anchor_receiver_id": "kind-security-anchor",
+      "anchor_receipt_key_id": "security-e2e-ed25519-v1",
+      "anchor_sequence": 22,
+      "anchor_head_hash": "8c4cc2c744b34fce210d0191218ca4829957e8c9a05132e571b61c96aeef099d"
+    },
+    "error_type": null,
+    "error": null
+  }
+}

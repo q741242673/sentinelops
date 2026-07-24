@@ -1,0 +1,221 @@
+{
+  "schema_version": "sentinelops.control-plane-chaos.v1",
+  "run_id": "d780e920dece4bfebe9c683ee138d4f9",
+  "generated_at": "2026-07-24T10:45:12.260381+00:00",
+  "environment": {
+    "python": "3.13.3",
+    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "kubernetes": "kind",
+    "api_replicas": 2,
+    "executor_replicas": 2,
+    "database": "PostgreSQL 16",
+    "model_provider": "rule_based",
+    "control_plane_chaos": true
+  },
+  "scope": "staging acceptance topology with ephemeral credentials; enterprise OIDC and external audit anchoring remain production deployment requirements",
+  "thresholds": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1
+  },
+  "summary": {
+    "passed": true,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "action_intents": 1,
+    "audit_events": 23,
+    "control_plane_chaos": true,
+    "duration_ms": 74378.789
+  },
+  "latency_ms": {
+    "fault_rollout": {
+      "p50": 2020.905,
+      "p95": 2020.905,
+      "max": 2020.905
+    },
+    "fault_to_prometheus_firing": {
+      "p50": 9171.005,
+      "p95": 9171.005,
+      "max": 9171.005
+    },
+    "prometheus_firing_to_webhook_incident": {
+      "p50": 7.52,
+      "p95": 7.52,
+      "max": 7.52
+    },
+    "webhook_to_approval_plan": {
+      "p50": 7.157,
+      "p95": 7.157,
+      "max": 7.157
+    },
+    "api_pod_replacement": {
+      "p50": 2797.156,
+      "p95": 2797.156,
+      "max": 2797.156
+    },
+    "executor_pod_replacement": {
+      "p50": 5536.78,
+      "p95": 5536.78,
+      "max": 5536.78
+    },
+    "approval_to_verified_recovery": {
+      "p50": 58681.775,
+      "p95": 58681.775,
+      "max": 58681.775
+    },
+    "fault_to_verified_recovery": {
+      "p50": 71008.274,
+      "p95": 71008.274,
+      "max": 71008.274
+    },
+    "fault_to_alert_cleared": {
+      "p50": 71231.098,
+      "p95": 71231.098,
+      "max": 71231.098
+    }
+  },
+  "trial": {
+    "passed": true,
+    "incident_id": "ecac726e-4cd3-49a1-b746-6a429bec4013",
+    "incident_status": "resolved",
+    "injected_revision": 4,
+    "expected_revision": 3,
+    "root_cause": "库存服务 Deployment revision 4 启用了合成预留故障",
+    "evidence_sources": [
+      "kubernetes_logs",
+      "loki",
+      "prometheus"
+    ],
+    "failed_trace_id": "0670e17024e492a4996fa45065f02db6",
+    "approving_api_url": "http://127.0.0.1:18101",
+    "executor_id": "sentinelops-executor-65846f94f-vkxdc:1:0116f778-d5e9-4eea-8249-af4ac388e22d",
+    "action_intents": 1,
+    "audit_events": 23,
+    "failed_requests_before_recovery": 96,
+    "healthy_requests_after_recovery": 10,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "timings_ms": {
+      "fault_rollout": 2020.905,
+      "fault_to_prometheus_firing": 9171.005,
+      "prometheus_firing_to_webhook_incident": 7.52,
+      "webhook_to_approval_plan": 7.157,
+      "api_pod_replacement": 2797.156,
+      "executor_pod_replacement": 5536.78,
+      "approval_to_verified_recovery": 58681.775,
+      "fault_to_verified_recovery": 71008.274,
+      "fault_to_alert_cleared": 71231.098
+    },
+    "checks": {
+      "two_api_replicas_ready": true,
+      "two_executor_replicas_ready": true,
+      "baseline_traffic_healthy": true,
+      "alertmanager_webhook_received": true,
+      "approval_gate_reached": true,
+      "root_cause_matches_injected_fault": true,
+      "grounded_observability_evidence": true,
+      "expected_remediation_selected": true,
+      "durable_snapshot_visible_on_all_api_replicas": true,
+      "webhook_owner_api_pod_restarted": true,
+      "approval_survived_api_restart": true,
+      "claimed_executor_pod_restarted": true,
+      "one_succeeded_action_intent": true,
+      "independent_executor_claimed_action": true,
+      "expired_claim_requeued_once": true,
+      "different_executor_claim_generation_took_over": true,
+      "approval_persisted": true,
+      "hmac_audit_chain_persisted": true,
+      "migration_head_applied": true,
+      "agent_resolved": true,
+      "deployment_restored": true,
+      "recovered_traffic_healthy": true,
+      "strict_recovery_evidence_present": true,
+      "resolved_webhook_persisted": true,
+      "final_state_visible_on_all_api_replicas": true
+    },
+    "database_snapshot": {
+      "schema_revision": "0008_anchor_unlock_workflow",
+      "action_intents": [
+        {
+          "status": "succeeded",
+          "executor_id": "sentinelops-executor-65846f94f-vkxdc:1:0116f778-d5e9-4eea-8249-af4ac388e22d",
+          "executor_generation": 2,
+          "attempt_id": "287ac383-080f-44ef-99cc-6b9403393c2a",
+          "action": {
+            "tool_name": "rollback_deployment",
+            "arguments": {
+              "name": "inventory-service",
+              "revision": 3
+            },
+            "rationale": "revision 4 引入库存服务 HTTP 503，而 revision 3 已知健康",
+            "expected_outcome": "库存服务不再返回 HTTP 503，结账流量恢复",
+            "risk": "high"
+          },
+          "result": {
+            "tool_name": "rollback_deployment",
+            "success": true,
+            "content": {
+              "deployment": "inventory-service",
+              "rolled_back": true,
+              "source_revision": 3,
+              "source_replica_set": "inventory-service-766b554c56"
+            },
+            "error": null,
+            "duration_ms": 28.278541999952722
+          }
+        }
+      ],
+      "approval_status": "approved",
+      "alert_binding_status": "resolved",
+      "audit_events": 23,
+      "hmac_audit_events": 23,
+      "action_claim_events": [
+        {
+          "actor_id": "sentinelops-executor-65846f94f-wvggl:1:41da1a0e-9395-4e8b-9be4-3432c94c0d4f",
+          "payload": {
+            "executor_generation": 1,
+            "attempt_id": "49116a70-a398-4fd2-b1e5-f54e4f8ac777",
+            "lease_expires_at": "2026-07-24T10:44:32.748107+00:00"
+          }
+        },
+        {
+          "actor_id": "sentinelops-executor-65846f94f-vkxdc:1:0116f778-d5e9-4eea-8249-af4ac388e22d",
+          "payload": {
+            "executor_generation": 2,
+            "attempt_id": "287ac383-080f-44ef-99cc-6b9403393c2a",
+            "lease_expires_at": "2026-07-24T10:45:17.870733+00:00"
+          }
+        }
+      ],
+      "action_requeue_events": [
+        {
+          "actor_id": "executor-claim-reaper",
+          "payload": {
+            "previous_executor_id": "sentinelops-executor-65846f94f-wvggl:1:41da1a0e-9395-4e8b-9be4-3432c94c0d4f",
+            "previous_generation": 1,
+            "reason": "claim_expired_before_dispatch"
+          }
+        }
+      ]
+    },
+    "chaos": {
+      "deleted_api_pod": "sentinelops-api-68bc6d99b9-2c8pn",
+      "replacement_api_pod": "sentinelops-api-68bc6d99b9-nkbsp",
+      "surviving_api_url": "http://127.0.0.1:18101",
+      "first_executor_id": "sentinelops-executor-65846f94f-wvggl:1:41da1a0e-9395-4e8b-9be4-3432c94c0d4f",
+      "first_executor_generation": 1,
+      "deleted_executor_pod": "sentinelops-executor-65846f94f-wvggl",
+      "replacement_executor_pods": [
+        "sentinelops-executor-65846f94f-fw8j6",
+        "sentinelops-executor-65846f94f-vkxdc"
+      ],
+      "final_executor_id": "sentinelops-executor-65846f94f-vkxdc:1:0116f778-d5e9-4eea-8249-af4ac388e22d",
+      "final_executor_generation": 2,
+      "claim_events": 2,
+      "requeue_events": 1
+    },
+    "error_type": null,
+    "error": null
+  }
+}

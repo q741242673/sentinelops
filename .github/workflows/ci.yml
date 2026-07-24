@@ -16,7 +16,79 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest -q
-      - run: python evals/run.py
+      - name: Run production Agent safety evaluation
+        run: python evals/run.py --output artifacts/agent-evaluation.json
+      - name: Upload Agent evaluation report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: agent-evaluation-report
+          path: artifacts/agent-evaluation.json
+          if-no-files-found: error
+          retention-days: 30
+
+  postgres-contract:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: sentinelops
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sentinelops"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SENTINELOPS_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/sentinelops
+      SENTINELOPS_MIGRATION_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/sentinelops_migrations
+      SENTINELOPS_BENCHMARK_DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/sentinelops_benchmark
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - name: Create isolated migration and benchmark databases
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql \
+            --host 127.0.0.1 \
+            --username postgres \
+            --dbname sentinelops \
+            --command "CREATE DATABASE sentinelops_migrations"
+          psql \
+            --host 127.0.0.1 \
+            --username postgres \
+            --dbname sentinelops \
+            --command "CREATE DATABASE sentinelops_benchmark"
+      - run: pytest -q tests/test_postgres_migrations.py
+      - run: SENTINELOPS_DATABASE_URL="$SENTINELOPS_TEST_DATABASE_URL" sentinelops db-init
+      - run: SENTINELOPS_DATABASE_URL="$SENTINELOPS_TEST_DATABASE_URL" sentinelops db-check
+      - run: >-
+          pytest -q
+          tests/test_postgres_alert_dedup.py
+          tests/test_postgres_audit.py
+          tests/test_postgres_store.py
+      - name: Run PostgreSQL production-readiness benchmark
+        run: >-
+          python scripts/production_readiness.py
+          --rounds 20
+          --concurrency 16
+          --output artifacts/production-readiness.json
+      - name: Upload production-readiness report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: production-readiness-report
+          path: artifacts/production-readiness.json
+          if-no-files-found: error
+          retention-days: 30
 
   console:
     runs-on: ubuntu-latest
@@ -64,4 +136,53 @@ jobs:
           chmod +x kind
           sudo mv kind /usr/local/bin/kind
       - run: python -m pip install -e "."
-      - run: scripts/e2e-observability.sh
+      - name: Run in-process Kubernetes recovery benchmark
+        run: SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER=true scripts/e2e-observability.sh
+      - name: Upload Kubernetes readiness report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: kubernetes-readiness-report
+          path: artifacts/kubernetes-readiness.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Run replicated control-plane topology benchmark
+        env:
+          SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER: "true"
+          SENTINELOPS_TOPOLOGY_READINESS_OUTPUT: artifacts/topology-readiness.json
+        run: scripts/e2e-topology.sh
+      - name: Upload topology readiness report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: topology-readiness-report
+          path: artifacts/topology-readiness.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Restart API and Executor during a real remediation
+        env:
+          SENTINELOPS_CONTROL_PLANE_CHAOS: "true"
+          SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER: "true"
+          SENTINELOPS_TOPOLOGY_READINESS_OUTPUT: artifacts/control-plane-chaos.json
+        run: scripts/e2e-topology.sh
+      - name: Upload control-plane chaos report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: control-plane-chaos-report
+          path: artifacts/control-plane-chaos.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Verify OIDC authorization and external audit anchoring
+        env:
+          SENTINELOPS_SECURITY_E2E: "true"
+          SENTINELOPS_TOPOLOGY_READINESS_OUTPUT: artifacts/security-readiness.json
+        run: scripts/e2e-topology.sh
+      - name: Upload security readiness report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: security-readiness-report
+          path: artifacts/security-readiness.json
+          if-no-files-found: error
+          retention-days: 30
