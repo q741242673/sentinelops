@@ -6,6 +6,13 @@ CLUSTER_NAME="${SENTINELOPS_OBSERVABILITY_CLUSTER:-sentinelops-observability}"
 CONTEXT="kind-${CLUSTER_NAME}"
 IMAGE="sentinelops-demo-services:local"
 ALERTMANAGER_IMAGE="prom/alertmanager:v0.28.1"
+OBSERVABILITY_IMAGES=(
+  "prom/prometheus:v3.13.1"
+  "${ALERTMANAGER_IMAGE}"
+  "grafana/loki:3.7.3"
+  "grafana/tempo:3.0.2"
+  "otel/opentelemetry-collector-contrib:0.156.0"
+)
 
 diagnose_deployment() {
   local deployment="$1"
@@ -45,10 +52,13 @@ case "$(docker exec "${NODE_CONTAINER}" uname -m)" in
   x86_64) NODE_PLATFORM="linux/amd64" ;;
   *) echo "Unsupported kind node architecture" >&2; exit 1 ;;
 esac
-docker pull --platform "${NODE_PLATFORM}" "${ALERTMANAGER_IMAGE}"
-docker save "${ALERTMANAGER_IMAGE}" | docker exec --privileged -i "${NODE_CONTAINER}" \
-  ctr --namespace=k8s.io images import \
-  --platform "${NODE_PLATFORM}" --digests --snapshotter=overlayfs -
+for observability_image in "${OBSERVABILITY_IMAGES[@]}"; do
+  docker pull --platform "${NODE_PLATFORM}" "${observability_image}"
+  docker save "${observability_image}" |
+    docker exec --privileged -i "${NODE_CONTAINER}" \
+      ctr --namespace=k8s.io images import \
+      --platform "${NODE_PLATFORM}" --digests --snapshotter=overlayfs -
+done
 
 INVENTORY_DEPLOYMENT_EXISTS=false
 ORDER_DEPLOYMENT_EXISTS=false

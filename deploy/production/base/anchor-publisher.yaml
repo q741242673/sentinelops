@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-anchor-publisher
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-anchor-publisher
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-anchor-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-anchor-publisher
+        app.kubernetes.io/part-of: sentinelops
+    spec:
+      serviceAccountName: sentinelops-anchor-publisher
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: sentinelops-anchor-publisher
+      containers:
+        - name: anchor-publisher
+          image: ghcr.io/your-org/sentinelops:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["anchor-publisher"]
+          envFrom:
+            - configMapRef:
+                name: sentinelops-runtime
+            - configMapRef:
+                name: sentinelops-anchor
+          env:
+            - name: SENTINELOPS_AUDIT_ANCHOR_HEALTH_FILE
+              value: /var/run/sentinelops/health/heartbeat
+          startupProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "120"
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 36
+          livenessProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "120"
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "120"
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: runtime-secret
+              mountPath: /var/run/secrets/sentinelops
+              readOnly: true
+            - name: anchor-health
+              mountPath: /var/run/sentinelops/health
+            - name: anchor-public-keys
+              mountPath: /etc/sentinelops-anchor
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: runtime-secret
+          projected:
+            defaultMode: 288
+            sources:
+              - secret:
+                  name: sentinelops-runtime
+                  items:
+                    - key: database-url
+                      path: database-url
+                    - key: audit-hmac-key
+                      path: audit-hmac-key
+                    - key: audit-anchor-token
+                      path: audit-anchor-token
+                    - key: audit-anchor-reconcile-token
+                      path: audit-anchor-reconcile-token
+        - name: anchor-health
+          emptyDir: {}
+        - name: anchor-public-keys
+          configMap:
+            name: sentinelops-anchor-public-keys
+            items:
+              - key: receipt-public-keys.json
+                path: receipt-public-keys.json
+        - name: tmp
+          emptyDir: {}

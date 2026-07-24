@@ -1,0 +1,281 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinelops-security
+  labels:
+    app.kubernetes.io/part-of: sentinelops-security-e2e
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-anchor-publisher
+  namespace: sentinelops-system
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oidc-jwks
+  namespace: sentinelops-security
+spec:
+  selector:
+    app.kubernetes.io/name: oidc-jwks
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oidc-jwks
+  namespace: sentinelops-security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oidc-jwks
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oidc-jwks
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jwks
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          command: ["python"]
+          args: ["-m", "http.server", "8080", "--directory", "/srv/jwks"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /.well-known/jwks.json
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: jwks
+              mountPath: /srv/jwks
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: jwks
+          configMap:
+            name: sentinelops-security-jwks
+            defaultMode: 292
+            items:
+              - key: jwks.json
+                path: .well-known/jwks.json
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchor-postgres
+  namespace: sentinelops-security
+spec:
+  selector:
+    app.kubernetes.io/name: anchor-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anchor-postgres
+  namespace: sentinelops-security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anchor-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anchor-postgres
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: postgres-user
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: postgres-password
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: postgres-database
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -ec
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchor-service
+  namespace: sentinelops-security
+spec:
+  selector:
+    app.kubernetes.io/name: anchor-service
+  ports:
+    - name: http
+      port: 8010
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anchor-service
+  namespace: sentinelops-security
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anchor-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anchor-service
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: anchor-service
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          args: ["anchor-service", "--host", "0.0.0.0", "--port", "8010"]
+          env:
+            - name: SENTINELOPS_ENVIRONMENT
+              value: staging
+            - name: SENTINELOPS_ANCHOR_SERVICE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: database-url
+            - name: SENTINELOPS_ANCHOR_SERVICE_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: anchor-delivery-token
+            - name: SENTINELOPS_ANCHOR_SERVICE_INVENTORY_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-security-secrets
+                  key: anchor-inventory-token
+            - name: SENTINELOPS_ANCHOR_SERVICE_ALLOWED_SOURCE_ID
+              value: kind-security-e2e
+            - name: SENTINELOPS_ANCHOR_SERVICE_RECEIVER_ID
+              value: kind-security-anchor
+            - name: SENTINELOPS_ANCHOR_SERVICE_SIGNING_KEY_ID
+              value: security-e2e-ed25519-v1
+            - name: SENTINELOPS_ANCHOR_SERVICE_SIGNING_PRIVATE_KEY_FILE
+              value: /var/run/secrets/anchor/private.pem
+          ports:
+            - name: http
+              containerPort: 8010
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: signing-key
+              mountPath: /var/run/secrets/anchor
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: sentinelops-security-secrets
+            defaultMode: 288
+            items:
+              - key: anchor-private.pem
+                path: private.pem
+        - name: tmp
+          emptyDir: {}

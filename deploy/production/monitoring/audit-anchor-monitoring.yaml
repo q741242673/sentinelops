@@ -1,0 +1,112 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinelops-audit-anchor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sentinelops-audit-anchor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  groups:
+    - name: sentinelops.audit-anchor
+      rules:
+        - alert: SentinelOpsAuditAnchorIntegrityBlocked
+          expr: >-
+            max(sentinelops_audit_anchor_security_state{
+              status="integrity_blocked"
+            }) == 1
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 因审计锚定完整性异常关闭了集群写操作
+        - alert: SentinelOpsAuditAnchorUnlockPendingTooLong
+          expr: >-
+            max(sentinelops_audit_anchor_security_state{
+              status="unlock_pending"
+            }) == 1
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 双人解锁已批准，但严格全量对账仍未完成
+        - alert: SentinelOpsAuditAnchorConfigurationBlocked
+          expr: >-
+            max(sentinelops_audit_anchor_security_state{
+              status="configuration_blocked"
+            }) == 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 审计锚定配置异常，集群写操作已关闭
+        - alert: SentinelOpsAuditAnchorInitializingTooLong
+          expr: >-
+            max(sentinelops_audit_anchor_security_state{
+              status="initializing"
+            }) == 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: SentinelOps 审计锚定长时间未完成首次对账
+        - alert: SentinelOpsAuditAnchorDeadLetter
+          expr: max(sentinelops_audit_anchor_dead_letter_items) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 存在需要人工处置的审计锚点
+        - alert: SentinelOpsAuditAnchorBacklogWarning
+          expr: >-
+            max(sentinelops_audit_anchor_oldest_delivery_age_seconds) > 600
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: SentinelOps 最老审计锚点已等待超过 10 分钟
+        - alert: SentinelOpsAuditAnchorBacklogCritical
+          expr: >-
+            max(sentinelops_audit_anchor_oldest_delivery_age_seconds) > 1800
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 最老审计锚点已等待超过 30 分钟
+        - alert: SentinelOpsAuditAnchorReconciliationStale
+          expr: >-
+            time() -
+            max(
+              sentinelops_audit_anchor_reconcile_last_success_timestamp_seconds
+            ) > 300
+            and
+            max(sentinelops_audit_anchor_security_write_blocked) == 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 审计锚定对账已过期且写安全闸门关闭
+        - alert: SentinelOpsAuditAnchorMetricsMissing
+          expr: >-
+            absent(sentinelops_audit_anchor_security_write_blocked)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: Prometheus 已连续 5 分钟收不到 SentinelOps 安全闸门指标

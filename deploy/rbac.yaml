@@ -4,21 +4,34 @@ metadata:
   name: sentinelops-agent
   namespace: sentinelops-demo
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-demo
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: sentinelops-agent
+  name: sentinelops-agent-readonly
   namespace: sentinelops-demo
 rules:
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    resources: ["deployments", "deployments/status", "deployments/scale", "replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-executor-write
+  namespace: sentinelops-demo
+rules:
   - apiGroups: ["apps"]
-    resources: ["deployments/status", "deployments/scale"]
-    verbs: ["get", "list", "watch", "patch"]
+    resources: ["deployments", "deployments/status", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["get", "list", "watch"]
@@ -26,7 +39,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: sentinelops-agent
+  name: sentinelops-agent-readonly
   namespace: sentinelops-demo
 subjects:
   - kind: ServiceAccount
@@ -35,4 +48,18 @@ subjects:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: sentinelops-agent
+  name: sentinelops-agent-readonly
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-executor-write
+  namespace: sentinelops-demo
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-executor
+    namespace: sentinelops-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-executor-write

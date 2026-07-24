@@ -1,4 +1,4 @@
-.PHONY: install test lint eval demo serve console console-live console-live-down console-build kind-up kind-fault kind-e2e kind-down \
+.PHONY: install test lint eval live-model-eval production-readiness kubernetes-readiness topology-readiness control-plane-chaos security-readiness demo serve db-init db-check executor console console-live console-live-down console-build kind-up kind-fault kind-e2e kind-down \
 	observability-up observability-fault observability-e2e golden-path-e2e \
 	observability-down
 
@@ -14,11 +14,41 @@ lint:
 eval:
 	python evals/run.py
 
+live-model-eval:
+	python evals/live_run.py $(LIVE_EVAL_ARGS)
+
+production-readiness:
+	python scripts/production_readiness.py \
+		--rounds 10 \
+		--concurrency 16 \
+		--output benchmarks/production-readiness.json
+
+kubernetes-readiness:
+	scripts/run-kubernetes-readiness.sh
+
+topology-readiness:
+	scripts/e2e-topology.sh
+
+control-plane-chaos:
+	SENTINELOPS_CONTROL_PLANE_CHAOS=true scripts/e2e-topology.sh
+
+security-readiness:
+	SENTINELOPS_SECURITY_E2E=true scripts/e2e-topology.sh
+
 demo:
 	sentinelops demo --scenario bad_rollout --approve
 
 serve:
 	sentinelops serve
+
+db-init:
+	sentinelops db-init
+
+db-check:
+	sentinelops db-check
+
+executor:
+	sentinelops executor
 
 console:
 	scripts/dev-console.sh

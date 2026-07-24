@@ -19,7 +19,7 @@ trap cleanup EXIT
 wait_for_url() {
   local url="$1"
   for _ in $(seq 1 60); do
-    if curl --fail --silent --show-error "${url}" >/dev/null 2>&1; then
+    if curl --noproxy "*" --fail --silent --show-error "${url}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -61,3 +61,8 @@ export SENTINELOPS_VERIFICATION_PROBE_URL=http://127.0.0.1:18080
 export SENTINELOPS_CHANGE_REPOSITORY_PATH="${ROOT_DIR}"
 
 python "${ROOT_DIR}/scripts/golden_path_e2e.py"
+
+python "${ROOT_DIR}/scripts/kubernetes_readiness.py" \
+  --context "${CONTEXT}" \
+  --rounds "${SENTINELOPS_KUBERNETES_READINESS_ROUNDS:-2}" \
+  --output "${SENTINELOPS_KUBERNETES_READINESS_OUTPUT:-${ROOT_DIR}/artifacts/kubernetes-readiness.json}"

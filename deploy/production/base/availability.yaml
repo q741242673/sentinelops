@@ -1,0 +1,38 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinelops-api
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-executor
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinelops-anchor-publisher
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-anchor-publisher

@@ -1,0 +1,562 @@
+{
+  "schema_version": "sentinelops.kubernetes-readiness.v1",
+  "run_id": "309ad3bffd1e4651880daf8829ffe6bd",
+  "generated_at": "2026-07-24T09:18:48.335081+00:00",
+  "environment": {
+    "python": "3.13.3",
+    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "tool_backend": "kubernetes",
+    "model_provider": "rule_based",
+    "model_name": "demo",
+    "namespace": "sentinelops-demo"
+  },
+  "configuration": {
+    "rounds": 3,
+    "fault": "inventory-service FAIL_EVERY=3 bad rollout",
+    "approval": "benchmark operator approves expected rollback",
+    "scope": "deterministic provider; validates the real Kubernetes and observability control loop, not remote-model quality"
+  },
+  "thresholds": {
+    "success_rate": 1.0,
+    "root_cause_accuracy": 1.0,
+    "verified_recovery_rate": 1.0,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "healthy_requests_after_recovery_per_trial": 10
+  },
+  "summary": {
+    "passed": true,
+    "trials": 3,
+    "passed_trials": 3,
+    "success_rate": 1.0,
+    "root_cause_accuracy": 1.0,
+    "verified_recovery_rate": 1.0,
+    "wrong_remediation_plans": 0,
+    "unsafe_writes": 0,
+    "duration_ms": 84741.702
+  },
+  "latency_ms": {
+    "fault_rollout": {
+      "p50": 4110.444,
+      "p95": 4274.961,
+      "max": 4274.961
+    },
+    "signal_detection": {
+      "p50": 9185.459,
+      "p95": 10172.277,
+      "max": 10172.277
+    },
+    "investigation_to_plan": {
+      "p50": 200.788,
+      "p95": 214.62,
+      "max": 214.62
+    },
+    "remediation_and_verification": {
+      "p50": 13887.12,
+      "p95": 14859.358,
+      "max": 14859.358
+    },
+    "fault_to_verified_recovery": {
+      "p50": 23309.763,
+      "p95": 24282.673,
+      "max": 24282.673
+    },
+    "fault_to_alert_cleared": {
+      "p50": 23448.668,
+      "p95": 24416.434,
+      "max": 24416.434
+    }
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "passed": true,
+      "incident_id": "dd728f82-7c16-4f8f-b0bc-35a249072b3a",
+      "incident_status": "resolved",
+      "alert_name": "HighInventoryErrorRate",
+      "failed_trace_id": "9da0699fe271c92f0d4001cdb7ebd1fc",
+      "root_cause": "库存服务 Deployment revision 100 启用了合成预留故障",
+      "diagnosis_confidence": 0.94,
+      "diagnosis_missing_evidence": [],
+      "diagnosis_contradictions": [],
+      "evidence_sources": [
+        "git_changes",
+        "kubernetes_logs",
+        "loki",
+        "prometheus",
+        "tempo"
+      ],
+      "remediation_tool": "rollback_deployment",
+      "remediation_target": "inventory-service",
+      "expected_revision": 99,
+      "injected_revision": 100,
+      "wrong_remediation_plans": 0,
+      "unsafe_writes": 0,
+      "write_attempts": 1,
+      "successful_writes": 1,
+      "failed_requests_before_recovery": 17,
+      "healthy_requests_after_recovery": 10,
+      "timings_ms": {
+        "fault_rollout": 3732.198,
+        "signal_detection": 8193.471,
+        "investigation_to_plan": 214.62,
+        "remediation_and_verification": 14859.358,
+        "fault_to_verified_recovery": 23309.763,
+        "fault_to_alert_cleared": 23448.668
+      },
+      "checks": {
+        "baseline_traffic_healthy": true,
+        "approval_gate_reached": true,
+        "diagnosis_present": true,
+        "plan_present": true,
+        "root_cause_matches_injected_fault": true,
+        "required_evidence_present": true,
+        "expected_remediation_selected": true,
+        "agent_resolved": true,
+        "exactly_one_expected_write": true,
+        "deployment_restored": true,
+        "recovered_traffic_healthy": true,
+        "prometheus_alert_cleared": true
+      },
+      "timeline_tail": [
+        {
+          "type": "approval.requested",
+          "message": "high 风险操作需要人工明确批准",
+          "data": {
+            "approval_id": "6c606276-0731-4d3d-a5e2-776fb574cfd2",
+            "approval_version": 1,
+            "execution_profile_id": "production-default",
+            "configured_max_risk": "low"
+          },
+          "created_at": "2026-07-24T09:17:36.155965Z"
+        },
+        {
+          "type": "approval.decided",
+          "message": "修复操作已批准",
+          "data": {
+            "approval_id": "6c606276-0731-4d3d-a5e2-776fb574cfd2",
+            "approval_version": 1,
+            "approved": true,
+            "note": "Approved by the Kubernetes readiness benchmark operator"
+          },
+          "created_at": "2026-07-24T09:17:36.158290Z"
+        },
+        {
+          "type": "remediation.preflight_passed",
+          "message": "执行前校验通过，审批绑定的集群状态未发生变化",
+          "data": {
+            "deployment_uid": "1094f121-7ed9-4ae1-987b-3e408f6d2c93",
+            "generation": 100,
+            "current_revision": 100
+          },
+          "created_at": "2026-07-24T09:17:36.168648Z"
+        },
+        {
+          "type": "action.executed",
+          "message": "rollback_deployment：执行成功",
+          "data": {},
+          "created_at": "2026-07-24T09:17:36.185513Z"
+        },
+        {
+          "type": "recovery.verified",
+          "message": "服务已恢复",
+          "data": {
+            "metrics": {
+              "source": "kubernetes_deployment_status",
+              "desired_replicas": 1,
+              "available_replicas": 1,
+              "availability": 1.0,
+              "note": "Connect Prometheus MCP for request-level SLI metrics"
+            },
+            "pods": {
+              "items": [
+                {
+                  "name": "inventory-service-5d6c544bd4-z4vjb",
+                  "phase": "Running",
+                  "ready": true,
+                  "restarts": 0,
+                  "waiting_reasons": [],
+                  "created_at": "2026-07-24T09:17:36+00:00"
+                }
+              ]
+            },
+            "prometheus": {
+              "source": "prometheus",
+              "query": "(sum(rate(http_requests_total{service=\"inventory-service\",status=~\"5..\"}[10s])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"inventory-service\"}[10s])), 0.001)",
+              "result_type": "vector",
+              "result": [
+                {
+                  "metric": {},
+                  "value": [
+                    1784884670.982,
+                    "0"
+                  ]
+                }
+              ]
+            },
+            "request_error_rate": 0.0,
+            "request_rate": 6.374203224596926,
+            "alert_firing": false,
+            "active_probe_statuses": [
+              502,
+              502,
+              502,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200
+            ],
+            "successful_trace_id": "80efa4f99717e616655d8cab1419998b",
+            "trace_structure_valid": true,
+            "successful_trace_verified": true,
+            "healthy_windows": 3,
+            "attempts": 15
+          },
+          "created_at": "2026-07-24T09:17:51.015670Z"
+        },
+        {
+          "type": "postmortem.generated",
+          "message": "事故报告已生成",
+          "data": {},
+          "created_at": "2026-07-24T09:17:51.016263Z"
+        }
+      ],
+      "error_type": null,
+      "error": null
+    },
+    {
+      "trial": 1,
+      "passed": true,
+      "incident_id": "28be06f0-12db-4546-95a7-d7bffbe4f8f7",
+      "incident_status": "resolved",
+      "alert_name": "HighInventoryErrorRate",
+      "failed_trace_id": "85abda95f8159d2feee69dbacfd6d7a1",
+      "root_cause": "库存服务 Deployment revision 102 启用了合成预留故障",
+      "diagnosis_confidence": 0.94,
+      "diagnosis_missing_evidence": [],
+      "diagnosis_contradictions": [],
+      "evidence_sources": [
+        "git_changes",
+        "kubernetes_logs",
+        "loki",
+        "prometheus",
+        "tempo"
+      ],
+      "remediation_tool": "rollback_deployment",
+      "remediation_target": "inventory-service",
+      "expected_revision": 101,
+      "injected_revision": 102,
+      "wrong_remediation_plans": 0,
+      "unsafe_writes": 0,
+      "write_attempts": 1,
+      "successful_writes": 1,
+      "failed_requests_before_recovery": 24,
+      "healthy_requests_after_recovery": 10,
+      "timings_ms": {
+        "fault_rollout": 4110.444,
+        "signal_detection": 10172.277,
+        "investigation_to_plan": 200.788,
+        "remediation_and_verification": 13887.12,
+        "fault_to_verified_recovery": 24282.673,
+        "fault_to_alert_cleared": 24416.434
+      },
+      "checks": {
+        "baseline_traffic_healthy": true,
+        "approval_gate_reached": true,
+        "diagnosis_present": true,
+        "plan_present": true,
+        "root_cause_matches_injected_fault": true,
+        "required_evidence_present": true,
+        "expected_remediation_selected": true,
+        "agent_resolved": true,
+        "exactly_one_expected_write": true,
+        "deployment_restored": true,
+        "recovered_traffic_healthy": true,
+        "prometheus_alert_cleared": true
+      },
+      "timeline_tail": [
+        {
+          "type": "approval.requested",
+          "message": "high 风险操作需要人工明确批准",
+          "data": {
+            "approval_id": "05f6f15d-aa83-4367-a514-738903383daa",
+            "approval_version": 1,
+            "execution_profile_id": "production-default",
+            "configured_max_risk": "low"
+          },
+          "created_at": "2026-07-24T09:18:06.186576Z"
+        },
+        {
+          "type": "approval.decided",
+          "message": "修复操作已批准",
+          "data": {
+            "approval_id": "05f6f15d-aa83-4367-a514-738903383daa",
+            "approval_version": 1,
+            "approved": true,
+            "note": "Approved by the Kubernetes readiness benchmark operator"
+          },
+          "created_at": "2026-07-24T09:18:06.188767Z"
+        },
+        {
+          "type": "remediation.preflight_passed",
+          "message": "执行前校验通过，审批绑定的集群状态未发生变化",
+          "data": {
+            "deployment_uid": "1094f121-7ed9-4ae1-987b-3e408f6d2c93",
+            "generation": 102,
+            "current_revision": 102
+          },
+          "created_at": "2026-07-24T09:18:06.199585Z"
+        },
+        {
+          "type": "action.executed",
+          "message": "rollback_deployment：执行成功",
+          "data": {},
+          "created_at": "2026-07-24T09:18:06.216170Z"
+        },
+        {
+          "type": "recovery.verified",
+          "message": "服务已恢复",
+          "data": {
+            "metrics": {
+              "source": "kubernetes_deployment_status",
+              "desired_replicas": 1,
+              "available_replicas": 1,
+              "availability": 1.0,
+              "note": "Connect Prometheus MCP for request-level SLI metrics"
+            },
+            "pods": {
+              "items": [
+                {
+                  "name": "inventory-service-64f88c6767-s66s4",
+                  "phase": "Running",
+                  "ready": true,
+                  "restarts": 0,
+                  "waiting_reasons": [],
+                  "created_at": "2026-07-24T09:18:06+00:00"
+                }
+              ]
+            },
+            "prometheus": {
+              "source": "prometheus",
+              "query": "(sum(rate(http_requests_total{service=\"inventory-service\",status=~\"5..\"}[10s])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"inventory-service\"}[10s])), 0.001)",
+              "result_type": "vector",
+              "result": [
+                {
+                  "metric": {},
+                  "value": [
+                    1784884700.044,
+                    "0"
+                  ]
+                }
+              ]
+            },
+            "request_error_rate": 0.0,
+            "request_rate": 6.23535,
+            "alert_firing": false,
+            "active_probe_statuses": [
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200
+            ],
+            "successful_trace_id": "824c6b40ffbd72803a831e7b87155cb9",
+            "trace_structure_valid": true,
+            "successful_trace_verified": true,
+            "healthy_windows": 3,
+            "attempts": 14
+          },
+          "created_at": "2026-07-24T09:18:20.073758Z"
+        },
+        {
+          "type": "postmortem.generated",
+          "message": "事故报告已生成",
+          "data": {},
+          "created_at": "2026-07-24T09:18:20.074446Z"
+        }
+      ],
+      "error_type": null,
+      "error": null
+    },
+    {
+      "trial": 2,
+      "passed": true,
+      "incident_id": "aa937221-df87-4350-a076-86f03fb0f142",
+      "incident_status": "resolved",
+      "alert_name": "HighInventoryErrorRate",
+      "failed_trace_id": "04ccd38a6b274f17dca7512946b6634b",
+      "root_cause": "库存服务 Deployment revision 104 启用了合成预留故障",
+      "diagnosis_confidence": 0.94,
+      "diagnosis_missing_evidence": [],
+      "diagnosis_contradictions": [],
+      "evidence_sources": [
+        "git_changes",
+        "kubernetes_logs",
+        "loki",
+        "prometheus",
+        "tempo"
+      ],
+      "remediation_tool": "rollback_deployment",
+      "remediation_target": "inventory-service",
+      "expected_revision": 103,
+      "injected_revision": 104,
+      "wrong_remediation_plans": 0,
+      "unsafe_writes": 0,
+      "write_attempts": 1,
+      "successful_writes": 1,
+      "failed_requests_before_recovery": 21,
+      "healthy_requests_after_recovery": 10,
+      "timings_ms": {
+        "fault_rollout": 4274.961,
+        "signal_detection": 9185.459,
+        "investigation_to_plan": 195.378,
+        "remediation_and_verification": 13779.508,
+        "fault_to_verified_recovery": 23188.402,
+        "fault_to_alert_cleared": 23317.953
+      },
+      "checks": {
+        "baseline_traffic_healthy": true,
+        "approval_gate_reached": true,
+        "diagnosis_present": true,
+        "plan_present": true,
+        "root_cause_matches_injected_fault": true,
+        "required_evidence_present": true,
+        "expected_remediation_selected": true,
+        "agent_resolved": true,
+        "exactly_one_expected_write": true,
+        "deployment_restored": true,
+        "recovered_traffic_healthy": true,
+        "prometheus_alert_cleared": true
+      },
+      "timeline_tail": [
+        {
+          "type": "approval.requested",
+          "message": "high 风险操作需要人工明确批准",
+          "data": {
+            "approval_id": "d3d88b9f-0cb7-48c8-980b-bce2ec3c18e6",
+            "approval_version": 1,
+            "execution_profile_id": "production-default",
+            "configured_max_risk": "low"
+          },
+          "created_at": "2026-07-24T09:18:34.335372Z"
+        },
+        {
+          "type": "approval.decided",
+          "message": "修复操作已批准",
+          "data": {
+            "approval_id": "d3d88b9f-0cb7-48c8-980b-bce2ec3c18e6",
+            "approval_version": 1,
+            "approved": true,
+            "note": "Approved by the Kubernetes readiness benchmark operator"
+          },
+          "created_at": "2026-07-24T09:18:34.337374Z"
+        },
+        {
+          "type": "remediation.preflight_passed",
+          "message": "执行前校验通过，审批绑定的集群状态未发生变化",
+          "data": {
+            "deployment_uid": "1094f121-7ed9-4ae1-987b-3e408f6d2c93",
+            "generation": 104,
+            "current_revision": 104
+          },
+          "created_at": "2026-07-24T09:18:34.347379Z"
+        },
+        {
+          "type": "action.executed",
+          "message": "rollback_deployment：执行成功",
+          "data": {},
+          "created_at": "2026-07-24T09:18:34.363297Z"
+        },
+        {
+          "type": "recovery.verified",
+          "message": "服务已恢复",
+          "data": {
+            "metrics": {
+              "source": "kubernetes_deployment_status",
+              "desired_replicas": 1,
+              "available_replicas": 1,
+              "availability": 1.0,
+              "note": "Connect Prometheus MCP for request-level SLI metrics"
+            },
+            "pods": {
+              "items": [
+                {
+                  "name": "inventory-service-d6fccb57b-mk2xn",
+                  "phase": "Running",
+                  "ready": true,
+                  "restarts": 0,
+                  "waiting_reasons": [],
+                  "created_at": "2026-07-24T09:18:34+00:00"
+                }
+              ]
+            },
+            "prometheus": {
+              "source": "prometheus",
+              "query": "(sum(rate(http_requests_total{service=\"inventory-service\",status=~\"5..\"}[10s])) or vector(0)) / clamp_min(sum(rate(http_requests_total{service=\"inventory-service\"}[10s])), 0.001)",
+              "result_type": "vector",
+              "result": [
+                {
+                  "metric": {},
+                  "value": [
+                    1784884728.086,
+                    "0"
+                  ]
+                }
+              ]
+            },
+            "request_error_rate": 0.0,
+            "request_rate": 6.236665716785401,
+            "alert_firing": false,
+            "active_probe_statuses": [
+              200,
+              200,
+              200,
+              502,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200,
+              200
+            ],
+            "successful_trace_id": "1bc59b2af0254fec8c2fe05d7ba98e53",
+            "trace_structure_valid": true,
+            "successful_trace_verified": true,
+            "healthy_windows": 3,
+            "attempts": 14
+          },
+          "created_at": "2026-07-24T09:18:48.113391Z"
+        },
+        {
+          "type": "postmortem.generated",
+          "message": "事故报告已生成",
+          "data": {},
+          "created_at": "2026-07-24T09:18:48.114734Z"
+        }
+      ],
+      "error_type": null,
+      "error": null
+    }
+  ]
+}

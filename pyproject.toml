@@ -11,14 +11,20 @@ requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "SentinelOps Contributors" }]
 dependencies = [
+  "alembic>=1.14,<2",
+  "aiosqlite>=0.20,<1",
+  "asyncpg>=0.30,<1",
+  "cryptography>=44,<50",
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "kubernetes>=30,<35",
   "langgraph>=0.6,<2",
   "openai>=1.68,<3",
+  "pyjwt[crypto]>=2.10,<3",
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "pyyaml>=6,<7",
+  "sqlalchemy[asyncio]>=2.0.36,<3",
   "uvicorn[standard]>=0.34,<1",
 ]
 
@@ -33,6 +39,8 @@ dev = [
 [project.scripts]
 sentinelops = "sentinelops.cli:main"
 sentinelops-mcp = "sentinelops.mcp_server:main"
+sentinelops-executor-health = "sentinelops.healthcheck:executor_main"
+sentinelops-anchor-health = "sentinelops.healthcheck:anchor_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sentinelops"]

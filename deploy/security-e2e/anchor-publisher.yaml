@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-anchor-publisher
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-anchor-publisher
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-anchor-publisher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-anchor-publisher
+    spec:
+      serviceAccountName: sentinelops-anchor-publisher
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: anchor-publisher
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          args: ["anchor-publisher"]
+          envFrom:
+            - configMapRef:
+                name: sentinelops-topology-runtime
+          env:
+            - name: SENTINELOPS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: database-url
+            - name: SENTINELOPS_AUDIT_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: audit-hmac-key
+            - name: SENTINELOPS_AUDIT_ANCHOR_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: audit-anchor-token
+            - name: SENTINELOPS_AUDIT_ANCHOR_RECONCILE_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sentinelops-topology-secrets
+                  key: audit-anchor-reconcile-token
+            - name: SENTINELOPS_AUDIT_ANCHOR_URL
+              value: http://anchor-service.sentinelops-security.svc.cluster.local:8010/v1/anchors
+            - name: SENTINELOPS_AUDIT_ANCHOR_INVENTORY_URL
+              value: http://anchor-service.sentinelops-security.svc.cluster.local:8010/v1/anchor-inventory
+            - name: SENTINELOPS_AUDIT_ANCHOR_SOURCE_ID
+              value: kind-security-e2e
+            - name: SENTINELOPS_AUDIT_ANCHOR_TRUSTED_RECEIVER_ID
+              value: kind-security-anchor
+            - name: SENTINELOPS_AUDIT_ANCHOR_RECEIPT_PUBLIC_KEYS_FILE
+              value: /etc/sentinelops-anchor/receipt-public-keys.json
+            - name: SENTINELOPS_AUDIT_ANCHOR_TIMEOUT_SECONDS
+              value: "5"
+            - name: SENTINELOPS_AUDIT_ANCHOR_CLAIM_TTL_SECONDS
+              value: "20"
+            - name: SENTINELOPS_AUDIT_ANCHOR_POLL_INTERVAL_SECONDS
+              value: "0.1"
+            - name: SENTINELOPS_AUDIT_ANCHOR_RECONCILE_INTERVAL_SECONDS
+              value: "5"
+            - name: SENTINELOPS_AUDIT_ANCHOR_RECONCILE_MAX_STALENESS_SECONDS
+              value: "30"
+            - name: SENTINELOPS_AUDIT_ANCHOR_HEALTH_FILE
+              value: /var/run/sentinelops/health/heartbeat
+          startupProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 2
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command:
+                - sentinelops-anchor-health
+                - --max-age-seconds
+                - "30"
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: health
+              mountPath: /var/run/sentinelops/health
+            - name: public-keys
+              mountPath: /etc/sentinelops-anchor
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: health
+          emptyDir: {}
+        - name: public-keys
+          configMap:
+            name: sentinelops-topology-anchor-public-keys
+            defaultMode: 292
+            items:
+              - key: receipt-public-keys.json
+                path: receipt-public-keys.json
+        - name: tmp
+          emptyDir: {}

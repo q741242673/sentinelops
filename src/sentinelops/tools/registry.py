@@ -131,9 +131,16 @@ CHANGE_TOOL_SPECS = [
 
 
 class ToolRegistry:
-    def __init__(self, backend: ToolBackend, specs: list[ToolSpec] | None = None) -> None:
+    def __init__(
+        self,
+        backend: ToolBackend,
+        specs: list[ToolSpec] | None = None,
+        *,
+        allow_guarded_writes: bool = True,
+    ) -> None:
         self.backend = backend
         self.specs = {spec.name: spec for spec in (specs or KUBERNETES_TOOL_SPECS)}
+        self.allow_guarded_writes = allow_guarded_writes
 
     def list_specs(self) -> list[ToolSpec]:
         return list(self.specs.values())
@@ -173,6 +180,12 @@ class ToolRegistry:
         precondition: dict[str, Any],
     ) -> ToolResult:
         """Attach a host-generated write guard after validating only public arguments."""
+        if not self.allow_guarded_writes:
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                error="This process does not hold the cluster-write capability",
+            )
         validation_error = self.validation_error(name, arguments)
         if validation_error:
             return ToolResult(tool_name=name, success=False, error=validation_error)
@@ -225,7 +238,11 @@ class ToolRegistry:
         return None
 
 
-def build_tool_registry(settings: Settings) -> ToolRegistry:
+def build_tool_registry(
+    settings: Settings,
+    *,
+    allow_guarded_writes: bool = True,
+) -> ToolRegistry:
     if settings.tool_backend == "simulator":
         kubernetes: ToolBackend = SimulatedKubernetesBackend()
     else:
@@ -259,4 +276,8 @@ def build_tool_registry(settings: Settings) -> ToolRegistry:
         )
         specs.extend(CHANGE_TOOL_SPECS)
         routes["get_change_evidence"] = changes
-    return ToolRegistry(CompositeBackend(routes), specs)
+    return ToolRegistry(
+        CompositeBackend(routes),
+        specs,
+        allow_guarded_writes=allow_guarded_writes,
+    )

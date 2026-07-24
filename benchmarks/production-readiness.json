@@ -1,0 +1,89 @@
+{
+  "schema_version": "sentinelops.production-readiness.v1",
+  "run_id": "605b8116e61c4378b294ef2cf87beea2",
+  "generated_at": "2026-07-24T08:47:00.473886+00:00",
+  "environment": {
+    "python": "3.13.3",
+    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "postgresql": "16.14"
+  },
+  "configuration": {
+    "rounds_per_scenario": 10,
+    "concurrency": 16,
+    "scenario_count": 5
+  },
+  "thresholds": {
+    "correctness_rate": 1.0,
+    "unsafe_writes": 0
+  },
+  "summary": {
+    "passed": true,
+    "total_trials": 50,
+    "passed_trials": 50,
+    "correctness_rate": 1.0,
+    "unsafe_writes": 0,
+    "duration_ms": 2842.943
+  },
+  "scenarios": {
+    "publisher_failover": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 5.173,
+        "p95": 28.399,
+        "max": 28.399
+      },
+      "failures": []
+    },
+    "alert_deduplication": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 52.942,
+        "p95": 246.076,
+        "max": 246.076
+      },
+      "failures": []
+    },
+    "executor_single_claim": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 17.754,
+        "p95": 181.897,
+        "max": 181.897
+      },
+      "failures": []
+    },
+    "executor_crash_recovery": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 9.869,
+        "p95": 37.004,
+        "max": 37.004
+      },
+      "failures": []
+    },
+    "worker_lease_fencing": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 2.951,
+        "p95": 21.438,
+        "max": 21.438
+      },
+      "failures": []
+    }
+  }
+}
