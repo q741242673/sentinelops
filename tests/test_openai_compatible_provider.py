@@ -33,6 +33,7 @@ async def test_provider_repairs_invalid_structured_output() -> None:
         model="test-model",
         api_key="test-key",
         base_url="https://model.example/v1",
+        max_tokens=2048,
     )
     create = AsyncMock(
         side_effect=[
@@ -58,6 +59,10 @@ async def test_provider_repairs_invalid_structured_output() -> None:
 
     assert result.required_field == "repaired"
     assert create.await_count == 2
+    assert all(
+        call.kwargs["max_tokens"] == 2048
+        for call in create.await_args_list
+    )
     correction_messages = create.await_args_list[1].kwargs["messages"]
     assert "Validation errors" in correction_messages[-1]["content"]
     metrics = provider.metrics_snapshot()
@@ -66,6 +71,80 @@ async def test_provider_repairs_invalid_structured_output() -> None:
     assert metrics[0].valid_output is False
     assert metrics[1].valid_output is True
     assert all(metric.schema_name == "ExampleOutput" for metric in metrics)
+    await provider.client.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_retries_empty_structured_output() -> None:
+    provider = OpenAICompatibleProvider(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://model.example/v1",
+    )
+    create = AsyncMock(
+        side_effect=[
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="  "))],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content='{"required_field": "retried"}')
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+    )
+    provider.client.chat.completions.create = create
+
+    result = await provider.structured(
+        system="Return test data",
+        prompt="Build the object",
+        schema=ExampleOutput,
+    )
+
+    assert result.required_field == "retried"
+    assert create.await_count == 2
+    retry_messages = create.await_args_list[1].kwargs["messages"]
+    assert "previous response was empty" in retry_messages[-1]["content"]
+    metrics = provider.metrics_snapshot()
+    assert [metric.error_type for metric in metrics] == ["EmptyResponse", None]
+    assert [metric.valid_output for metric in metrics] == [False, True]
+    await provider.client.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_fails_after_two_empty_structured_outputs() -> None:
+    provider = OpenAICompatibleProvider(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://model.example/v1",
+    )
+    provider.client.chat.completions.create = AsyncMock(
+        side_effect=[
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=""))],
+                usage=None,
+            ),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="empty structured response after retry"):
+        await provider.structured(
+            system="Return test data",
+            prompt="Build the object",
+            schema=ExampleOutput,
+        )
+
+    metrics = provider.metrics_snapshot()
+    assert len(metrics) == 2
+    assert all(metric.error_type == "EmptyResponse" for metric in metrics)
     await provider.client.close()
 
 
@@ -141,4 +220,13 @@ def test_provider_rejects_non_positive_deadline() -> None:
             model="test-model",
             api_key="test-key",
             timeout_seconds=0,
+        )
+
+
+def test_provider_rejects_non_positive_max_tokens() -> None:
+    with pytest.raises(ValueError, match="max_tokens"):
+        OpenAICompatibleProvider(
+            model="test-model",
+            api_key="test-key",
+            max_tokens=0,
         )

@@ -61,15 +61,21 @@ const SOURCE_LABELS: Record<string, string> = {
 
 type DemoMode = "manual" | "auto" | "reflection";
 
-const DEMO_MODES: Array<{
+const FAULT_SCENARIOS: Array<{
   id: DemoMode;
   title: string;
   subtitle: string;
 }> = [
-  { id: "auto", title: "自动修复", subtitle: "自动授权安全操作" },
-  { id: "manual", title: "人工审批", subtitle: "高风险操作需确认" },
-  { id: "reflection", title: "复杂调查", subtitle: "证据冲突时定向补查" },
+  { id: "auto", title: "瞬态运行时故障", subtitle: "允许自动执行安全重启" },
+  { id: "manual", title: "错误版本发布", subtitle: "回滚前必须人工审批" },
+  { id: "reflection", title: "证据冲突故障", subtitle: "触发有边界的定向补查" },
 ];
+
+const FAULT_ACTION_LABELS: Record<DemoMode, string> = {
+  auto: "注入瞬态故障",
+  manual: "发布错误版本",
+  reflection: "注入复杂故障",
+};
 
 function timeLabel(value: string): string {
   return new Intl.DateTimeFormat("zh-CN", {
@@ -96,6 +102,13 @@ function alertTitle(name: string): string {
     InventoryTransientRuntimeFault: "库存服务瞬态运行时故障",
   };
   return labels[name] ?? name;
+}
+
+function executionProfileLabel(incident: Incident): string {
+  if (incident.execution_profile_id.startsWith("lab.auto-remediation")) return "自动处置";
+  if (incident.execution_profile_id.startsWith("lab.bounded-reflection")) return "有界调查";
+  if (incident.execution_profile_id.startsWith("lab.")) return "人工审批";
+  return "生产策略";
 }
 
 function mergeIncident(items: Incident[], updated: Incident): Incident[] {
@@ -128,7 +141,7 @@ function IncidentQueue({
   return (
     <aside className="incident-queue">
       <div className="queue-heading">
-        <span>事故队列</span>
+        <span>事故中心</span>
         <b>{incidents.length}</b>
       </div>
       <div className="queue-list">
@@ -156,23 +169,32 @@ function IncidentQueue({
   );
 }
 
-function DemoLauncher({
+function FaultLab({
   mode,
   busy,
   message,
+  liveMode,
   onModeChange,
   onRun,
 }: {
   mode: DemoMode;
   busy: boolean;
   message: string;
+  liveMode: boolean;
   onModeChange: (mode: DemoMode) => void;
   onRun: () => void;
 }) {
   return (
-    <section className="demo-launcher">
-      <div className="mode-switch" aria-label="演示场景">
-        {DEMO_MODES.map((item) => (
+    <section className="fault-lab">
+      <div className="fault-lab-heading">
+        <div>
+          <span>仅限本地隔离环境</span>
+          <strong>故障实验室</strong>
+          <small>主动制造可恢复故障，用于验证 Agent 的调查和处置链路。</small>
+        </div>
+      </div>
+      <div className="mode-switch" aria-label="故障实验场景">
+        {FAULT_SCENARIOS.map((item) => (
           <button
             type="button"
             key={item.id}
@@ -190,7 +212,11 @@ function DemoLauncher({
           {busy && <i />}{message}
         </span>
         <button type="button" className="run-button" onClick={onRun} disabled={busy}>
-          {busy ? "正在执行" : "启动演示"}
+          {busy
+            ? "正在执行"
+            : liveMode
+              ? FAULT_ACTION_LABELS[mode]
+              : "创建模拟事故"}
         </button>
       </div>
     </section>
@@ -266,11 +292,13 @@ function ExecutionFlow({ incident }: { incident: Incident }) {
 function ResultPanel({
   incident,
   busy,
+  canReset,
   onDecide,
   onReset,
 }: {
   incident: Incident;
   busy: boolean;
+  canReset: boolean;
   onDecide: (approved: boolean) => void;
   onReset: () => void;
 }) {
@@ -338,7 +366,9 @@ function ResultPanel({
         {incident.status === "escalated" && (
           <div className="terminal-result stopped">
             <span>!</span><div><strong>已安全停止</strong><small>没有执行集群写操作</small></div>
-            <button type="button" onClick={onReset} disabled={busy}>恢复演示基线</button>
+            {canReset && (
+              <button type="button" onClick={onReset} disabled={busy}>恢复实验基线</button>
+            )}
           </div>
         )}
       </section>
@@ -379,8 +409,11 @@ function App() {
   const [streamConnected, setStreamConnected] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [faultBusy, setFaultBusy] = useState(false);
+  const [labOpen, setLabOpen] = useState(false);
   const [demoMode, setDemoMode] = useState<DemoMode>("auto");
-  const [demoMessage, setDemoMessage] = useState("选择场景后启动，页面会自动跟随最新事故。");
+  const [demoMessage, setDemoMessage] = useState(
+    "选择一种故障，系统会自动恢复基线、注入故障并等待真实告警。",
+  );
   const [error, setError] = useState<ConsoleError | null>(null);
   const knownIncidentIds = useRef(new Set<string>());
   const incidentStatuses = useRef(new Map<string, Incident["status"]>());
@@ -444,11 +477,9 @@ function App() {
 
   const selected = incidents.find((item) => item.id === selectedId) ?? incidents[0] ?? null;
   const liveMode = runtime?.tool_backend === "kubernetes";
-  const selectedMode: DemoMode = selected?.execution_profile_id.startsWith("lab.bounded-reflection")
-    ? "reflection"
-    : selected?.execution_profile_id.startsWith("lab.auto-remediation")
-      ? "auto"
-      : "manual";
+  const labAvailable = !["prod", "production"].includes(
+    runtime?.environment.trim().toLowerCase() ?? "development",
+  );
   const selectedEvidence = useMemo(
     () => selected?.diagnosis?.hypotheses.flatMap((item) => item.evidence) ?? [],
     [selected],
@@ -488,7 +519,7 @@ function App() {
       setDemoMessage("Alertmanager 已创建新事故，Agent 正在实时处理。");
     } catch (cause) {
       setError(consoleError(cause instanceof Error ? cause.message : "故障注入失败"));
-      setDemoMessage("演示未启动，请根据错误信息检查环境。");
+      setDemoMessage("故障实验未启动，请根据错误信息检查环境。");
     } finally {
       setFaultBusy(false);
     }
@@ -541,20 +572,20 @@ function App() {
   async function resetBaseline() {
     setActionBusy(true);
     setError(null);
-    setDemoMessage("正在恢复演示基线…");
+    setDemoMessage("正在恢复实验基线…");
     try {
       let job = await api.resetDemoEnvironment();
       while (job.status === "resetting") {
-        setDemoMessage("后台正在恢复 Deployment，并等待演示告警清除…");
+        setDemoMessage("后台正在恢复 Deployment，并等待实验告警清除…");
         await new Promise((resolve) => window.setTimeout(resolve, 500));
         job = await api.getDemoResetJob(job.id);
       }
       if (job.status === "failed" || !job.result?.baseline_restored) {
-        throw new Error(job.error ?? "演示环境恢复失败");
+        throw new Error(job.error ?? "实验环境恢复失败");
       }
-      setDemoMessage("演示环境已恢复健康，可以开始下一轮。");
+      setDemoMessage("实验环境已恢复健康，可以开始下一轮。");
     } catch (cause) {
-      setError(consoleError(cause instanceof Error ? cause.message : "无法恢复演示环境"));
+      setError(consoleError(cause instanceof Error ? cause.message : "无法恢复实验环境"));
     } finally {
       setActionBusy(false);
     }
@@ -566,17 +597,29 @@ function App() {
         <div className="product-name"><span>S</span><div><strong>SentinelOps</strong><small>Agent 事故响应控制台</small></div></div>
         <div className="header-status">
           <span><i className={streamConnected ? "connected" : ""} />{streamConnected ? "实时事件已连接" : "正在重连事件流"}</span>
-          <span>{liveMode ? "真实 kind 集群" : "本地模拟环境"}</span>
+          <span>{liveMode ? "Kubernetes 已连接" : "本地模拟环境"}</span>
+          {labAvailable && (
+            <button
+              type="button"
+              className={labOpen ? "lab-toggle active" : "lab-toggle"}
+              onClick={() => setLabOpen((open) => !open)}
+            >
+              {labOpen ? "收起故障实验室" : "本地故障实验室"}
+            </button>
+          )}
         </div>
       </header>
 
-      <DemoLauncher
-        mode={demoMode}
-        busy={faultBusy || actionBusy}
-        message={demoMessage}
-        onModeChange={setDemoMode}
-        onRun={liveMode ? injectFault : createSimulatedIncident}
-      />
+      {labAvailable && labOpen && (
+        <FaultLab
+          mode={demoMode}
+          busy={faultBusy || actionBusy}
+          message={demoMessage}
+          liveMode={liveMode}
+          onModeChange={setDemoMode}
+          onRun={liveMode ? injectFault : createSimulatedIncident}
+        />
+      )}
 
       {visibleError && <div className="error-banner" role="alert">{visibleError.message}</div>}
 
@@ -586,7 +629,11 @@ function App() {
           {loading ? (
             <div className="empty-state"><i /><strong>正在连接事故控制面…</strong></div>
           ) : !selected ? (
-            <div className="empty-state"><i /><strong>等待演示开始</strong><span>启动一个场景后，这里会立即显示 Agent 的每一步动作。</span></div>
+            <div className="empty-state">
+              <i />
+              <strong>等待 Alertmanager 告警</strong>
+              <span>真实告警进入后，这里会立即展示 Agent 的调查、决策和验证过程。</span>
+            </div>
           ) : (
             <>
               <section className="incident-header">
@@ -596,7 +643,7 @@ function App() {
                   <p>{selected.alert.service} · {selected.alert.namespace} · {timeLabel(selected.created_at)}</p>
                 </div>
                 <div className="incident-facts">
-                  <span><small>场景</small><strong>{DEMO_MODES.find((item) => item.id === selectedMode)?.title}</strong></span>
+                  <span><small>处置策略</small><strong>{executionProfileLabel(selected)}</strong></span>
                   <span><small>证据</small><strong>{selectedEvidence.length}</strong></span>
                   <span><small>状态</small><strong>{STATUS_LABELS[selected.status]}</strong></span>
                 </div>
@@ -606,6 +653,7 @@ function App() {
                 <ResultPanel
                   incident={selected}
                   busy={faultBusy || actionBusy}
+                  canReset={selected.execution_profile_id.startsWith("lab.")}
                   onDecide={decide}
                   onReset={resetBaseline}
                 />

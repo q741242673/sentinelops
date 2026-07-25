@@ -100,6 +100,7 @@ data:
   SENTINELOPS_MODEL_NAME: replace-with-model-name
   SENTINELOPS_MODEL_BASE_URL: http://model-gateway.sentinelops-dependencies.svc.cluster.local/v1
   SENTINELOPS_MODEL_API_KEY_FILE: /var/run/secrets/sentinelops/model-api-key
+  SENTINELOPS_MODEL_MAX_TOKENS: "4096"
   SENTINELOPS_PROMETHEUS_URL: http://prometheus.sentinelops-dependencies.svc.cluster.local:9090
   SENTINELOPS_LOKI_URL: http://loki.sentinelops-dependencies.svc.cluster.local:3100
   SENTINELOPS_TEMPO_URL: http://tempo.sentinelops-dependencies.svc.cluster.local:3200

@@ -39,10 +39,14 @@ class OpenAICompatibleProvider:
         api_key: str,
         base_url: str | None = None,
         timeout_seconds: float = 60,
+        max_tokens: int = 4096,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
         self.model = model
+        self.max_tokens = max_tokens
         self.call_metrics: list[ModelCallMetric] = []
         timeout = httpx.Timeout(
             timeout_seconds,
@@ -89,6 +93,7 @@ class OpenAICompatibleProvider:
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=0,
+                    max_tokens=self.max_tokens,
                 )
             except Exception as exc:
                 self.call_metrics.append(
@@ -124,9 +129,23 @@ class OpenAICompatibleProvider:
                 total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
             )
             content = response.choices[0].message.content
-            if not content:
+            if not content or not content.strip():
+                metric.error_type = "EmptyResponse"
                 self.call_metrics.append(metric)
-                raise RuntimeError("Model returned an empty structured response")
+                if attempt == 1:
+                    raise RuntimeError(
+                        "Model returned an empty structured response after retry"
+                    )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous response was empty. Return only the complete JSON "
+                            "object required by the schema."
+                        ),
+                    }
+                )
+                continue
             try:
                 result = schema.model_validate_json(content)
                 metric.valid_output = True
