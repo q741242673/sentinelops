@@ -17,4 +17,5 @@ def build_provider(settings: Settings) -> LLMProvider:
         api_key=api_key,
         base_url=settings.model_base_url,
         timeout_seconds=settings.model_timeout_seconds,
+        max_tokens=settings.model_max_tokens,
     )

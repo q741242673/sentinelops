@@ -82,6 +82,7 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     assert api["SENTINELOPS_DEMO_ENABLED"] == "false"
     assert api["SENTINELOPS_ALERTMANAGER_WEBHOOK_AUTH_MODE"] != "disabled"
     assert api["SENTINELOPS_MODEL_API_KEY_FILE"].startswith("/var/run/secrets/")
+    assert 256 <= int(api["SENTINELOPS_MODEL_MAX_TOKENS"]) <= 32_768
     assert api["SENTINELOPS_ALERTMANAGER_WEBHOOK_BEARER_TOKEN_FILE"].startswith(
         "/var/run/secrets/"
     )

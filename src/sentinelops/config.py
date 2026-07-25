@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     model_api_key: SecretStr | None = None
     model_api_key_file: str | None = None
     model_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    model_max_tokens: int = Field(default=4096, ge=256, le=32_768)
     kubernetes_namespace: str = "sentinelops-demo"
     demo_enabled: bool = False
     demo_namespace: str = "sentinelops-demo"

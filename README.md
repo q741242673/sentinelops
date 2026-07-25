@@ -169,8 +169,8 @@ make console
 
 ```bash
 SENTINELOPS_MODEL_PROVIDER=openai_compatible \
-SENTINELOPS_MODEL_NAME=your-model-name \
-SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1 \
+SENTINELOPS_MODEL_NAME=deepseek-v4-flash \
+SENTINELOPS_MODEL_BASE_URL=https://api.deepseek.com \
 SENTINELOPS_MODEL_API_KEY=replace-me \
 make console-live
 ```
@@ -209,9 +209,14 @@ SENTINELOPS_MODEL_NAME=your-model-name
 SENTINELOPS_MODEL_BASE_URL=https://api.example.com/v1
 SENTINELOPS_MODEL_API_KEY=replace-me
 SENTINELOPS_MODEL_TIMEOUT_SECONDS=60
+SENTINELOPS_MODEL_MAX_TOKENS=4096
 ```
 
 运行 `make console-live` 时，请像上一节那样在命令前传入这四个变量；这样无论换哪一家服务，启动脚本都不会猜测你想用哪个模型。
+
+远程模型的单次输出默认限制为 4096 Token，可以通过
+`SENTINELOPS_MODEL_MAX_TOKENS` 调整到 256–32768。模型偶尔返回空内容时，Provider 会再请求一次；
+第二次仍为空就安全失败，不会把空结果交给 Agent。
 
 `rule_based` 是给本地离线测试和 CI 使用的固定规则实现，不应该当作生产环境里的大模型。
 

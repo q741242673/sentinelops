@@ -542,10 +542,12 @@ class CatalogCapturingProvider(RuleBasedProvider):
     def __init__(self) -> None:
         super().__init__()
         self.catalog: dict = {}
+        self.diagnosis_system = ""
 
     async def structured(self, *, system, prompt, schema, metadata=None):
         if schema is Diagnosis and not self.catalog:
             self.catalog = json.loads(prompt)["observations"]["evidence_catalog"]
+            self.diagnosis_system = system
         return await super().structured(
             system=system,
             prompt=prompt,
@@ -835,6 +837,8 @@ async def test_context_queries_publish_stable_server_evidence_catalog() -> None:
     assert provider.catalog["collect_context:1:tool:rollout"]["source"] == (
         "kubernetes_rollout"
     )
+    assert "空 Event、空日志" in provider.diagnosis_system
+    assert "不得为了满足多源要求" in provider.diagnosis_system
 
 
 @pytest.mark.asyncio
