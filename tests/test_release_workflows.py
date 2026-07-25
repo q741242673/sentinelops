@@ -8,6 +8,10 @@ CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 SETUP_PYTHON_SHA = "ece7cb06caefa5fff74198d8649806c4678c61a1"
 UPLOAD_ARTIFACT_SHA = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 DOWNLOAD_ARTIFACT_SHA = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+ATTEST_SHA = "f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6"
+BUILD_PUSH_SHA = "53b7df96c91f9c12dcc8a07bcb9ccacbed38856a"
+COSIGN_INSTALLER_SHA = "faadad0cce49287aee09b3a48701e75088a2c6ad"
+SBOM_SHA = "e22c389904149dbc22b58101806040fa8d37a610"
 
 
 def _read(path: str) -> str:
@@ -55,6 +59,39 @@ def test_release_candidate_workflow_builds_without_publishing() -> None:
     assert "docker push" not in workflow
     assert "gh release" not in workflow
     assert "contents: write" not in workflow
+
+
+def test_tag_release_is_fail_closed_signed_and_attested() -> None:
+    workflow = _read(".github/workflows/release.yml")
+
+    assert 'tags:\n      - "v*"' in workflow
+    assert "workflow_dispatch:" not in workflow
+    assert "branches:" not in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "git merge-base --is-ancestor" in workflow
+    assert "actions/workflows/soak.yml/runs?status=success" in workflow
+    assert 'select(.head_sha == \\"${GITHUB_SHA}\\")' in workflow
+    assert "--release-version \"$release_version\"" in workflow
+    assert "Refuse to overwrite an existing RC image tag" in workflow
+    assert "platforms: linux/amd64" in workflow
+    assert "provenance: mode=max" in workflow
+    assert "sbom: true" in workflow
+    assert "push-to-registry: true" in workflow
+    assert "cosign sign --yes" in workflow
+    assert "cosign verify" in workflow
+    assert "python scripts/release_manifest.py" in workflow
+    assert "gh release create" in workflow
+    assert "--prerelease" in workflow
+    assert ":latest" not in workflow
+    assert workflow.index("cosign verify") < workflow.index("gh release create")
+    assert workflow.index("release_manifest.py") < workflow.index("gh release create")
+    assert workflow.count(ATTEST_SHA) == 3
+    assert BUILD_PUSH_SHA in workflow
+    assert COSIGN_INSTALLER_SHA in workflow
+    assert SBOM_SHA in workflow
+    assert CHECKOUT_SHA in workflow
+    assert SETUP_PYTHON_SHA in workflow
+    assert UPLOAD_ARTIFACT_SHA in workflow
 
 
 def test_release_repository_hygiene_is_present() -> None:

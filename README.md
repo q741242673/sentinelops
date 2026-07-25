@@ -736,6 +736,10 @@ make release-check
 - `release-candidate` 只从触发它的 Git commit 构建 Python wheel 和源码包，记录 commit、
   Actions run、版本与 SHA-256 校验和，再放入保留 90 天的 Artifact。它不会创建 Git Tag、
   GitHub Release 或推送容器镜像。
+- `release` 只响应 RC Tag。它要求 Tag 指向 `main` 中已经通过完整 `soak` 的同一个 commit，
+  否则直接停止。通过后才会构建 `linux/amd64` 镜像和 Python 包，生成 SPDX SBOM，写入
+  provenance，用 GitHub OIDC 对镜像做无密钥签名，最后才创建 GitHub Prerelease。RC 不会覆盖
+  已存在的版本镜像，也不会发布 `latest`。
 
 压测结束后不是看日志凭感觉判断。`scripts/soak_gate.py` 会独立读取两份 JSON，并要求：
 
@@ -755,9 +759,37 @@ make kubernetes-soak
 make soak-gate
 ```
 
-这套结果证明的是固定环境里的重复恢复能力和安全不变量，不是生产 SLA。第一次 RC 先把版本、
-制品和验收证据收稳，正式 Tag、镜像 digest、签名、SBOM 与 provenance 会在发布流程验收完成后
-再开放。版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+这套结果证明的是固定环境里的重复恢复能力和安全不变量，不是生产 SLA。正式 RC 发布后，
+GitHub Release 会同时提供 wheel、源码包、`SHA256SUMS`、SPDX SBOM 和
+`release-manifest.json`。清单把源码 commit、完整 soak run、发布 run、镜像 digest 和文件校验和
+绑在一起，查看者不用根据可变 Tag 猜测运行的到底是哪一份代码。版本变化见
+[CHANGELOG.md](CHANGELOG.md)。
+
+下载 Release 文件后可以先验证 Python 制品：
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+镜像必须用 Release 清单中的 digest，而不是只信版本 Tag。下面把 `<digest>` 替换为清单里的
+`sha256:...`：
+
+```bash
+docker pull ghcr.io/q741242673/sentinelops@<digest>
+
+cosign verify \
+  --certificate-identity \
+    "https://github.com/q741242673/sentinelops/.github/workflows/release.yml@refs/tags/v0.1.0-rc.1" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+  ghcr.io/q741242673/sentinelops@<digest>
+
+gh attestation verify \
+  "oci://ghcr.io/q741242673/sentinelops@<digest>" \
+  --repo q741242673/sentinelops
+```
+
+签名只接受这个仓库、这条 Release workflow 和这个 Tag 的 GitHub OIDC 身份；换仓库、换 workflow
+或只拿一个同名镜像都不能通过上述校验。
 
 ### PostgreSQL 多副本与故障恢复基准
 
