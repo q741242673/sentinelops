@@ -30,4 +30,5 @@
 - 生产 OIDC、Secret、外部 Anchor、TLS 和长期存储需要接入企业现有服务；
 - RC 首先验证 `linux/amd64`，暂不承诺多架构镜像；
 - 远程模型评估单独手动运行，定时压测使用确定性 Provider，不产生模型费用；
-- 当前 Release Candidate workflow 先生成候选制品和验收证据，不会自动发布 `latest`。
+- RC 发布只接受已通过完整 soak 的 `main` commit；公开制品包含镜像 digest、签名、SPDX SBOM、
+  provenance 和校验清单，不会发布 `latest`。
