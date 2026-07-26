@@ -41,9 +41,7 @@ type Reconciler struct {
 	ControllerID       string
 	Clock              func() time.Time
 	AfterWrite         func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
-	AdmissionIntegrity interface {
-		Check(context.Context) admissionintegrity.Result
-	}
+	AdmissionIntegrity func(context.Context) admissionintegrity.Result
 }
 
 type validationFailure struct {
@@ -110,7 +108,7 @@ func (r *Reconciler) Reconcile(
 	}
 
 	if r.AdmissionIntegrity != nil {
-		integrity := r.AdmissionIntegrity.Check(ctx)
+		integrity := r.AdmissionIntegrity(ctx)
 		if !integrity.Healthy {
 			reason := "AdmissionIntegrityDrift"
 			if integrity.Unknown {

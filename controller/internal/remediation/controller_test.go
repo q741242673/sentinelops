@@ -105,7 +105,7 @@ func TestAdmissionDriftRejectsBeforeDeploymentWrite(t *testing.T) {
 		Object:  "enforce_binding",
 		Reason:  "read_failed",
 	}}
-	reconciler.AdmissionIntegrity = checker
+	reconciler.AdmissionIntegrity = checker.Check
 
 	reconcileOnce(t, reconciler, remediation)
 
@@ -122,7 +122,7 @@ func TestAdmissionReadFailureRejectsAsUnknown(t *testing.T) {
 		ActionRestart,
 		nil,
 	)
-	reconciler.AdmissionIntegrity = &fixedIntegrityChecker{
+	checker := &fixedIntegrityChecker{
 		result: admissionintegrity.Result{
 			Healthy: false,
 			Unknown: true,
@@ -131,6 +131,7 @@ func TestAdmissionReadFailureRejectsAsUnknown(t *testing.T) {
 			Reason:  "read_failed",
 		},
 	}
+	reconciler.AdmissionIntegrity = checker.Check
 
 	reconcileOnce(t, reconciler, remediation)
 
@@ -144,7 +145,7 @@ func TestAdmissionAuditModeRejectsAutomaticWrite(t *testing.T) {
 		ActionRestart,
 		nil,
 	)
-	reconciler.AdmissionIntegrity = &fixedIntegrityChecker{
+	checker := &fixedIntegrityChecker{
 		result: admissionintegrity.Result{
 			Healthy: false,
 			Mode:    admissionintegrity.ModeAudit,
@@ -152,6 +153,7 @@ func TestAdmissionAuditModeRejectsAutomaticWrite(t *testing.T) {
 			Reason:  "enforcement_not_enabled",
 		},
 	}
+	reconciler.AdmissionIntegrity = checker.Check
 
 	reconcileOnce(t, reconciler, remediation)
 
@@ -165,11 +167,27 @@ func TestHealthyAdmissionIntegrityAllowsRegisteredWrite(t *testing.T) {
 		ActionRestart,
 		nil,
 	)
-	reconciler.AdmissionIntegrity = &fixedIntegrityChecker{
+	checker := &fixedIntegrityChecker{
 		result: admissionintegrity.Result{
 			Healthy: true,
 			Mode:    admissionintegrity.ModeEnforced,
 		},
+	}
+	reconciler.AdmissionIntegrity = checker.Check
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
+}
+
+func TestDisabledAdmissionIntegrityLeavesRegisteredWriteEnabled(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	if reconciler.AdmissionIntegrity != nil {
+		t.Fatal("test setup unexpectedly enabled admission integrity")
 	}
 
 	reconcileOnce(t, reconciler, remediation)

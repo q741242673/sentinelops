@@ -137,10 +137,12 @@ func main() {
 		}
 	}
 	reconciler := &remediation.Reconciler{
-		Client:             manager.GetClient(),
-		Scheme:             manager.GetScheme(),
-		ControllerID:       controllerID,
-		AdmissionIntegrity: integrityChecker,
+		Client:       manager.GetClient(),
+		Scheme:       manager.GetScheme(),
+		ControllerID: controllerID,
+	}
+	if integrityChecker != nil {
+		reconciler.AdmissionIntegrity = integrityChecker.Check
 	}
 	if err := reconciler.SetupWithManager(manager, maxConcurrent); err != nil {
 		setupLog.Error(err, "unable to create remediation controller")
