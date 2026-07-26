@@ -349,6 +349,7 @@ spec:
                       - reason
                       - message
                       - lastTransitionTime
+                      - observedGeneration
                     properties:
                       type:
                         type: string
@@ -370,3 +371,6 @@ spec:
                       lastTransitionTime:
                         type: string
                         format: date-time
+                      observedGeneration:
+                        type: integer
+                        minimum: 0

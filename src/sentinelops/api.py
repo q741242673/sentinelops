@@ -59,6 +59,7 @@ from sentinelops.operator_auth import (
     OperatorIdentity,
     operator_auth_configuration_error,
 )
+from sentinelops.remediation_controller import KubernetesRemediationGateway
 from sentinelops.runtime import build_agent
 from sentinelops.storage import (
     ApprovalConflictError,
@@ -630,6 +631,10 @@ async def initialize_persistence(
         raise RuntimeError(
             "生产环境必须使用独立 Executor：设置 SENTINELOPS_EXECUTOR_MODE=external"
         )
+    if production and settings.executor_backend != "controller":
+        raise RuntimeError(
+            "生产环境 Executor 必须通过 SentinelRemediation Controller 执行"
+        )
     if production and settings.alertmanager_source_id == "default":
         raise RuntimeError(
             "生产环境必须配置稳定且唯一的 SENTINELOPS_ALERTMANAGER_SOURCE_ID"
@@ -710,7 +715,7 @@ async def initialize_persistence(
     if settings.executor_mode == "embedded":
         embedded_executor_tools = build_tool_registry(
             settings,
-            allow_guarded_writes=True,
+            allow_guarded_writes=settings.executor_backend == "direct",
         )
 
     for stored in stored_incidents:
@@ -747,8 +752,21 @@ async def initialize_persistence(
         assert embedded_executor_tools is not None
         executor = ExecutorWorker(
             store,
-            embedded_executor_tools,
+            (
+                embedded_executor_tools
+                if settings.executor_backend == "direct"
+                else None
+            ),
             owner_id=f"embedded-executor:{worker_id}",
+            remediation_gateway=(
+                KubernetesRemediationGateway(
+                    settings.kubernetes_namespace,
+                    poll_interval_seconds=settings.executor_poll_interval_seconds,
+                    result_timeout_seconds=settings.executor_result_timeout_seconds,
+                )
+                if settings.executor_backend == "controller"
+                else None
+            ),
             claim_ttl_seconds=settings.executor_claim_ttl_seconds,
             poll_interval_seconds=settings.executor_poll_interval_seconds,
         )

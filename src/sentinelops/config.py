@@ -232,6 +232,7 @@ class Settings(BaseSettings):
         le=60,
     )
     executor_mode: Literal["embedded", "external"] = "embedded"
+    executor_backend: Literal["direct", "controller"] = "direct"
     executor_claim_ttl_seconds: float = Field(default=60.0, ge=10, le=600)
     executor_poll_interval_seconds: float = Field(default=0.5, ge=0.05, le=10)
     executor_result_timeout_seconds: float = Field(default=120.0, ge=5, le=900)

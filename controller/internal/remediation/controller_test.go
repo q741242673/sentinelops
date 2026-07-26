@@ -3,6 +3,7 @@ package remediation
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,55 @@ const (
 	testDeployment = "order-service"
 	testNowText    = "2026-07-26T06:00:00Z"
 )
+
+func TestCrossLanguageContractDigests(t *testing.T) {
+	expected := map[string]string{
+		ActionRestart:  "29dbaa37e2caaaaa8056267c1b6ff8c9dc18f5fe3311353154634beee7c65bf9",
+		ActionRollback: "c431542012a61d0f456d839569c3b7f9d4c3a817395357dbfc77374f3fa445ea",
+		ActionScale:    "856ea7b9c7740c7147307a7c665ed6c2a851c45b117889de78e29758f551127d",
+	}
+	for action, want := range expected {
+		got, ok := CatalogDigest(action)
+		if !ok || got != want {
+			t.Fatalf("CatalogDigest(%q) = %q/%t, want %q/true", action, got, ok, want)
+		}
+	}
+	catalogDigest, _ := CatalogDigest(ActionRollback)
+	policyDigest := AuthorizationPolicyDigest(
+		ActionRollback,
+		"human_approval",
+		catalogDigest,
+	)
+	if policyDigest != "b47c4efbda8eee5fe667f4e45592fb40c27a694478bda2d20e38d071045b0552" {
+		t.Fatalf("human policy digest = %q", policyDigest)
+	}
+	if got := HumanApprovalDigest(
+		strings.Repeat("a", 64),
+		"approval-01",
+		3,
+		policyDigest,
+	); got != "8e6d5730c5e1305d67ea41e40789e724f8b55446bbe1ea688b41961f3caa33be" {
+		t.Fatalf("human approval digest = %q", got)
+	}
+	capturedAt, err := time.Parse(time.RFC3339Nano, "2026-07-26T10:06:19.316941Z")
+	if err != nil {
+		t.Fatalf("parse snapshot time: %v", err)
+	}
+	snapshot := opsv1alpha1.ExecutionPrecondition{
+		ResourceVersion:      "919",
+		Generation:           1,
+		DesiredReplicas:      1,
+		Paused:               false,
+		CurrentRevision:      1,
+		CurrentReplicaSetUID: types.UID("b3ff8fd0-5bb3-4a4d-87ef-14dd72d2c637"),
+		CurrentTemplateHash:  "6894bfdf4f",
+		CapturedAt:           metav1.NewTime(capturedAt),
+	}
+	if got := SnapshotDigest(snapshot); got !=
+		"183295b557b263268185d9dc9a877ece7a735a1887130c8cb07e42192db3e125" {
+		t.Fatalf("snapshot digest = %q", got)
+	}
+}
 
 func TestRestartAppliesRegisteredAction(t *testing.T) {
 	reconciler, kubeClient, remediation := newTestReconciler(
@@ -73,9 +123,14 @@ func TestRollbackUsesHealthProvedReplicaSet(t *testing.T) {
 	rollbackTarget := rollbackReplicaSet()
 	proof := rollbackProof(getDeployment(t, kubeClient), rollbackTarget)
 	remediation.Spec.Precondition.RollbackTarget = &opsv1alpha1.RollbackTarget{
-		Revision:          revision,
-		ReplicaSetUID:     rollbackTarget.UID,
-		HealthProofDigest: digestJSON(proof),
+		Revision:      revision,
+		ReplicaSetUID: rollbackTarget.UID,
+		HealthProofDigest: RollbackHealthProofDigest(
+			proof["subject"],
+			proof["version"],
+			proof["verifiedAt"],
+			proof["verifier"],
+		),
 	}
 	remediation.Spec.Precondition.SnapshotDigest = SnapshotDigest(
 		remediation.Spec.Precondition,
@@ -170,6 +225,49 @@ func TestFenceMustBindCapturedDeploymentGeneration(t *testing.T) {
 	reconcileOnce(t, reconciler, remediation)
 
 	assertPhase(t, kubeClient, remediation, PhaseRejected, "FenceGenerationMismatch")
+}
+
+func TestAuthorizationPolicyDigestMismatchRejectsRequest(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	remediation.Spec.Authorization.PolicyDigest = "untrusted-policy"
+	if err := kubeClient.Update(context.Background(), remediation); err != nil {
+		t.Fatalf("change policy digest: %v", err)
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(
+		t,
+		kubeClient,
+		remediation,
+		PhaseRejected,
+		"AuthorizationPolicyDigestMismatch",
+	)
+}
+
+func TestHumanApprovalDigestBindsActionAndVersion(t *testing.T) {
+	approvalVersion := int64(3)
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		func(remediation *opsv1alpha1.SentinelRemediation) {
+			remediation.Spec.Authorization.Decision = "human_approval"
+			remediation.Spec.Authorization.ApprovalID = "approval-01"
+			remediation.Spec.Authorization.ApprovalVersion = &approvalVersion
+		},
+	)
+	remediation.Spec.Authorization.ApprovalDigest = "wrong-approval-digest"
+	if err := kubeClient.Update(context.Background(), remediation); err != nil {
+		t.Fatalf("change approval digest: %v", err)
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "ApprovalDigestMismatch")
 }
 
 func TestCrashAfterWriteRecoversWithoutRepeatingAction(t *testing.T) {
@@ -302,6 +400,19 @@ func newTestReconciler(
 		mutate(remediation)
 	}
 	remediation.Spec.Action.CatalogDigest = mustCatalogDigest(t, action)
+	remediation.Spec.Authorization.PolicyDigest = AuthorizationPolicyDigest(
+		action,
+		remediation.Spec.Authorization.Decision,
+		remediation.Spec.Action.CatalogDigest,
+	)
+	if remediation.Spec.Authorization.Decision == "human_approval" {
+		remediation.Spec.Authorization.ApprovalDigest = HumanApprovalDigest(
+			remediation.Spec.ActionID,
+			remediation.Spec.Authorization.ApprovalID,
+			*remediation.Spec.Authorization.ApprovalVersion,
+			remediation.Spec.Authorization.PolicyDigest,
+		)
+	}
 	remediation.Spec.Precondition.SnapshotDigest = SnapshotDigest(
 		remediation.Spec.Precondition,
 	)
@@ -433,15 +544,28 @@ func rollbackProof(
 	deployment *appsv1.Deployment,
 	replicaSet *appsv1.ReplicaSet,
 ) map[string]string {
+	runtimeImages := "sha256:runtime-v1"
+	images := prefixedDigestJSON([]map[string]string{
+		{"image": "example/order:v1", "name": "app"},
+	})
+	subject := prefixedDigestJSON(map[string]string{
+		"deployment_uid":  string(deployment.UID),
+		"git_commit":      "",
+		"images":          images,
+		"replica_set_uid": string(replicaSet.UID),
+		"revision":        replicaSet.Annotations["deployment.kubernetes.io/revision"],
+		"runtime_images":  runtimeImages,
+		"template_hash":   templateHash(replicaSet),
+	})
 	return map[string]string{
 		"deploymentUid": string(deployment.UID),
-		"gitCommit":     "commit-v1",
-		"images":        "example/order:v1",
+		"gitCommit":     "none",
+		"images":        images,
 		"replicaSetUid": string(replicaSet.UID),
 		"revision":      replicaSet.Annotations["deployment.kubernetes.io/revision"],
-		"runtimeImages": "example/order@sha256:v1",
+		"runtimeImages": runtimeImages,
 		"status":        "healthy",
-		"subject":       testNamespace + "/" + testDeployment,
+		"subject":       subject,
 		"templateHash":  templateHash(replicaSet),
 		"verifiedAt":    "2026-07-26T05:30:00Z",
 		"verifier":      "sentinelops-health-proof/v1",

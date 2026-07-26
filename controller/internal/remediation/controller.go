@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	opsv1alpha1 "github.com/q741242673/sentinelops/controller/api/v1alpha1"
@@ -170,7 +172,7 @@ func (r *Reconciler) validateStatic(
 	if failure := validateParameters(spec.Action); failure != nil {
 		return failure
 	}
-	if failure := validateAuthorization(spec.Authorization); failure != nil {
+	if failure := validateAuthorization(spec); failure != nil {
 		return failure
 	}
 	return nil
@@ -252,6 +254,7 @@ func (r *Reconciler) validateClusterState(
 			deployment,
 			rollbackTarget,
 			rollback.HealthProofDigest,
+			r.now(),
 		); failure != nil {
 			return nil, failure
 		}
@@ -496,14 +499,38 @@ func validateParameters(action opsv1alpha1.RemediationAction) *validationFailure
 }
 
 func validateAuthorization(
-	authorization opsv1alpha1.ExecutionAuthorization,
+	spec opsv1alpha1.SentinelRemediationSpec,
 ) *validationFailure {
+	authorization := spec.Authorization
+	expectedPolicyDigest := AuthorizationPolicyDigest(
+		spec.Action.Plugin,
+		authorization.Decision,
+		spec.Action.CatalogDigest,
+	)
+	if authorization.PolicyDigest != expectedPolicyDigest {
+		return rejected(
+			"AuthorizationPolicyDigestMismatch",
+			"authorization policy digest does not match the action contract",
+		)
+	}
 	switch authorization.Decision {
 	case "human_approval":
 		if authorization.ApprovalID == "" ||
 			authorization.ApprovalVersion == nil ||
 			authorization.ApprovalDigest == "" {
 			return rejected("ApprovalBindingMissing", "human approval binding is incomplete")
+		}
+		expectedApprovalDigest := HumanApprovalDigest(
+			spec.ActionID,
+			authorization.ApprovalID,
+			*authorization.ApprovalVersion,
+			authorization.PolicyDigest,
+		)
+		if authorization.ApprovalDigest != expectedApprovalDigest {
+			return rejected(
+				"ApprovalDigestMismatch",
+				"human approval digest does not match the immutable action",
+			)
 		}
 	case "risk_policy":
 		if authorization.ApprovalID != "" ||
@@ -554,50 +581,71 @@ func validateRollbackProof(
 	deployment *appsv1.Deployment,
 	replicaSet *appsv1.ReplicaSet,
 	expectedDigest string,
+	now time.Time,
 ) *validationFailure {
 	annotations := replicaSet.Annotations
 	revision := annotations["deployment.kubernetes.io/revision"]
-	expected := map[string]string{
-		"deploymentUid": string(deployment.UID),
-		"gitCommit":     annotations["sentinelops.io/health-proof-git-commit"],
-		"images":        annotations["sentinelops.io/health-proof-images"],
-		"replicaSetUid": string(replicaSet.UID),
-		"revision":      revision,
-		"runtimeImages": annotations["sentinelops.io/health-proof-runtime-images"],
-		"status":        "healthy",
-		"subject":       annotations["sentinelops.io/health-proof-subject"],
-		"templateHash":  templateHash(replicaSet),
-		"verifiedAt":    annotations["sentinelops.io/health-proof-verified-at"],
-		"verifier":      annotations["sentinelops.io/health-proof-verifier"],
-		"version":       "v1",
+	gitCommit := replicaSet.Spec.Template.Annotations["sentinelops.io/git-commit"]
+	proofGitCommit := gitCommit
+	if proofGitCommit == "" {
+		proofGitCommit = "none"
 	}
-	for key, value := range expected {
-		annotationKey := "sentinelops.io/health-proof-" + healthAnnotationSuffix(key)
-		if value == "" || annotations[annotationKey] != value {
+	imageItems := make([]map[string]string, 0, len(replicaSet.Spec.Template.Spec.Containers))
+	for _, container := range replicaSet.Spec.Template.Spec.Containers {
+		imageItems = append(imageItems, map[string]string{
+			"image": container.Image,
+			"name":  container.Name,
+		})
+	}
+	sort.Slice(imageItems, func(i int, j int) bool {
+		return imageItems[i]["name"] < imageItems[j]["name"]
+	})
+	images := prefixedDigestJSON(imageItems)
+	runtimeImages := annotations["sentinelops.io/health-proof-runtime-images"]
+	subject := prefixedDigestJSON(map[string]string{
+		"deployment_uid":  string(deployment.UID),
+		"git_commit":      gitCommit,
+		"images":          images,
+		"replica_set_uid": string(replicaSet.UID),
+		"revision":        revision,
+		"runtime_images":  runtimeImages,
+		"template_hash":   templateHash(replicaSet),
+	})
+	expectedAnnotations := map[string]string{
+		"sentinelops.io/health-proof-deployment-uid": string(deployment.UID),
+		"sentinelops.io/health-proof-git-commit":     proofGitCommit,
+		"sentinelops.io/health-proof-images":         images,
+		"sentinelops.io/health-proof-replicaset-uid": string(replicaSet.UID),
+		"sentinelops.io/health-proof-revision":       revision,
+		"sentinelops.io/health-proof-status":         "healthy",
+		"sentinelops.io/health-proof-subject":        subject,
+		"sentinelops.io/health-proof-template-hash":  templateHash(replicaSet),
+		"sentinelops.io/health-proof-version":        "v1",
+	}
+	for key, value := range expectedAnnotations {
+		if value == "" || annotations[key] != value {
 			return stale("RollbackHealthProofChanged", "rollback health proof is invalid")
 		}
 	}
-	if digestJSON(expected) != expectedDigest {
+	if !strings.HasPrefix(runtimeImages, "sha256:") {
+		return stale("RollbackHealthProofChanged", "runtime image proof is invalid")
+	}
+	verifiedAt := annotations["sentinelops.io/health-proof-verified-at"]
+	verifiedTime, err := time.Parse(time.RFC3339, verifiedAt)
+	if err != nil || verifiedTime.After(now.Add(5*time.Minute)) {
+		return stale("RollbackHealthProofChanged", "rollback verification time is invalid")
+	}
+	verifier := annotations["sentinelops.io/health-proof-verifier"]
+	if strings.TrimSpace(verifier) == "" {
+		return stale("RollbackHealthProofChanged", "rollback verifier is missing")
+	}
+	if RollbackHealthProofDigest(
+		subject,
+		"v1",
+		verifiedAt,
+		verifier,
+	) != expectedDigest {
 		return stale("RollbackHealthProofDigestChanged", "rollback health proof digest changed")
 	}
 	return nil
-}
-
-func healthAnnotationSuffix(key string) string {
-	switch key {
-	case "deploymentUid":
-		return "deployment-uid"
-	case "replicaSetUid":
-		return "replicaset-uid"
-	case "runtimeImages":
-		return "runtime-images"
-	case "templateHash":
-		return "template-hash"
-	case "gitCommit":
-		return "git-commit"
-	case "verifiedAt":
-		return "verified-at"
-	default:
-		return key
-	}
 }

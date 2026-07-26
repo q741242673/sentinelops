@@ -25,6 +25,22 @@ class RecordingWriteBackend:
         )
 
 
+class RecordingRemediationGateway:
+    def __init__(self) -> None:
+        self.intents = []
+
+    async def execute(self, intent) -> ToolResult:
+        self.intents.append(intent)
+        return ToolResult(
+            tool_name=intent.action.tool_name,
+            success=True,
+            content={
+                "sentinel_remediation": intent.idempotency_key,
+                "controller_phase": "Succeeded",
+            },
+        )
+
+
 class BlockingExecutorStore:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
@@ -127,6 +143,32 @@ async def test_executor_is_the_only_component_that_calls_write_backend(tmp_path)
     assert completed.status == "succeeded"
     assert len(backend.calls) == 1
     assert backend.calls[0][0] == record.approval.action.tool_name
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_executor_submits_immutable_contract_without_direct_write_access(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path)
+    gateway = RecordingRemediationGateway()
+    worker = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-controller",
+        remediation_gateway=gateway,
+    )
+
+    assert await worker.run_once() is True
+
+    completed = await store.latest_action_intent(record.id)
+    assert completed is not None
+    assert completed.status == "succeeded"
+    assert completed.result is not None
+    assert completed.result.content["sentinel_remediation"] == intent.idempotency_key
+    assert [item.idempotency_key for item in gateway.intents] == [
+        intent.idempotency_key
+    ]
     await store.close()
 
 

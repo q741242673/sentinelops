@@ -13,6 +13,15 @@ if ! grep -Fxq "${CLUSTER_NAME}" <<<"${clusters}"; then
 fi
 
 kubectl config use-context "kind-${CLUSTER_NAME}"
+
+WORKLOAD_IMAGE="${SENTINELOPS_KIND_WORKLOAD_IMAGE:-nginx:1.27-alpine}"
+if ! docker image inspect "${WORKLOAD_IMAGE}" >/dev/null 2>&1; then
+  docker pull "${WORKLOAD_IMAGE}"
+fi
+"${ROOT_DIR}/scripts/kind-load-image.sh" \
+  "${CLUSTER_NAME}" \
+  "${WORKLOAD_IMAGE}"
+
 kubectl apply -f "${ROOT_DIR}/deploy/kind/workload.yaml"
 kubectl patch deployment/order-service \
   --namespace sentinelops-demo \

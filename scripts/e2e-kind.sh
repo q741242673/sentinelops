@@ -12,6 +12,7 @@ trap cleanup EXIT
 
 "${ROOT_DIR}/scripts/kind-up.sh"
 "${ROOT_DIR}/scripts/e2e-remediation-contract.sh"
+"${ROOT_DIR}/scripts/e2e-remediation-controller.sh"
 "${ROOT_DIR}/scripts/inject-bad-rollout.sh"
 
 export SENTINELOPS_TOOL_BACKEND=kubernetes
