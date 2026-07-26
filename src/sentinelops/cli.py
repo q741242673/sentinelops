@@ -178,6 +178,9 @@ async def run_executor() -> None:
         remediation_gateway=remediation_gateway,
         claim_ttl_seconds=settings.executor_claim_ttl_seconds,
         poll_interval_seconds=settings.executor_poll_interval_seconds,
+        missing_contract_grace_seconds=(
+            settings.executor_missing_contract_grace_seconds
+        ),
         health_callback=(
             lambda: _touch_executor_health_file(settings.executor_health_file or "")
             if settings.executor_health_file

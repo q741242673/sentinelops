@@ -276,8 +276,8 @@ spec:
                 - rule: >-
                     !has(oldSelf.phase)
                     || !(oldSelf.phase in ['Succeeded', 'Failed', 'Rejected', 'Stale', 'Cancelled'])
-                    || (has(self.phase) && self.phase == oldSelf.phase)
-                  message: terminal remediation phases cannot be changed
+                    || self == oldSelf
+                  message: terminal remediation status is immutable
                 - rule: >-
                     !has(oldSelf.observedGeneration)
                     || !has(self.observedGeneration)

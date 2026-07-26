@@ -236,6 +236,11 @@ class Settings(BaseSettings):
     executor_claim_ttl_seconds: float = Field(default=60.0, ge=10, le=600)
     executor_poll_interval_seconds: float = Field(default=0.5, ge=0.05, le=10)
     executor_result_timeout_seconds: float = Field(default=120.0, ge=5, le=900)
+    executor_missing_contract_grace_seconds: float = Field(
+        default=30.0,
+        ge=0,
+        le=600,
+    )
     executor_health_file: str | None = None
 
     def resolved_model_api_key(self) -> str | None:

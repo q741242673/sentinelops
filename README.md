@@ -72,6 +72,7 @@ flowchart TB
     EXECUTOR --> CONTRACT["不可变 SentinelRemediation"]
     CONTRACT --> CONTROLLER["Go Remediation Controller"]
     CONTROLLER --> WRITE["带版本条件的集群操作"]
+    CONTROLLER -->|"Executor 崩溃后只读对账"| EXECUTOR
     AGENT --> PROPOSAL["不可变变更提案"]
     PROPOSAL --> OUTBOX["PostgreSQL GitOps Outbox"]
     OUTBOX --> PUBLISHER["独立 GitOps Publisher"]
@@ -292,6 +293,10 @@ Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同�
 
 写入时使用 Kubernetes 自带的 resourceVersion 冲突检查，并把 action ID、动作类型和 fence generation 一起写到 Deployment。即使 API Server 已经接受修改后 Controller 立刻崩溃，重启后的新副本也会从这个标记恢复结果，不会再次触发同一个动作。两个副本通过 Lease 选主，只有 leader 处理写入。
 
+Executor 自己在提交合同后崩溃也不会丢掉已知结果。每个跨过写入分界的 Action Intent 都会同时进入一个数据库对账队列；替代 Executor 要先领取带 generation 的对账租约，然后只读取同名 `SentinelRemediation`，不会在恢复流程中补建缺失合同。只有 CR 的完整 `spec`、UID、generation、Controller 身份、Executed 条件和结果摘要都能与原 Action Intent 对上，数据库才会把 `dispatched/unknown` 收口为 `succeeded/failed`。CR 不存在、仍在执行、结构异常或不能证明是否写入时都会保持未知并继续交给人工。
+
+在线等待会绑定创建时返回的 CR UID，发现同名资源被替换就停止；进程崩溃后的恢复无法和 Kubernetes 创建动作做跨系统原子提交，因此还依赖生产 RBAC 禁止 Executor 删除或修改 CR。若集群管理员可以删除后按相同 spec 重建同名 CR，需要再用准入策略和集群审计约束这类高权限操作，不能把公开摘要当成签名。
+
 这里的 `Succeeded` 只表示“注册动作已被 Kubernetes 接受且结果可追踪”，不表示业务已经恢复。是否恢复仍由 Agent 的严格验证阶段根据主动请求、Prometheus、Alertmanager 和新 Trace 决定。
 
 生产执行链已经切换完成：Executor 领取数据库中的 Action Intent 后，只创建和读取
@@ -305,7 +310,8 @@ scripts/e2e-remediation-controller.sh
 ```
 
 这项测试会使用真正的 Executor ServiceAccount 短期 Token 创建合同，等待 Controller 修改真实 Deployment，
-再由 API Server 证明该身份可以创建合同，但不能修改合同或 Deployment。
+再模拟 Executor 在回写数据库前崩溃，由替代 Executor 只读恢复 Controller 结果；最后由 API Server 证明
+Executor 身份可以创建合同，但不能修改合同或 Deployment。
 
 本地或生产集群需要先安装 CRD：
 
@@ -313,7 +319,7 @@ scripts/e2e-remediation-controller.sh
 kubectl apply -f deploy/production/crds/sentinelremediations.yaml
 ```
 
-`scripts/e2e-remediation-contract.sh` 会在真实 Kubernetes API Server 上验证：合法合同可以创建、`spec` 篡改会被拒绝、已经写入的终态不能反向修改。普通 YAML 解析无法覆盖这些 CEL 规则，所以这项检查也被接入了 kind E2E。
+`scripts/e2e-remediation-contract.sh` 会在真实 Kubernetes API Server 的临时隔离 namespace 中验证：合法合同可以创建、`spec` 篡改会被拒绝、已经写入的终态不能反向修改。普通 YAML 解析无法覆盖这些 CEL 规则，所以这项检查也被接入了 kind E2E。
 
 Controller 自身可以单独检查：
 
@@ -464,9 +470,13 @@ kubectl -n sentinelops-system create secret generic sentinelops-runtime \
 kubectl apply -f deploy/production/access/workload-rbac.yaml
 ```
 
-数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`：
+数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`。升级到包含
+`0010_action_reconcile_outbox` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
+执行的 Action Intent；旧 Executor 不会写入新对账表，若让它和迁移并发运行会产生无法自动恢复的
+遗漏。PostgreSQL 迁移还会在回填和孤儿检查期间锁住 Action Intent 表，但这不能代替停止旧进程：
 
 ```bash
+kubectl -n sentinelops-system scale deployment/sentinelops-executor --replicas=0
 kubectl -n sentinelops-system delete job sentinelops-db-migrate --ignore-not-found
 kubectl apply -f deploy/production/base/migration-job.yaml
 kubectl -n sentinelops-system wait \
@@ -474,7 +484,7 @@ kubectl -n sentinelops-system wait \
   --timeout=10m
 ```
 
-迁移完成后再发布服务：
+迁移完成后再发布新版本服务（新 Executor Deployment 会恢复清单中声明的副本数）：
 
 ```bash
 kubectl apply \
@@ -588,7 +598,7 @@ sentinelops anchor-service
 
 参考服务会拒绝 sequence 倒退、跳号、分叉和错误 predecessor；完全相同的重试返回第一次保存的同一份 receipt 和签名。生产环境应把它替换为独立权限的 PostgreSQL 审计服务、SIEM 或 WORM/Object Lock 存储，SQLite 示例不能当成不可篡改设施。写入 Token 和只读对账 Token 应使用不同权限。
 
-`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次；`0009_gitops_proposal_outbox` 保存不可变动态提案及其独立发布队列。
+`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次；`0009_gitops_proposal_outbox` 保存不可变动态提案及其独立发布队列；`0010_action_reconcile_outbox` 为跨过写入分界的操作保存带租约的 Controller 结果对账任务。
 
 这里准确的说法是“篡改可检测，并可把已投递链头锚定到外部”，不是绝对不可篡改：
 
@@ -658,12 +668,16 @@ SENTINELOPS_EXECUTOR_MODE=external
 SENTINELOPS_EXECUTOR_BACKEND=controller
 SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS=60
 SENTINELOPS_EXECUTOR_RESULT_TIMEOUT_SECONDS=120
+SENTINELOPS_EXECUTOR_MISSING_CONTRACT_GRACE_SECONDS=30
 ```
 
 数据库 deadline 同时限制连接池等待、SQL 执行和锁等待，避免后台 Worker
 因为一条没有上限的数据库调用长期卡住。Executor、GitOps Publisher 和审计锚点 Publisher
 使用独立进程心跳；外部依赖异常时审计安全闸门仍会关闭，但 Kubernetes
 不会因为一次慢调用反复重启仍然存活的进程。
+只有在执行 fence 加宽限时间已经过去、而同名 Controller 合同仍然不存在时，对账任务才会进入
+dead letter，Action Intent 保持 `unknown` 并升级人工，不会补建合同。合同仍在执行或 Kubernetes
+临时不可访问时会继续重试；身份、spec、终态收据等不可变字段明确不可信时会立即停止自动收口。
 
 先把数据库升级到当前版本并检查版本，再分别启动 API 和独立 Executor：
 
@@ -697,8 +711,10 @@ sentinelops gitops-publisher
 Agent Lease 只负责授权入队；Executor 有自己的 owner、generation、attempt ID 和领取期限。
 领取后、合同创建前崩溃可以安全地重新排队；一旦进入 `dispatched`，数据库仍按“外部写可能发生”
 处理，超时后标记 `unknown`，不会交给另一个 Executor 猜测重放。合同创建后，Controller 会按 action ID
-幂等执行；Controller 自身在写入后崩溃，可以从 Deployment 标记恢复执行结果。当前版本不会自动把一个
-已经标成 `unknown` 的数据库任务重新判成成功，这种情况仍交给人工核对。
+幂等执行；Controller 自身在写入后崩溃，可以从 Deployment 标记恢复执行结果。替代 Executor 会通过
+单独的数据库对账租约只读查询现有合同，并严格核对完整 spec、generation、Executed 条件和结果摘要；
+可信终态会自动补回 Action Intent，缺失、未完成、被替换或含糊的合同仍保持 `unknown`，绝不自动补建或重放。
+补回 `succeeded` 也只代表集群动作结果已知，事故仍需完成业务恢复验证或由人工确认。
 
 这套 fence 能阻止 SentinelOps 自己的旧审批和重复动作，但不能阻止集群中其他高权限账号绕过 Controller
 直接修改 Deployment。要把边界扩展到所有写入者，还需要接入准入策略，并统一约束发布系统和人工权限。
@@ -1203,8 +1219,9 @@ tests/              # 单元测试和安全边界测试
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；
 - `SentinelRemediation` v1alpha1 集群内执行合同、不可变 spec、独立 status、终态保护和 create-only Executor 提交权限；
 - Python Executor 到 Go Remediation Controller 的真实执行链：跨语言合同摘要、create-only CR、真实 ServiceAccount Token、最小 RBAC 和 kind Deployment 写入验证；
+- Executor 崩溃后的 Controller 终态自动对账：只读恢复、完整合同与结果摘要校验、数据库租约 fencing、幂等回写和 kind 崩溃窗口回放；
 - Go Remediation Controller：三种注册动作、fresh preflight、resourceVersion CAS、动作标记幂等恢复、Lease 选主、最小 RBAC 和双副本部署；
-- 三段式 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
+- 版本化 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
 - PostgreSQL 告警 fingerprint 生命周期、跨副本原子去重、乱序事件保护和崩溃后补调度；
 - 生产 Webhook 启动门禁、Bearer Token、原始请求体 HMAC、密钥轮换和请求大小边界；
 - API/Executor/审计锚定 Publisher 分离部署、Secret 文件挂载、迁移 Job、探针、PDB、容器加固和入站 NetworkPolicy；
@@ -1216,7 +1233,6 @@ tests/              # 单元测试和安全边界测试
 接入生产环境前还需要：
 
 - 使用准入策略约束 Controller 之外的 Deployment 写入者，把 fence 从 SentinelOps 内部边界扩展到整个集群；
-- 增加 `unknown` Action Intent 与 Controller 终态的自动对账，在 Executor 失联后恢复数据库结果；
 - 接入企业 Secret 管理和更细的 RBAC；
 - 为外部锚定增加限流和灾难恢复方案。
 

@@ -3,12 +3,18 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from sqlalchemy import select, update
 
 from sentinelops.config import Settings
 from sentinelops.domain import Alert, ToolResult
 from sentinelops.executor import ExecutorWorker
+from sentinelops.remediation_controller import RemediationObservation
 from sentinelops.runtime import build_agent
 from sentinelops.storage import ActionIntentConflictError, SqlIncidentStore
+from sentinelops.storage.sqlalchemy import (
+    action_intents,
+    action_reconciliation_outbox,
+)
 from sentinelops.tools import ToolRegistry
 
 
@@ -28,6 +34,11 @@ class RecordingWriteBackend:
 class RecordingRemediationGateway:
     def __init__(self) -> None:
         self.intents = []
+        self.observed_intents = []
+        self.observation = RemediationObservation(
+            state="not_found",
+            reason="no recovery contract",
+        )
 
     async def execute(self, intent) -> ToolResult:
         self.intents.append(intent)
@@ -39,6 +50,12 @@ class RecordingRemediationGateway:
                 "controller_phase": "Succeeded",
             },
         )
+
+    async def observe(self, intent) -> RemediationObservation:
+        self.observed_intents.append(intent)
+        if isinstance(self.observation, Exception):
+            raise self.observation
+        return self.observation
 
 
 class BlockingExecutorStore:
@@ -123,6 +140,60 @@ async def _queued_intent(tmp_path, *, suffix: str = "a"):
     )
     await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
     return store, record, lease, intent
+
+
+async def _expire_action_for_reconciliation(
+    store: SqlIncidentStore,
+    action_id: str,
+) -> None:
+    expired = "2000-01-01T00:00:00+00:00"
+    async with store.engine.begin() as connection:
+        await connection.execute(
+            update(action_intents)
+            .where(action_intents.c.idempotency_key == action_id)
+            .values(executor_lease_until=expired)
+        )
+        await connection.execute(
+            update(action_reconciliation_outbox)
+            .where(action_reconciliation_outbox.c.action_id == action_id)
+            .values(next_attempt_at=expired)
+        )
+
+
+async def _set_action_fence_expiry(
+    store: SqlIncidentStore,
+    action_id: str,
+    expires_at: str,
+) -> None:
+    async with store.engine.begin() as connection:
+        row = (
+            await connection.execute(
+                select(action_intents.c.precondition).where(
+                    action_intents.c.idempotency_key == action_id
+                )
+            )
+        ).one()
+        precondition = dict(row.precondition)
+        precondition["expires_at"] = expires_at
+        await connection.execute(
+            update(action_intents)
+            .where(action_intents.c.idempotency_key == action_id)
+            .values(precondition=precondition)
+        )
+
+
+async def _reconciliation_outbox_status(
+    store: SqlIncidentStore,
+    action_id: str,
+) -> str:
+    async with store.engine.connect() as connection:
+        return (
+            await connection.execute(
+                select(action_reconciliation_outbox.c.status).where(
+                    action_reconciliation_outbox.c.action_id == action_id
+                )
+            )
+        ).scalar_one()
 
 
 @pytest.mark.asyncio
@@ -331,4 +402,411 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
     )
     with pytest.raises(ActionIntentConflictError):
         await store.complete_action(claim=claim, result=conflicting)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_replacement_executor_recovers_controller_result_without_replay(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="e")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-crash",
+        attempt_id="crashed-after-controller-submit",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="Executor disappeared after submitting the CR",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    controller_result = ToolResult(
+        tool_name=intent.action.tool_name,
+        success=True,
+        content={
+            "sentinel_remediation": intent.idempotency_key,
+            "remediation_uid": "controller-resource-uid",
+            "controller_phase": "Succeeded",
+            "outcome_digest": "trusted-controller-outcome",
+        },
+        duration_ms=0,
+    )
+    gateway = RecordingRemediationGateway()
+    gateway.observation = RemediationObservation(
+        state="terminal",
+        phase="Succeeded",
+        result=controller_result,
+        reason="ActionApplied",
+    )
+    replacement = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-replacement",
+        remediation_gateway=gateway,
+        claim_ttl_seconds=60,
+    )
+
+    assert await replacement.run_once() is True
+
+    recovered = await store.latest_action_intent(record.id)
+    assert recovered is not None
+    assert recovered.status == "succeeded"
+    assert recovered.result == controller_result
+    assert [item.idempotency_key for item in gateway.observed_intents] == [
+        intent.idempotency_key
+    ]
+    assert gateway.intents == []
+    audit = await store.list_audit_events(record.id)
+    reconciled = [
+        event
+        for event in audit
+        if event.source_component == "executor-reconciler"
+    ]
+    assert len(reconciled) == 1
+    assert reconciled[0].event_type == "action.succeeded"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_action_reconciliation_claim_is_fenced_between_executors(
+    tmp_path,
+) -> None:
+    store, _, _, intent = await _queued_intent(tmp_path, suffix="f")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-crash",
+        attempt_id="expired-controller-attempt",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="controller response was lost",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    first = await store.claim_action_reconciliation(
+        owner_id="reconciler-a",
+        ttl_seconds=1,
+    )
+    assert first is not None
+    assert (
+        await store.claim_action_reconciliation(
+            owner_id="reconciler-b",
+            ttl_seconds=1,
+        )
+        is None
+    )
+    await store.retry_action_reconciliation(
+        first,
+        error="Controller is still executing",
+        retry_after_seconds=0.1,
+    )
+    async with store.engine.begin() as connection:
+        await connection.execute(
+            update(action_reconciliation_outbox)
+            .where(
+                action_reconciliation_outbox.c.action_id
+                == intent.idempotency_key
+            )
+            .values(next_attempt_at="2000-01-01T00:00:00+00:00")
+        )
+    second = await store.claim_action_reconciliation(
+        owner_id="reconciler-b",
+        ttl_seconds=1,
+    )
+    assert second is not None
+    assert second.generation == first.generation + 1
+
+    with pytest.raises(ActionIntentConflictError):
+        await store.complete_action_reconciliation(
+            first,
+            result=ToolResult(
+                tool_name=first.intent.action.tool_name,
+                success=True,
+                content={"stale_reconciler": True},
+            ),
+        )
+    await store.retry_action_reconciliation(
+        second,
+        error="leave the unknown result for manual review",
+        retry_after_seconds=60,
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_controller_contract_dead_letters_only_after_fence_grace(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="m")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-missing-contract",
+        attempt_id="missing-contract-attempt",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="Executor disappeared before the Controller result was stored",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    gateway = RecordingRemediationGateway()
+    replacement = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-missing-contract-reconciler",
+        remediation_gateway=gateway,
+        claim_ttl_seconds=60,
+        missing_contract_grace_seconds=0,
+    )
+
+    assert await replacement.run_once() is True
+    assert (
+        await _reconciliation_outbox_status(store, intent.idempotency_key)
+        == "pending"
+    )
+    before_deadline = await store.latest_action_intent(record.id)
+    assert before_deadline is not None
+    assert before_deadline.status == "unknown"
+
+    await _set_action_fence_expiry(
+        store,
+        intent.idempotency_key,
+        "2000-01-01T00:00:00+00:00",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+    assert await replacement.run_once() is True
+    assert (
+        await _reconciliation_outbox_status(store, intent.idempotency_key)
+        == "dead_letter"
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_in_progress_controller_contract_retries_after_fence_expiry(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="p")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-in-progress-contract",
+        attempt_id="in-progress-contract-attempt",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="Controller is still applying the action",
+    )
+    await _set_action_fence_expiry(
+        store,
+        intent.idempotency_key,
+        "2000-01-01T00:00:00+00:00",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    gateway = RecordingRemediationGateway()
+    gateway.observation = RemediationObservation(
+        state="in_progress",
+        phase="Executing",
+        reason="Controller is still executing",
+    )
+    replacement = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-in-progress-reconciler",
+        remediation_gateway=gateway,
+        claim_ttl_seconds=60,
+        missing_contract_grace_seconds=0,
+    )
+
+    assert await replacement.run_once() is True
+    assert (
+        await _reconciliation_outbox_status(store, intent.idempotency_key)
+        == "pending"
+    )
+    preserved = await store.latest_action_intent(record.id)
+    assert preserved is not None
+    assert preserved.status == "unknown"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_temporary_controller_error_retries_after_fence_expiry(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="t")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-temporary-error",
+        attempt_id="temporary-error-attempt",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="Kubernetes API response was lost",
+    )
+    await _set_action_fence_expiry(
+        store,
+        intent.idempotency_key,
+        "2000-01-01T00:00:00+00:00",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    gateway = RecordingRemediationGateway()
+    gateway.observation = RuntimeError("temporary Kubernetes 503")
+    replacement = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-temporary-error-reconciler",
+        remediation_gateway=gateway,
+        claim_ttl_seconds=60,
+        missing_contract_grace_seconds=0,
+    )
+
+    assert await replacement.run_once() is True
+    assert (
+        await _reconciliation_outbox_status(store, intent.idempotency_key)
+        == "pending"
+    )
+    preserved = await store.latest_action_intent(record.id)
+    assert preserved is not None
+    assert preserved.status == "unknown"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_immutable_invalid_controller_result_is_dead_lettered(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="d")
+    original = await store.claim_action_execution(
+        owner_id="executor-before-invalid-result",
+        attempt_id="invalid-controller-result-attempt",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    gateway = RecordingRemediationGateway()
+    gateway.observation = RemediationObservation(
+        state="unknown",
+        phase="Succeeded",
+        reason="Controller outcome digest is invalid",
+        retryable=False,
+    )
+    replacement = ExecutorWorker(
+        store,
+        None,
+        owner_id="executor-dead-letter",
+        remediation_gateway=gateway,
+        claim_ttl_seconds=60,
+    )
+
+    assert await replacement.run_once() is True
+    preserved = await store.latest_action_intent(record.id)
+    assert preserved is not None
+    assert preserved.status == "unknown"
+    assert preserved.error == "Controller outcome digest is invalid"
+    assert (
+        await store.claim_action_reconciliation(
+            owner_id="must-not-retry-dead-letter",
+            ttl_seconds=60,
+        )
+        is None
+    )
+    audit = await store.list_audit_events(record.id)
+    dead_letters = [
+        event
+        for event in audit
+        if event.event_type == "action.reconciliation_dead_lettered"
+    ]
+    assert len(dead_letters) == 1
+
+    late_result = ToolResult(
+        tool_name=intent.action.tool_name,
+        success=True,
+        content={"trusted_late_controller_result": True},
+        duration_ms=0,
+    )
+    completed = await store.complete_action(
+        claim=original,
+        result=late_result,
+    )
+    assert completed.status == "succeeded"
+    async with store.engine.connect() as connection:
+        outbox_status = (
+            await connection.execute(
+                select(action_reconciliation_outbox.c.status).where(
+                    action_reconciliation_outbox.c.action_id
+                    == intent.idempotency_key
+                )
+            )
+        ).scalar_one()
+    assert outbox_status == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates(
+    tmp_path,
+) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path, suffix="c")
+    original = await store.claim_action_execution(
+        owner_id="executor-original",
+        attempt_id="original-late-result",
+        ttl_seconds=60,
+    )
+    assert original is not None
+    await store.mark_action_dispatched(original)
+    await store.mark_action_unknown(
+        claim=original,
+        reason="original Executor response was delayed",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+    reconciliation = await store.claim_action_reconciliation(
+        owner_id="executor-reconciler",
+        ttl_seconds=60,
+    )
+    assert reconciliation is not None
+    result = ToolResult(
+        tool_name=intent.action.tool_name,
+        success=True,
+        content={
+            "sentinel_remediation": intent.idempotency_key,
+            "controller_phase": "Succeeded",
+            "deterministic": True,
+        },
+        duration_ms=0,
+    )
+
+    outcomes = await asyncio.gather(
+        store.complete_action(claim=original, result=result),
+        store.complete_action_reconciliation(
+            reconciliation,
+            result=result,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(not isinstance(item, Exception) for item in outcomes) >= 1
+    final = await store.latest_action_intent(record.id)
+    assert final is not None
+    assert final.status == "succeeded"
+    assert final.result == result
+    succeeded_events = [
+        event
+        for event in await store.list_audit_events(record.id)
+        if event.event_type == "action.succeeded"
+    ]
+    assert len(succeeded_events) == 1
     await store.close()

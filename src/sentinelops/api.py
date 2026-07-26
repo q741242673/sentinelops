@@ -769,6 +769,9 @@ async def initialize_persistence(
             ),
             claim_ttl_seconds=settings.executor_claim_ttl_seconds,
             poll_interval_seconds=settings.executor_poll_interval_seconds,
+            missing_contract_grace_seconds=(
+                settings.executor_missing_contract_grace_seconds
+            ),
         )
         embedded_executor_task = asyncio.create_task(executor.run_forever())
 

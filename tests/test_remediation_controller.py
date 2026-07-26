@@ -19,11 +19,21 @@ from sentinelops.storage.base import StoredActionIntent
 
 
 class FakeCustomObjectsApi:
-    def __init__(self, *, terminal_phase: str = "Succeeded") -> None:
+    def __init__(
+        self,
+        *,
+        terminal_phase: str = "Succeeded",
+        terminal_reason: str = "ActionApplied",
+        outcome_digest_override: str | None = None,
+        crossed_write_boundary: bool = False,
+    ) -> None:
         self.resource: dict | None = None
         self.create_calls = 0
         self.get_calls = 0
         self.terminal_phase = terminal_phase
+        self.terminal_reason = terminal_reason
+        self.outcome_digest_override = outcome_digest_override
+        self.crossed_write_boundary = crossed_write_boundary
 
     def create_namespaced_custom_object(
         self,
@@ -38,6 +48,13 @@ class FakeCustomObjectsApi:
         if self.resource is not None:
             raise ApiException(status=409, reason="AlreadyExists")
         self.resource = deepcopy(body)
+        self.resource["metadata"].update(
+            {
+                "uid": "remediation-uid",
+                "generation": 1,
+                "resourceVersion": "41",
+            }
+        )
         return deepcopy(self.resource)
 
     def get_namespaced_custom_object(
@@ -53,26 +70,65 @@ class FakeCustomObjectsApi:
         assert self.resource is not None
         resource = deepcopy(self.resource)
         if self.get_calls >= 2:
+            outcome = {
+                "beforeResourceVersion": resource["spec"]["precondition"][
+                    "resourceVersion"
+                ],
+                "afterResourceVersion": "42",
+                "observedActionId": resource["spec"]["actionId"],
+                "message": "registered action was applied exactly once",
+            }
+            outcome["outcomeDigest"] = canonical_digest(outcome)
+            if self.outcome_digest_override is not None:
+                outcome["outcomeDigest"] = self.outcome_digest_override
             resource["status"] = {
                 "phase": self.terminal_phase,
-                "reason": "ActionApplied",
-                "result": {
-                    "observedActionId": resource["spec"]["actionId"],
-                    "outcomeDigest": "controller-result-digest",
-                    "message": "registered action was applied exactly once",
-                },
+                "reason": self.terminal_reason,
+                "observedGeneration": resource["metadata"]["generation"],
+                "controllerId": "controller-a",
+                "finishedAt": "2026-07-26T06:01:00Z",
+                "result": (
+                    outcome if self.terminal_phase == "Succeeded" else None
+                ),
                 "conditions": [
                     {
                         "type": "Executed",
                         "status": (
                             "True" if self.terminal_phase == "Succeeded" else "False"
                         ),
-                        "reason": "ActionApplied",
+                        "reason": self.terminal_reason,
                         "message": "controller terminal result",
+                        "observedGeneration": resource["metadata"][
+                            "generation"
+                        ],
                     }
                 ],
             }
+            if (
+                self.terminal_phase == "Succeeded"
+                or self.crossed_write_boundary
+            ):
+                resource["status"].update(
+                    {
+                        "attempt": 1,
+                        "startedAt": "2026-07-26T06:00:30Z",
+                    }
+                )
         return resource
+
+
+class MissingCustomObjectsApi:
+    def __init__(self) -> None:
+        self.create_calls = 0
+        self.get_calls = 0
+
+    def create_namespaced_custom_object(self, *_args, **_kwargs):
+        self.create_calls += 1
+        raise AssertionError("只读恢复不能创建 SentinelRemediation")
+
+    def get_namespaced_custom_object(self, *_args, **_kwargs):
+        self.get_calls += 1
+        raise ApiException(status=404, reason="NotFound")
 
 
 def _intent(
@@ -249,6 +305,9 @@ async def test_gateway_creates_contract_and_waits_for_bound_success() -> None:
     assert result.tool_name == "restart_deployment"
     assert result.content["controller_phase"] == "Succeeded"
     assert result.content["sentinel_remediation"] == "a" * 64
+    assert result.content["observed_generation"] == 1
+    assert result.content["finished_at"] == "2026-07-26T06:01:00Z"
+    assert len(result.content["executed_condition_digest"]) == 64
     assert api.create_calls == 1
     assert api.get_calls == 2
 
@@ -257,6 +316,13 @@ async def test_gateway_creates_contract_and_waits_for_bound_success() -> None:
 async def test_gateway_reuses_only_an_identical_existing_contract() -> None:
     api = FakeCustomObjectsApi()
     api.resource = build_sentinel_remediation(_intent())
+    api.resource["metadata"].update(
+        {
+            "uid": "existing-remediation-uid",
+            "generation": 1,
+            "resourceVersion": "40",
+        }
+    )
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
         custom_objects_api=api,
@@ -277,7 +343,10 @@ async def test_gateway_reuses_only_an_identical_existing_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_rejection_is_a_failed_tool_result() -> None:
-    api = FakeCustomObjectsApi(terminal_phase="Stale")
+    api = FakeCustomObjectsApi(
+        terminal_phase="Stale",
+        terminal_reason="ResourceVersionChanged",
+    )
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
         custom_objects_api=api,
@@ -289,4 +358,111 @@ async def test_controller_rejection_is_a_failed_tool_result() -> None:
 
     assert result.success is False
     assert result.content["controller_phase"] == "Stale"
-    assert result.error == "ActionApplied: controller terminal result"
+    assert result.error == "ResourceVersionChanged: controller terminal result"
+
+
+@pytest.mark.asyncio
+async def test_observe_missing_contract_never_creates_or_replays_it() -> None:
+    api = MissingCustomObjectsApi()
+    gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=api,
+    )
+
+    observation = await gateway.observe(_intent())
+
+    assert observation.state == "not_found"
+    assert api.get_calls == 1
+    assert api.create_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_observe_accepts_only_a_fully_bound_controller_result() -> None:
+    api = FakeCustomObjectsApi()
+    api.create_namespaced_custom_object(
+        None,
+        None,
+        None,
+        None,
+        build_sentinel_remediation(_intent()),
+    )
+    api.get_calls = 1
+    gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=api,
+    )
+
+    observation = await gateway.observe(_intent())
+
+    assert observation.state == "terminal"
+    assert observation.result is not None
+    assert observation.result.success is True
+    assert observation.result.duration_ms == 0
+
+    assert api.resource is not None
+    api.resource["spec"]["target"]["uid"] = "spoofed-target"
+    rejected = await gateway.observe(_intent())
+    assert rejected.state == "unknown"
+    assert "spec" in str(rejected.reason)
+
+
+@pytest.mark.asyncio
+async def test_observe_rejects_false_success_digest_and_unknown_stale_outcome() -> None:
+    api = FakeCustomObjectsApi(outcome_digest_override="0" * 64)
+    api.create_namespaced_custom_object(
+        None,
+        None,
+        None,
+        None,
+        build_sentinel_remediation(_intent()),
+    )
+    api.get_calls = 1
+    gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=api,
+    )
+
+    invalid_digest = await gateway.observe(_intent())
+    assert invalid_digest.state == "unknown"
+    assert "outcomeDigest" in str(invalid_digest.reason)
+
+    unsafe_api = FakeCustomObjectsApi(
+        terminal_phase="Stale",
+        terminal_reason="ActionOutcomeUnknown",
+    )
+    unsafe_api.create_namespaced_custom_object(
+        None,
+        None,
+        None,
+        None,
+        build_sentinel_remediation(_intent()),
+    )
+    unsafe_api.get_calls = 1
+    unsafe_gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=unsafe_api,
+    )
+    unsafe = await unsafe_gateway.observe(_intent())
+    assert unsafe.state == "unknown"
+    assert "不能证明写操作未发生" in str(unsafe.reason)
+
+    after_write_api = FakeCustomObjectsApi(
+        terminal_phase="Stale",
+        terminal_reason="FenceSuperseded",
+        crossed_write_boundary=True,
+    )
+    after_write_api.create_namespaced_custom_object(
+        None,
+        None,
+        None,
+        None,
+        build_sentinel_remediation(_intent()),
+    )
+    after_write_api.get_calls = 1
+    after_write_gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=after_write_api,
+    )
+    after_write = await after_write_gateway.observe(_intent())
+    assert after_write.state == "unknown"
+    assert "不能证明写操作未发生" in str(after_write.reason)

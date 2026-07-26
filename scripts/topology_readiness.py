@@ -1215,7 +1215,7 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
             )
             checks["migration_head_applied"] = (
                 database_snapshot.get("schema_revision")
-                == "0009_gitops_proposal_outbox"
+                == "0010_action_reconcile_outbox"
             )
             checks["agent_resolved"] = incident_status == "resolved"
             checks["deployment_restored"] = (

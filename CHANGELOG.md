@@ -15,12 +15,13 @@
 - OIDC 人工审批、最小权限、HMAC 审计链、Ed25519 外部回执和锚点失效时 fail-closed；
 - 双 API、双 Executor、多副本接管、进程崩溃、严格恢复验证和中文事故控制台；
 - 不可变动态提案、事务型 GitOps Outbox，以及幂等创建 GitHub Draft PR 的独立参考 Gateway；
+- Executor 在合同提交后失联时，由替代 Executor 只读核验 Controller 终态并通过数据库租约幂等回写；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
 
 升级与迁移：
 
 - 数据库必须先运行 Alembic migration，当前 schema head 为
-  `0009_gitops_proposal_outbox`；
+  `0010_action_reconcile_outbox`；
 - API、Executor、Migration Job 和 Anchor Publisher 必须使用同一镜像版本；
 - 生产部署应把清单里的示例镜像替换为 RC 镜像的不可变 digest；
 - 旧 SQLite 本地演示可以继续使用，但多副本生产模式必须使用 PostgreSQL。

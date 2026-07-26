@@ -22,6 +22,7 @@ from sqlalchemy import (
     func,
     insert,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -56,6 +57,7 @@ from sentinelops.storage.audit import (
 )
 from sentinelops.storage.base import (
     ActionIntentConflictError,
+    ActionReconciliationClaim,
     AlertFiringClaim,
     AlertResolution,
     ApprovalConflictError,
@@ -301,6 +303,27 @@ action_intents = Table(
     Column("claimed_at", String(40), nullable=True),
     Column("dispatched_at", String(40), nullable=True),
     Column("finished_at", String(40), nullable=True),
+)
+
+action_reconciliation_outbox = Table(
+    "sentinelops_action_reconciliation_outbox",
+    metadata,
+    Column("action_id", String(64), primary_key=True),
+    Column("status", String(24), nullable=False, index=True),
+    Column("attempt_count", Integer, nullable=False),
+    Column("next_attempt_at", String(40), nullable=False),
+    Column("claimed_by", String(200), nullable=True),
+    Column("claim_generation", BigInteger, nullable=False),
+    Column("attempt_id", String(64), nullable=True, unique=True),
+    Column("claim_until", String(40), nullable=True),
+    Column("last_error_sha256", String(64), nullable=True),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+Index(
+    "ix_sentinelops_action_reconciliation_status_next_attempt",
+    action_reconciliation_outbox.c.status,
+    action_reconciliation_outbox.c.next_attempt_at,
 )
 
 change_proposals = Table(
@@ -3908,6 +3931,21 @@ class SqlIncidentStore:
                 raise ActionIntentConflictError(
                     "Executor 领取已失效，禁止派发集群写操作"
                 )
+            await connection.execute(
+                insert(action_reconciliation_outbox).values(
+                    action_id=claim.idempotency_key,
+                    status="pending",
+                    attempt_count=0,
+                    next_attempt_at=claim.expires_at.isoformat(),
+                    claimed_by=None,
+                    claim_generation=0,
+                    attempt_id=None,
+                    claim_until=None,
+                    last_error_sha256=None,
+                    created_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
             await self._append_audit_event(
                 connection,
                 incident_id=claim.incident_id,
@@ -3975,6 +4013,24 @@ class SqlIncidentStore:
                     )
             else:
                 result_payload = result.model_dump(mode="json")
+                await connection.execute(
+                    update(action_reconciliation_outbox)
+                    .where(
+                        action_reconciliation_outbox.c.action_id
+                        == claim.idempotency_key,
+                        action_reconciliation_outbox.c.status.in_(
+                            ["pending", "claimed", "dead_letter"]
+                        ),
+                    )
+                    .values(
+                        status="completed",
+                        claimed_by=None,
+                        attempt_id=None,
+                        claim_until=None,
+                        last_error_sha256=None,
+                        updated_at=now.isoformat(),
+                    )
+                )
                 await self._append_audit_event(
                     connection,
                     incident_id=claim.incident_id,
@@ -4001,6 +4057,496 @@ class SqlIncidentStore:
                     occurred_at=now.isoformat(),
                 )
         return await self._require_action(claim.idempotency_key)
+
+    async def claim_action_reconciliation(
+        self,
+        *,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> ActionReconciliationClaim | None:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await connection.execute(
+                update(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.status == "claimed",
+                    action_reconciliation_outbox.c.claim_until
+                    <= now.isoformat(),
+                )
+                .values(
+                    status="pending",
+                    claimed_by=None,
+                    attempt_id=None,
+                    claim_until=None,
+                    updated_at=now.isoformat(),
+                )
+            )
+            row = (
+                (
+                    await connection.execute(
+                        select(
+                            action_intents,
+                            action_reconciliation_outbox.c.attempt_count.label(
+                                "reconciliation_attempt_count"
+                            ),
+                            action_reconciliation_outbox.c.claim_generation.label(
+                                "reconciliation_claim_generation"
+                            ),
+                        )
+                        .join(
+                            action_reconciliation_outbox,
+                            action_reconciliation_outbox.c.action_id
+                            == action_intents.c.idempotency_key,
+                        )
+                        .where(
+                            action_reconciliation_outbox.c.status == "pending",
+                            action_reconciliation_outbox.c.next_attempt_at
+                            <= now.isoformat(),
+                            action_intents.c.status.in_(
+                                ["dispatched", "unknown"]
+                            ),
+                            or_(
+                                action_intents.c.executor_lease_until.is_(None),
+                                action_intents.c.executor_lease_until
+                                <= now.isoformat(),
+                            ),
+                        )
+                        .order_by(
+                            action_reconciliation_outbox.c.next_attempt_at.asc(),
+                            action_reconciliation_outbox.c.created_at.asc(),
+                        )
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            generation = int(row["reconciliation_claim_generation"]) + 1
+            attempt_count = int(row["reconciliation_attempt_count"]) + 1
+            attempt_id = str(uuid4())
+            expires_at = now + timedelta(seconds=max(0.1, ttl_seconds))
+            claimed = await connection.execute(
+                update(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.action_id
+                    == row["idempotency_key"],
+                    action_reconciliation_outbox.c.status == "pending",
+                )
+                .values(
+                    status="claimed",
+                    attempt_count=attempt_count,
+                    claimed_by=owner_id,
+                    claim_generation=generation,
+                    attempt_id=attempt_id,
+                    claim_until=expires_at.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if claimed.rowcount != 1:
+                raise ActionIntentConflictError(
+                    "Controller 结果对账任务已被其他 Executor 领取"
+                )
+            return ActionReconciliationClaim(
+                intent=self._stored_action(row),
+                owner_id=owner_id,
+                generation=generation,
+                attempt_id=attempt_id,
+                attempt_count=attempt_count,
+                expires_at=expires_at,
+            )
+
+    async def complete_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        result: Any,
+    ) -> StoredActionIntent:
+        result_payload = result.model_dump(mode="json")
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._fence_action_reconciliation_claim(
+                connection,
+                claim,
+                now=now,
+            )
+            intent = claim.intent
+            updated = await connection.execute(
+                update(action_intents)
+                .where(
+                    action_intents.c.idempotency_key
+                    == intent.idempotency_key,
+                    action_intents.c.incident_id == intent.incident_id,
+                    action_intents.c.executor_generation
+                    == intent.executor_generation,
+                    action_intents.c.attempt_id == intent.attempt_id,
+                    action_intents.c.status.in_(["dispatched", "unknown"]),
+                )
+                .values(
+                    status="succeeded" if result.success else "failed",
+                    result=result_payload,
+                    error=result.error,
+                    finished_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if updated.rowcount != 1:
+                existing = (
+                    (
+                        await connection.execute(
+                            select(action_intents).where(
+                                action_intents.c.idempotency_key
+                                == intent.idempotency_key
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if (
+                    existing is None
+                    or existing["incident_id"] != intent.incident_id
+                    or existing["executor_generation"]
+                    != intent.executor_generation
+                    or existing["attempt_id"] != intent.attempt_id
+                    or existing["status"] not in {"succeeded", "failed"}
+                    or existing["result"] != result_payload
+                ):
+                    raise ActionIntentConflictError(
+                        "Controller 结果无法绑定到原始 Executor 尝试"
+                    )
+            completed = await connection.execute(
+                update(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.action_id
+                    == intent.idempotency_key,
+                    action_reconciliation_outbox.c.status == "claimed",
+                    action_reconciliation_outbox.c.claimed_by == claim.owner_id,
+                    action_reconciliation_outbox.c.claim_generation
+                    == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id
+                    == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until
+                    > now.isoformat(),
+                )
+                .values(
+                    status="completed",
+                    claimed_by=None,
+                    attempt_id=None,
+                    claim_until=None,
+                    last_error_sha256=None,
+                    updated_at=now.isoformat(),
+                )
+            )
+            if completed.rowcount != 1:
+                raise ActionIntentConflictError(
+                    "Controller 结果对账租约已失效"
+                )
+            if updated.rowcount == 1:
+                controller_receipt = (
+                    result_payload.get("content")
+                    if isinstance(result_payload.get("content"), dict)
+                    else {}
+                )
+                controller_result = (
+                    controller_receipt.get("controller_result")
+                    if isinstance(
+                        controller_receipt.get("controller_result"),
+                        dict,
+                    )
+                    else {}
+                )
+                await self._append_audit_event(
+                    connection,
+                    incident_id=intent.incident_id,
+                    operation_id=(
+                        f"action:{intent.idempotency_key}:"
+                        f"controller-reconciled:{claim.attempt_id}"
+                    ),
+                    event_type=(
+                        "action.succeeded"
+                        if result.success
+                        else "action.failed"
+                    ),
+                    source_component="executor-reconciler",
+                    actor_type="executor",
+                    actor_id=claim.owner_id,
+                    actor_assurance="service-account",
+                    subject_type="action_intent",
+                    subject_id=intent.idempotency_key,
+                    payload={
+                        "executor_generation": intent.executor_generation,
+                        "executor_attempt_id": intent.attempt_id,
+                        "reconciliation_generation": claim.generation,
+                        "reconciliation_attempt_id": claim.attempt_id,
+                        "tool_name": result.tool_name,
+                        "result_sha256": canonical_payload_hash(
+                            result_payload
+                        ),
+                        "success": result.success,
+                        "remediation_uid": controller_receipt.get(
+                            "remediation_uid"
+                        ),
+                        "remediation_generation": controller_receipt.get(
+                            "remediation_generation"
+                        ),
+                        "observed_generation": controller_receipt.get(
+                            "observed_generation"
+                        ),
+                        "controller_phase": controller_receipt.get(
+                            "controller_phase"
+                        ),
+                        "controller_id": controller_receipt.get(
+                            "controller_id"
+                        ),
+                        "finished_at": controller_receipt.get(
+                            "finished_at"
+                        ),
+                        "spec_digest": controller_receipt.get(
+                            "spec_digest"
+                        ),
+                        "executed_condition_digest": (
+                            controller_receipt.get(
+                                "executed_condition_digest"
+                            )
+                        ),
+                        "outcome_digest": controller_result.get(
+                            "outcomeDigest"
+                        ),
+                    },
+                    occurred_at=now.isoformat(),
+                )
+        return await self._require_action(claim.intent.idempotency_key)
+
+    async def retry_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        error: str,
+        retry_after_seconds: float,
+    ) -> StoredActionIntent:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._fence_action_reconciliation_claim(
+                connection,
+                claim,
+                now=now,
+            )
+            retried = await connection.execute(
+                update(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.action_id
+                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.status == "claimed",
+                    action_reconciliation_outbox.c.claimed_by == claim.owner_id,
+                    action_reconciliation_outbox.c.claim_generation
+                    == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id
+                    == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until
+                    > now.isoformat(),
+                )
+                .values(
+                    status="pending",
+                    next_attempt_at=(
+                        now
+                        + timedelta(
+                            seconds=max(0.1, retry_after_seconds)
+                        )
+                    ).isoformat(),
+                    claimed_by=None,
+                    attempt_id=None,
+                    claim_until=None,
+                    last_error_sha256=canonical_payload_hash(error),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if retried.rowcount != 1:
+                raise ActionIntentConflictError(
+                    "Controller 结果对账租约已失效"
+                )
+            await connection.execute(
+                update(action_intents)
+                .where(
+                    action_intents.c.idempotency_key
+                    == claim.intent.idempotency_key,
+                    action_intents.c.incident_id
+                    == claim.intent.incident_id,
+                    action_intents.c.executor_generation
+                    == claim.intent.executor_generation,
+                    action_intents.c.attempt_id
+                    == claim.intent.attempt_id,
+                    action_intents.c.status.in_(["dispatched", "unknown"]),
+                )
+                .values(
+                    error=error[:2048],
+                    updated_at=now.isoformat(),
+                )
+            )
+        return await self._require_action(claim.intent.idempotency_key)
+
+    async def dead_letter_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        error: str,
+    ) -> StoredActionIntent:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._fence_action_reconciliation_claim(
+                connection,
+                claim,
+                now=now,
+            )
+            abandoned = await connection.execute(
+                update(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.action_id
+                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.status == "claimed",
+                    action_reconciliation_outbox.c.claimed_by == claim.owner_id,
+                    action_reconciliation_outbox.c.claim_generation
+                    == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id
+                    == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until
+                    > now.isoformat(),
+                )
+                .values(
+                    status="dead_letter",
+                    claimed_by=None,
+                    attempt_id=None,
+                    claim_until=None,
+                    last_error_sha256=canonical_payload_hash(error),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if abandoned.rowcount != 1:
+                raise ActionIntentConflictError(
+                    "Controller 结果对账租约已失效"
+                )
+            transitioned_unknown = await connection.execute(
+                update(action_intents)
+                .where(
+                    action_intents.c.idempotency_key
+                    == claim.intent.idempotency_key,
+                    action_intents.c.incident_id
+                    == claim.intent.incident_id,
+                    action_intents.c.executor_generation
+                    == claim.intent.executor_generation,
+                    action_intents.c.attempt_id
+                    == claim.intent.attempt_id,
+                    action_intents.c.status == "dispatched",
+                )
+                .values(
+                    status="unknown",
+                    error=error[:2048],
+                    finished_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if transitioned_unknown.rowcount == 0:
+                preserved_unknown = await connection.execute(
+                    update(action_intents)
+                    .where(
+                        action_intents.c.idempotency_key
+                        == claim.intent.idempotency_key,
+                        action_intents.c.incident_id
+                        == claim.intent.incident_id,
+                        action_intents.c.executor_generation
+                        == claim.intent.executor_generation,
+                        action_intents.c.attempt_id
+                        == claim.intent.attempt_id,
+                        action_intents.c.status == "unknown",
+                    )
+                    .values(
+                        error=error[:2048],
+                        updated_at=now.isoformat(),
+                    )
+                )
+                if preserved_unknown.rowcount != 1:
+                    raise ActionIntentConflictError(
+                        "dead letter 无法绑定原始 Action Intent"
+                    )
+            else:
+                await self._append_audit_event(
+                    connection,
+                    incident_id=claim.intent.incident_id,
+                    operation_id=(
+                        f"action:{claim.intent.idempotency_key}:"
+                        f"reconciliation-unknown:{claim.generation}"
+                    ),
+                    event_type="action.unknown",
+                    source_component="executor-reconciler",
+                    actor_type="executor",
+                    actor_id=claim.owner_id,
+                    actor_assurance="service-account",
+                    subject_type="action_intent",
+                    subject_id=claim.intent.idempotency_key,
+                    payload={
+                        "executor_generation": (
+                            claim.intent.executor_generation
+                        ),
+                        "executor_attempt_id": claim.intent.attempt_id,
+                        "reconciliation_generation": claim.generation,
+                        "reason_sha256": canonical_payload_hash(error),
+                    },
+                    occurred_at=now.isoformat(),
+                )
+            await self._append_audit_event(
+                connection,
+                incident_id=claim.intent.incident_id,
+                operation_id=(
+                    f"action:{claim.intent.idempotency_key}:"
+                    f"reconciliation-dead-letter:{claim.generation}"
+                ),
+                event_type="action.reconciliation_dead_lettered",
+                source_component="executor-reconciler",
+                actor_type="executor",
+                actor_id=claim.owner_id,
+                actor_assurance="service-account",
+                subject_type="action_intent",
+                subject_id=claim.intent.idempotency_key,
+                payload={
+                    "executor_generation": claim.intent.executor_generation,
+                    "executor_attempt_id": claim.intent.attempt_id,
+                    "reconciliation_generation": claim.generation,
+                    "reconciliation_attempt_count": claim.attempt_count,
+                    "reason_sha256": canonical_payload_hash(error),
+                },
+                occurred_at=now.isoformat(),
+            )
+        return await self._require_action(claim.intent.idempotency_key)
+
+    @staticmethod
+    async def _fence_action_reconciliation_claim(
+        connection: Any,
+        claim: ActionReconciliationClaim,
+        *,
+        now: datetime,
+    ) -> None:
+        current = (
+            await connection.execute(
+                select(action_reconciliation_outbox.c.action_id).where(
+                    action_reconciliation_outbox.c.action_id
+                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.status == "claimed",
+                    action_reconciliation_outbox.c.claimed_by == claim.owner_id,
+                    action_reconciliation_outbox.c.claim_generation
+                    == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id
+                    == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until
+                    > now.isoformat(),
+                )
+            )
+        ).scalar_one_or_none()
+        if current is None:
+            raise ActionIntentConflictError(
+                "Controller 结果对账领取已过期或被转移"
+            )
 
     async def cancel_action(
         self,
@@ -4122,7 +4668,7 @@ class SqlIncidentStore:
                         f"incident {incident_id} still has an active executor"
                     )
             if row["status"] == "claimed":
-                await connection.execute(
+                requeued = await connection.execute(
                     update(action_intents)
                     .where(
                         action_intents.c.idempotency_key == row["idempotency_key"],
@@ -4136,6 +4682,20 @@ class SqlIncidentStore:
                         updated_at=now.isoformat(),
                     )
                 )
+                if requeued.rowcount != 1:
+                    current = (
+                        (
+                            await connection.execute(
+                                select(action_intents).where(
+                                    action_intents.c.idempotency_key
+                                    == row["idempotency_key"]
+                                )
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    return self._stored_action(current)
                 row = {
                     **row,
                     "status": "queued",
@@ -4161,7 +4721,7 @@ class SqlIncidentStore:
                     occurred_at=now.isoformat(),
                 )
             elif row["status"] == "dispatched":
-                await connection.execute(
+                unknown = await connection.execute(
                     update(action_intents)
                     .where(
                         action_intents.c.idempotency_key == row["idempotency_key"],
@@ -4174,6 +4734,20 @@ class SqlIncidentStore:
                         updated_at=now.isoformat(),
                     )
                 )
+                if unknown.rowcount != 1:
+                    current = (
+                        (
+                            await connection.execute(
+                                select(action_intents).where(
+                                    action_intents.c.idempotency_key
+                                    == row["idempotency_key"]
+                                )
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    return self._stored_action(current)
                 row = {**row, "status": "unknown", "error": reason}
                 await self._append_audit_event(
                     connection,
