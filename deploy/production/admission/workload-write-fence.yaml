@@ -84,6 +84,27 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
+  name: sentinelops-workload-write-fence-audit
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  policyName: sentinelops-workload-write-fence
+  validationActions:
+    - Warn
+    - Audit
+  paramRef:
+    name: sentinelops-workload-write-fence
+    namespace: sentinelops-workloads
+    parameterNotFoundAction: Deny
+  matchResources:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        sentinelops.io/admission-audit: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
   name: sentinelops-workload-write-fence
   labels:
     app.kubernetes.io/part-of: sentinelops
@@ -101,3 +122,89 @@ spec:
     namespaceSelector:
       matchLabels:
         sentinelops.io/admission-protected: "true"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sentinelops-admission-governance
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: ops.sentinelops.io/v1alpha1
+    kind: SentinelAdmissionGuard
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: ["ops.sentinelops.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["UPDATE", "DELETE"]
+        resources: ["sentineladmissionguards"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["namespaces"]
+        scope: Cluster
+  variables:
+    - name: isGuard
+      expression: >-
+        request.resource.group == 'ops.sentinelops.io'
+        && request.resource.resource == 'sentineladmissionguards'
+    - name: isNamespace
+      expression: >-
+        request.resource.group == ''
+        && request.resource.resource == 'namespaces'
+    - name: oldProtection
+      expression: >-
+        variables.isNamespace
+        && has(oldObject.metadata.labels)
+        && 'sentinelops.io/admission-protected' in oldObject.metadata.labels
+          ? oldObject.metadata.labels['sentinelops.io/admission-protected']
+          : ''
+    - name: newProtection
+      expression: >-
+        variables.isNamespace
+        && has(object.metadata.labels)
+        && 'sentinelops.io/admission-protected' in object.metadata.labels
+          ? object.metadata.labels['sentinelops.io/admission-protected']
+          : ''
+  validations:
+    - expression: >-
+        !variables.isGuard
+        || request.name != params.metadata.name
+        || request.namespace != params.metadata.namespace
+        || request.userInfo.username in params.spec.allowedPolicyManagers
+      message: >-
+        SentinelAdmissionGuard changes require an explicitly allowed policy
+        manager identity
+      reason: Forbidden
+    - expression: >-
+        !variables.isNamespace
+        || request.name != params.metadata.namespace
+        || variables.oldProtection == variables.newProtection
+        || request.userInfo.username in params.spec.allowedPolicyManagers
+      message: >-
+        the SentinelOps enforcement label can only be changed by an explicitly
+        allowed policy manager identity
+      reason: Forbidden
+  auditAnnotations:
+    - key: admission-governance
+      valueExpression: >-
+        variables.isGuard ? 'guard-change' : 'enforcement-label-change'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sentinelops-admission-governance
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  policyName: sentinelops-admission-governance
+  validationActions:
+    - Deny
+    - Audit
+  paramRef:
+    name: sentinelops-workload-write-fence
+    namespace: sentinelops-workloads
+    parameterNotFoundAction: Deny

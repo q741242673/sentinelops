@@ -77,6 +77,69 @@ async def test_postgres_serializes_concurrent_audit_appends_per_incident() -> No
 
 
 @pytest.mark.asyncio
+async def test_postgres_chain_verification_stays_stable_during_appends() -> None:
+    assert DATABASE_URL is not None
+    audit_key = "postgres-audit-snapshot-key-000001"
+    verifier = SqlIncidentStore(
+        DATABASE_URL,
+        audit_hmac_key=audit_key,
+        audit_key_id="postgres-snapshot-v1",
+    )
+    writer = SqlIncidentStore(
+        DATABASE_URL,
+        audit_hmac_key=audit_key,
+        audit_key_id="postgres-snapshot-v1",
+    )
+    record = IncidentRecord(
+        alert=Alert(
+            name="ConcurrentAuditVerification",
+            namespace="sentinelops-tests",
+            service="inventory-service",
+            severity="warning",
+            summary="verify a stable chain boundary while events are appended",
+        )
+    )
+    await writer.save(record, expected_version=None, graph_state=None)
+
+    async def append(index: int) -> None:
+        async with writer.engine.begin() as connection:
+            await writer._append_audit_event(
+                connection,
+                incident_id=record.id,
+                operation_id=f"postgres-snapshot:{index}",
+                event_type="contract.concurrent_snapshot_append",
+                source_component="test",
+                actor_type="system",
+                actor_id="snapshot-writer",
+                actor_assurance="internal",
+                subject_type="incident",
+                subject_id=record.id,
+                payload={"index": index},
+            )
+
+    async def verify_repeatedly() -> list[bool]:
+        results: list[bool] = []
+        for _ in range(40):
+            results.append(
+                (await verifier.verify_audit_chain(record.id)).valid
+            )
+            await asyncio.sleep(0)
+        return results
+
+    verification_results, _ = await asyncio.gather(
+        verify_repeatedly(),
+        asyncio.gather(*(append(index) for index in range(40))),
+    )
+
+    assert all(verification_results)
+    final = await verifier.verify_audit_chain(record.id)
+    assert final.valid is True
+    assert final.event_count == 41
+    await verifier.close()
+    await writer.close()
+
+
+@pytest.mark.asyncio
 async def test_postgres_anchor_claim_uses_skip_locked_and_cas() -> None:
     assert DATABASE_URL is not None
     audit_key = "postgres-anchor-contract-key-00001"

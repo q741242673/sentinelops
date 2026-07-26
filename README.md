@@ -92,7 +92,7 @@ flowchart TB
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
 - **独立 Executor**：单独进程领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
 - **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间。
-- **集群准入写闸门**：使用 Kubernetes 原生 `ValidatingAdmissionPolicy` 保护明确标记的 namespace。即使某个账号已经拿到 Deployment 写 RBAC，只要不在该 namespace 的允许身份清单中，API Server 仍会拒绝写入；修复合同的创建、状态更新和删除也分别绑定 Executor、Controller 和清理身份。
+- **集群准入写闸门**：使用 Kubernetes 原生 `ValidatingAdmissionPolicy` 保护明确标记的 namespace。即使某个账号已经拿到 Deployment 写 RBAC，只要不在该 namespace 的允许身份清单中，API Server 仍会拒绝写入；策略可先用 Warn/Audit 灰度观察，再切到 Deny。白名单和正式启用标签也受独立策略保护，不能由普通发布账号自行修改。
 - **独立 GitOps Publisher**：只领取已经过边界检查并保存到数据库的动态提案，再交给公司 GitOps Gateway 创建代码变更请求。API、Agent 和 Executor 都不持有代码仓库写权限。
 - **集群与监控环境**：本地使用 kind 运行微服务、Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector。
 
@@ -134,7 +134,7 @@ SentinelOps 给大模型加了几条硬限制：
 11. **重复告警只能创建一个事故**：多 API 副本通过 PostgreSQL 原子认领 `Alertmanager 来源 + fingerprint + startsAt`。resolved 后保留记录，迟到的旧 firing 不会重新开事故，上一轮 resolved 也不能关闭下一轮告警。
 12. **外部请求不能伪造告警**：生产环境拒绝匿名 Webhook。原生 Alertmanager 可以使用 Bearer Token；经过签名网关时也可以使用覆盖时间戳和原始请求体的 HMAC-SHA256。重复认证头、过期签名、压缩体和超大请求都会在解析告警前被拒绝。
 13. **Controller 只执行注册动作**：写操作必须有对应的 Action Plugin。插件由服务端声明参数、最低风险、目标字段、审批方式、恢复验证方式和执行快照要求；只在提示词里出现、临时加入工具白名单或缺少完整快照的动作都不能进入 Kubernetes 后端。
-14. **RBAC 之外还有准入写闸门**：生产清单可以把目标 namespace 标记为受保护。Deployment 的创建、更新和删除只接受显式列出的发布身份或 Remediation Controller；`SentinelRemediation` 的创建、状态更新和删除分别绑定独立身份。缺少参数对象时策略会 fail-closed，而不是放行。
+14. **RBAC 之外还有准入写闸门**：生产清单可以先观察再把目标 namespace 标记为受保护。Deployment 的创建、更新和删除只接受显式列出的发布身份或 Remediation Controller；`SentinelRemediation` 的创建、状态更新和删除分别绑定独立身份。缺少参数对象时策略会 fail-closed，普通账号也不能修改允许名单或关闭正式保护。
 
 ## 快速运行：不需要 Kubernetes 和模型 Key
 
@@ -483,10 +483,12 @@ kubectl apply -f deploy/production/access/workload-rbac.yaml
 - 把公司 GitOps Controller、发布机器人等正常发布身份加入
   `allowedDeploymentWriters`；
 - 保留 SentinelOps Controller、Executor 的默认身份；
+- 把负责准入变更的公司平台身份加入 `allowedPolicyManagers`。示例中的
+  `sentinelops-admission-admin` 只创建 ServiceAccount，不会默认获得任何 RBAC；
 - 如果需要自动清理历史修复合同，单独创建只负责清理的 ServiceAccount，再加入
   `allowedRemediationDeleters`。默认空列表意味着任何人都不能直接删除合同。
 
-然后依次创建参数、策略和绑定，最后才给 namespace 加保护标签：
+然后依次创建参数、策略和绑定。先给目标 namespace 加灰度标签：
 
 ```bash
 kubectl apply \
@@ -494,15 +496,30 @@ kubectl apply \
   -f deploy/production/admission/workload-write-fence.yaml
 
 kubectl label namespace sentinelops-workloads \
+  sentinelops.io/admission-audit=true \
+  --overwrite
+```
+
+灰度阶段不会拦截请求，但不在允许清单中的写入会返回 Warning 并进入 Kubernetes Audit。先观察正常
+发布、SentinelOps 修复、运维脚本和回滚，把合法身份补齐。确认没有误报后，由公司的变更系统临时把
+目标 namespace 的更新权限、参数对象的更新权限授予 `sentinelops-admission-admin`，并以该身份切换：
+
+```bash
+kubectl label namespace sentinelops-workloads \
+  sentinelops.io/admission-audit- \
   sentinelops.io/admission-protected=true \
   --overwrite
 ```
 
-标签生效后，已有 Deployment 写权限但不在允许清单中的身份也会被 API Server 拒绝。应先在预发布
-namespace 验证正常发布、SentinelOps 修复和回滚，再逐个 namespace 开启。参数对象和 namespace
-标签本身必须只交给平台安全管理员修改，并接入 Kubernetes Audit；能删除准入策略、修改参数或移除
-标签的 cluster-admin 仍能绕过这道闸门。namespace 退役前也要先按变更流程解除保护，否则垃圾回收
-身份可能因为不在允许列表中而无法删除受保护资源。
+正式标签生效后，已有 Deployment 写 RBAC 但不在允许清单中的身份也会被 API Server 拒绝。独立治理
+策略同时保护 `SentinelAdmissionGuard` 和 `sentinelops.io/admission-protected`：普通发布账号即使
+额外拿到这些资源的 RBAC，也不能扩充白名单或移除标签。管理员 ServiceAccount 默认不挂载 Token，
+仓库也不提供长期 RoleBinding；应由公司变更系统短时授权、执行、审计并回收。
+
+break-glass 时应先记录工单和当前策略/参数快照，再由集群安全管理员临时取得策略管理身份。能够删除
+`ValidatingAdmissionPolicy` 或 Binding 的最高权限 cluster-admin 最终仍能绕过这道闸门，这是
+Kubernetes 集群管理员的信任边界。namespace 退役前也要先按同一变更流程解除正式保护，否则资源清理
+可能被写闸门拒绝。
 
 数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`。升级到包含
 `0010_action_reconcile_outbox` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在

@@ -401,6 +401,7 @@ def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None
         "openAPIV3Schema"
     ]["properties"]["spec"]
     assert set(guard_schema["required"]) == {
+        "allowedPolicyManagers",
         "allowedDeploymentWriters",
         "allowedRemediationCreators",
         "allowedRemediationStatusWriters",
@@ -423,7 +424,12 @@ def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None
     executor = (
         "system:serviceaccount:sentinelops-system:sentinelops-executor"
     )
+    admission_admin = (
+        "system:serviceaccount:sentinelops-system:"
+        "sentinelops-admission-admin"
+    )
     assert guard == {
+        "allowedPolicyManagers": [admission_admin],
         "allowedDeploymentWriters": [controller],
         "allowedRemediationCreators": [executor],
         "allowedRemediationStatusWriters": [controller],
@@ -479,10 +485,67 @@ def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None
     assert binding["matchResources"]["namespaceSelector"][
         "matchLabels"
     ] == {"sentinelops.io/admission-protected": "true"}
+
+    audit_binding = _resource(
+        "ValidatingAdmissionPolicyBinding",
+        "sentinelops-workload-write-fence-audit",
+        None,
+    )["spec"]
+    assert set(audit_binding["validationActions"]) == {"Warn", "Audit"}
+    assert audit_binding["paramRef"] == binding["paramRef"]
+    assert audit_binding["matchResources"]["namespaceSelector"][
+        "matchLabels"
+    ] == {"sentinelops.io/admission-audit": "true"}
+
+    governance = _resource(
+        "ValidatingAdmissionPolicy",
+        "sentinelops-admission-governance",
+        None,
+    )["spec"]
+    assert governance["failurePolicy"] == "Fail"
+    governance_resources = {
+        resource
+        for rule in governance["matchConstraints"]["resourceRules"]
+        for resource in rule["resources"]
+    }
+    assert governance_resources == {"sentineladmissionguards", "namespaces"}
+    governance_validation_text = " ".join(
+        validation["expression"]
+        for validation in governance["validations"]
+    )
+    assert "allowedPolicyManagers" in governance_validation_text
+    assert "variables.oldProtection == variables.newProtection" in (
+        governance_validation_text
+    )
+    assert all(
+        validation["reason"] == "Forbidden"
+        for validation in governance["validations"]
+    )
+
+    governance_binding = _resource(
+        "ValidatingAdmissionPolicyBinding",
+        "sentinelops-admission-governance",
+        None,
+    )["spec"]
+    assert set(governance_binding["validationActions"]) == {"Deny", "Audit"}
+    assert governance_binding["paramRef"] == binding["paramRef"]
+
+    manager_account = _resource(
+        "ServiceAccount",
+        "sentinelops-admission-admin",
+        "sentinelops-system",
+    )
+    assert manager_account["automountServiceAccountToken"] is False
     assert all(
         "sentineladmissionguards" not in rule.get("resources", [])
         for resource in _resources()
         if resource["kind"] == "Role"
+        for rule in resource["rules"]
+    )
+    assert all(
+        "namespaces" not in rule.get("resources", [])
+        for resource in _resources()
+        if resource["kind"] in {"Role", "ClusterRole"}
         for rule in resource["rules"]
     )
 

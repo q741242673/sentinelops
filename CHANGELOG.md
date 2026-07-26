@@ -17,6 +17,7 @@
 - 不可变动态提案、事务型 GitOps Outbox，以及幂等创建 GitHub Draft PR 的独立参考 Gateway；
 - Executor 在合同提交后失联时，由替代 Executor 只读核验 Controller 终态并通过数据库租约幂等回写；
 - Kubernetes 原生准入写闸门；即使 RBAC 已允许，未列入参数的 Deployment 和修复合同写入仍会被 API Server 拒绝；
+- 准入写闸门支持 Warn/Audit 灰度观察后再切换 Deny，并由独立治理策略保护允许名单和正式启用标签；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
 
 升级与迁移：
