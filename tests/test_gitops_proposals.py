@@ -117,7 +117,7 @@ async def test_proposal_and_outbox_commit_atomically_and_publish_once(
         "proposal_id": preview.proposal_id,
         "proposal_digest": preview.proposal_digest,
         "change_request_url": "https://git.example/pulls/17",
-        "revision": "abcdef0123456789",
+        "revision": "a" * 40,
     }
     published = await store.complete_gitops_proposal(
         claim,
@@ -233,7 +233,7 @@ async def test_http_gitops_sink_binds_receipt_and_idempotency_key() -> None:
                 "proposal_id": preview.proposal_id,
                 "proposal_digest": preview.proposal_digest,
                 "change_request_url": "https://git.example/pulls/17",
-                "revision": "abcdef0123456789",
+                "revision": "a" * 40,
             },
         )
 
@@ -267,7 +267,7 @@ async def test_http_gitops_sink_rejects_unbound_receipt() -> None:
                 "proposal_id": preview.proposal_id,
                 "proposal_digest": "0" * 64,
                 "change_request_url": "https://git.example/pulls/17",
-                "revision": "abcdef0",
+                "revision": "a" * 40,
             },
         )
 

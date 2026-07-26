@@ -22,6 +22,10 @@ def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None
     audit_file.write_text("audit-secret\n")
     anchor_file = tmp_path / "anchor-token"
     anchor_file.write_text("anchor-secret\n")
+    gitops_file = tmp_path / "gitops-token"
+    gitops_file.write_text("gitops-secret\n")
+    github_file = tmp_path / "github-token"
+    github_file.write_text("github-secret\n")
 
     settings = Settings(
         database_url_file=str(database_file),
@@ -29,6 +33,8 @@ def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None
         alertmanager_webhook_bearer_token_file=str(webhook_file),
         audit_hmac_key_file=str(audit_file),
         audit_anchor_bearer_token_file=str(anchor_file),
+        gitops_bearer_token_file=str(gitops_file),
+        gitops_github_token_file=str(github_file),
     )
 
     assert settings.resolved_database_url() == "sqlite+aiosqlite:///state.db"
@@ -36,6 +42,8 @@ def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None
     assert settings.resolved_webhook_bearer_token() == "webhook-secret"
     assert settings.resolved_audit_hmac_key() == "audit-secret"
     assert settings.resolved_audit_anchor_bearer_token() == "anchor-secret"
+    assert settings.resolved_gitops_bearer_token() == "gitops-secret"
+    assert settings.resolved_gitops_github_token() == "github-secret"
 
 
 def test_secret_value_and_file_cannot_both_be_configured(tmp_path: Path) -> None:

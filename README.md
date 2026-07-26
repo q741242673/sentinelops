@@ -321,6 +321,37 @@ SENTINELOPS_GITOPS_BEARER_TOKEN_FILE=/var/run/secrets/sentinelops/gitops-token
 
 Gateway 才负责使用 GitHub App、GitLab Project Token 或公司内部机器人创建分支和 PR/MR。SentinelOps API、Agent、Executor 都不需要仓库写凭据；GitOps 合并和实际部署仍由现有 CODEOWNERS、CI、策略检查和发布系统决定。这里实现的是可靠的提案提交通道，不是让大模型绕过评审直接应用 YAML。
 
+仓库还带了一个可以直接运行的参考 GitHub Gateway。它会使用固定仓库、固定基础分支和固定目录，创建 `sentinelops/proposal-<proposal_id>` 分支，把完整提案保存为 JSON，然后创建 Draft PR。请求不能指定仓库、分支或文件路径；Gateway 也会重新计算摘要、检查有效期，并确认分支里只有这一份提案文件。相同提案重复投递会返回原来的 PR，不会反复建分支。
+
+先准备两个互相独立的配置文件和 Secret：
+
+```bash
+mkdir -p .local/secrets
+cp config/gitops-gateway.env.example .local/gitops-gateway.env
+cp config/gitops-publisher.env.example .local/gitops-publisher.env
+openssl rand -hex 32 > .local/secrets/gitops-token
+```
+
+把 GitHub App 的短期 installation token，或只对目标配置仓库生效的 fine-grained token，单独写入 `.local/secrets/gitops-github-token`。需要的仓库权限只有 Metadata 只读、Contents 读写和 Pull requests 读写。不要使用个人全仓库 Token，也不要把 GitHub Token 放进 Publisher 的配置文件。
+
+修改 `.local/gitops-gateway.env` 里的目标仓库后启动：
+
+```bash
+sentinelops gitops-gateway \
+  --env-file .local/gitops-gateway.env \
+  --host 127.0.0.1 \
+  --port 8020
+```
+
+另一个终端启动 Publisher：
+
+```bash
+sentinelops gitops-publisher \
+  --env-file .local/gitops-publisher.env
+```
+
+参考 Gateway 只负责创建“提案 PR”，不会猜测每家公司配置仓库的目录结构，也不会直接改业务 Deployment YAML。实际公司接入时，可以让现有 GitOps Bot 读取提案 JSON 并生成对应配置变更，或者替换成公司自己的 Gateway。`deploy/gitops-gateway/reference.yaml` 提供了无 Kubernetes Token、只读根文件系统和只允许 Publisher 入站的部署参考；生产环境还需要在它前面接 TLS 或服务网格。
+
 生产 OIDC 需要单独授予 `sentinelops.incident.propose`。该权限可以预览并提交受限提案，但不能批准标准修复、直接修改集群或合并代码变更。
 
 ## Kubernetes 生产部署基线
@@ -1071,6 +1102,7 @@ src/sentinelops/
 ├── actions.py      # 可执行修复动作的 Action Plugin 合同与注册表
 ├── change_proposals.py # 不可执行的动态变更预览、边界检查和 diff
 ├── gitops.py       # 独立 GitOps Gateway 投递、回执绑定和重试
+├── gitops_gateway.py # 参考 GitHub Draft PR Gateway
 ├── agent/          # Agent 执行流程、质量检查和风险策略
 ├── llm/            # 大模型接口和不同服务的适配代码
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图

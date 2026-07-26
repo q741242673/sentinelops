@@ -14,6 +14,7 @@
 - Alertmanager、Prometheus、Loki、Tempo 和 Kubernetes 组成真实故障调查与恢复闭环；
 - OIDC 人工审批、最小权限、HMAC 审计链、Ed25519 外部回执和锚点失效时 fail-closed；
 - 双 API、双 Executor、多副本接管、进程崩溃、严格恢复验证和中文事故控制台；
+- 不可变动态提案、事务型 GitOps Outbox，以及幂等创建 GitHub Draft PR 的独立参考 Gateway；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
 
 升级与迁移：

@@ -8,7 +8,14 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    ValidationError,
+    field_validator,
+)
 
 from sentinelops.change_proposals import ChangeProposalPreview
 from sentinelops.storage import IncidentStore
@@ -41,7 +48,22 @@ class GitOpsReceipt(BaseModel):
     proposal_id: str
     proposal_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     change_request_url: HttpUrl
-    revision: str = Field(min_length=7, max_length=128)
+    revision: str = Field(pattern=r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+    @field_validator("change_request_url")
+    @classmethod
+    def https_change_request(cls, value: HttpUrl) -> HttpUrl:
+        if (
+            value.scheme != "https"
+            or value.username is not None
+            or value.password is not None
+            or value.query is not None
+            or value.fragment is not None
+        ):
+            raise ValueError(
+                "代码变更地址必须是无账号、query 和 fragment 的 HTTPS URL"
+            )
+        return value
 
 
 def gitops_request_payload(
