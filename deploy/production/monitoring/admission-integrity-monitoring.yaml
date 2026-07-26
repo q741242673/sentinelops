@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-remediation-controller
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  selector:
+    app.kubernetes.io/name: sentinelops-remediation-controller
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: sentinelops-admission-integrity
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-remediation-controller
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 5s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: sentinelops-admission-integrity
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  groups:
+    - name: sentinelops-admission-integrity
+      rules:
+        - alert: SentinelOpsAdmissionIntegrityBlocked
+          expr: >-
+            min(sentinelops_admission_integrity_healthy) == 0
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 自动修复已因准入完整性异常而停止
+        - alert: SentinelOpsAdmissionIntegrityCheckStale
+          expr: >-
+            time() -
+            min(sentinelops_admission_integrity_last_check_timestamp_seconds)
+            > 60
+          for: 30s
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 准入完整性检查已经过期
+        - alert: SentinelOpsAdmissionIntegrityMetricsMissing
+          expr: >-
+            absent(sentinelops_admission_integrity_healthy)
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: SentinelOps 准入完整性指标不可用

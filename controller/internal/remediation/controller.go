@@ -10,6 +10,7 @@ import (
 	"time"
 
 	opsv1alpha1 "github.com/q741242673/sentinelops/controller/api/v1alpha1"
+	"github.com/q741242673/sentinelops/controller/internal/admissionintegrity"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -36,10 +37,11 @@ const (
 
 type Reconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	ControllerID string
-	Clock        func() time.Time
-	AfterWrite   func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
+	Scheme             *runtime.Scheme
+	ControllerID       string
+	Clock              func() time.Time
+	AfterWrite         func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
+	AdmissionIntegrity func(context.Context) admissionintegrity.Result
 }
 
 type validationFailure struct {
@@ -105,6 +107,35 @@ func (r *Reconciler) Reconcile(
 		return ctrl.Result{}, r.finishFailure(ctx, remediation, failure)
 	}
 
+	if r.AdmissionIntegrity != nil {
+		integrity := r.AdmissionIntegrity(ctx)
+		if !integrity.Healthy ||
+			integrity.Unknown ||
+			integrity.Mode != admissionintegrity.ModeEnforced {
+			reason := "AdmissionIntegrityDrift"
+			if integrity.Unknown {
+				reason = "AdmissionIntegrityUnknown"
+			} else if integrity.Mode != admissionintegrity.ModeEnforced {
+				reason = "AdmissionFenceNotEnforced"
+			}
+			return ctrl.Result{}, r.finishFailure(
+				ctx,
+				remediation,
+				rejected(
+					reason,
+					"cluster admission integrity does not authorize automatic writes",
+				),
+			)
+		}
+	}
+
+	// The live admission preflight can take long enough for the execution
+	// fence to expire. Re-read the clock at the final write boundary instead
+	// of relying on the earlier static validation.
+	if failure := r.validateFenceFresh(remediation); failure != nil {
+		return ctrl.Result{}, r.finishFailure(ctx, remediation, failure)
+	}
+
 	if err := r.markExecuting(ctx, remediation); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -133,10 +164,6 @@ func (r *Reconciler) Reconcile(
 func (r *Reconciler) validateStatic(
 	remediation *opsv1alpha1.SentinelRemediation,
 ) *validationFailure {
-	now := time.Now().UTC()
-	if r.Clock != nil {
-		now = r.Clock().UTC()
-	}
 	spec := remediation.Spec
 	if remediation.Name != spec.ActionID {
 		return rejected("ActionIdentityMismatch", "metadata.name does not match actionId")
@@ -147,8 +174,8 @@ func (r *Reconciler) validateStatic(
 	if spec.Target.APIVersion != "apps/v1" || spec.Target.Kind != "Deployment" {
 		return rejected("UnsupportedTarget", "only apps/v1 Deployment targets are supported")
 	}
-	if !spec.Fence.ExpiresAt.Time.After(now) {
-		return stale("FenceExpired", "execution fence has expired")
+	if failure := r.validateFenceFresh(remediation); failure != nil {
+		return failure
 	}
 	if spec.Fence.Generation != spec.Precondition.Generation {
 		return rejected(
@@ -174,6 +201,15 @@ func (r *Reconciler) validateStatic(
 	}
 	if failure := validateAuthorization(spec); failure != nil {
 		return failure
+	}
+	return nil
+}
+
+func (r *Reconciler) validateFenceFresh(
+	remediation *opsv1alpha1.SentinelRemediation,
+) *validationFailure {
+	if !remediation.Spec.Fence.ExpiresAt.Time.After(r.now()) {
+		return stale("FenceExpired", "execution fence has expired")
 	}
 	return nil
 }

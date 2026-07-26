@@ -362,6 +362,36 @@ async def test_controller_rejection_is_a_failed_tool_result() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "AdmissionFenceNotEnforced",
+        "AdmissionIntegrityDrift",
+        "AdmissionIntegrityUnknown",
+    ],
+)
+async def test_admission_integrity_rejections_prove_no_write(
+    reason: str,
+) -> None:
+    api = FakeCustomObjectsApi(
+        terminal_phase="Rejected",
+        terminal_reason=reason,
+    )
+    gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        custom_objects_api=api,
+        poll_interval_seconds=0,
+        result_timeout_seconds=1,
+    )
+
+    result = await gateway.execute(_intent())
+
+    assert result.success is False
+    assert result.content["controller_phase"] == "Rejected"
+    assert result.error == f"{reason}: controller terminal result"
+
+
+@pytest.mark.asyncio
 async def test_observe_missing_contract_never_creates_or_replays_it() -> None:
     api = MissingCustomObjectsApi()
     gateway = KubernetesRemediationGateway(

@@ -88,6 +88,14 @@ data:
   SENTINELOPS_EXECUTOR_MODE: external
   SENTINELOPS_EXECUTOR_BACKEND: controller
   SENTINELOPS_EXECUTOR_MISSING_CONTRACT_GRACE_SECONDS: "30"
+  SENTINELOPS_ADMISSION_INTEGRITY_REQUIRED: "true"
+  SENTINELOPS_ADMISSION_POLICY_NAME: sentinelops-workload-write-fence
+  SENTINELOPS_ADMISSION_GOVERNANCE_POLICY_NAME: sentinelops-admission-governance
+  SENTINELOPS_ADMISSION_GUARD_NAME: sentinelops-workload-write-fence
+  SENTINELOPS_ADMISSION_REQUEST_TIMEOUT: 5s
+  SENTINELOPS_ADMISSION_RECONCILE_INTERVAL: 15s
+  SENTINELOPS_ADMISSION_EXPECTED_GUARD_SPEC: >-
+    {"allowedPolicyManagers":["system:serviceaccount:sentinelops-system:sentinelops-admission-admin"],"allowedDeploymentWriters":["system:serviceaccount:sentinelops-system:sentinelops-remediation-controller"],"allowedRemediationCreators":["system:serviceaccount:sentinelops-system:sentinelops-executor"],"allowedRemediationStatusWriters":["system:serviceaccount:sentinelops-system:sentinelops-remediation-controller"],"allowedRemediationDeleters":[]}
   SENTINELOPS_ALERTMANAGER_SOURCE_ID: prod-cluster-a
 ---
 apiVersion: v1

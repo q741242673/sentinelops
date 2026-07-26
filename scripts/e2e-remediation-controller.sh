@@ -15,6 +15,9 @@ docker build \
 kubectl apply \
   -f "${ROOT_DIR}/deploy/production/crds/sentinelremediations.yaml" \
   -f "${ROOT_DIR}/deploy/kind/remediation-controller.yaml"
+kubectl rollout restart \
+  deployment/sentinelops-remediation-controller \
+  --namespace sentinelops-system
 kubectl rollout status \
   deployment/sentinelops-remediation-controller \
   --namespace sentinelops-system \

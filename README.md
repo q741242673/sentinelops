@@ -91,7 +91,7 @@ flowchart TB
 - **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
 - **独立 Executor**：单独进程领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
-- **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间。
+- **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间；还会绕过本地缓存，直接向 API Server 重新核对准入策略完整性。
 - **集群准入写闸门**：使用 Kubernetes 原生 `ValidatingAdmissionPolicy` 保护明确标记的 namespace。即使某个账号已经拿到 Deployment 写 RBAC，只要不在该 namespace 的允许身份清单中，API Server 仍会拒绝写入；策略可先用 Warn/Audit 灰度观察，再切到 Deny。白名单和正式启用标签也受独立策略保护，不能由普通发布账号自行修改。
 - **独立 GitOps Publisher**：只领取已经过边界检查并保存到数据库的动态提案，再交给公司 GitOps Gateway 创建代码变更请求。API、Agent 和 Executor 都不持有代码仓库写权限。
 - **集群与监控环境**：本地使用 kind 运行微服务、Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector。
@@ -135,6 +135,7 @@ SentinelOps 给大模型加了几条硬限制：
 12. **外部请求不能伪造告警**：生产环境拒绝匿名 Webhook。原生 Alertmanager 可以使用 Bearer Token；经过签名网关时也可以使用覆盖时间戳和原始请求体的 HMAC-SHA256。重复认证头、过期签名、压缩体和超大请求都会在解析告警前被拒绝。
 13. **Controller 只执行注册动作**：写操作必须有对应的 Action Plugin。插件由服务端声明参数、最低风险、目标字段、审批方式、恢复验证方式和执行快照要求；只在提示词里出现、临时加入工具白名单或缺少完整快照的动作都不能进入 Kubernetes 后端。
 14. **RBAC 之外还有准入写闸门**：生产清单可以先观察再把目标 namespace 标记为受保护。Deployment 的创建、更新和删除只接受显式列出的发布身份或 Remediation Controller；`SentinelRemediation` 的创建、状态更新和删除分别绑定独立身份。缺少参数对象时策略会 fail-closed，普通账号也不能修改允许名单或关闭正式保护。
+15. **准入策略漂移会阻断 Controller**：Controller 每隔 15 秒检查 CRD、策略、绑定、白名单和 namespace 标签，并在每个真实 Deployment 写入前执行一次不走缓存的检查。只开 Audit、删除强制 Binding、修改 CEL、增加额外 writer、策略尚未被 API Server 接受或读取超时，都会在标记 `Executing` 前拒绝合同，不会碰 Deployment。
 
 ## 快速运行：不需要 Kubernetes 和模型 Key
 
@@ -488,6 +489,12 @@ kubectl apply -f deploy/production/access/workload-rbac.yaml
 - 如果需要自动清理历史修复合同，单独创建只负责清理的 ServiceAccount，再加入
   `allowedRemediationDeleters`。默认空列表意味着任何人都不能直接删除合同。
 
+同一份身份清单还要同步到
+`deploy/production/base/prerequisites.yaml` 的
+`SENTINELOPS_ADMISSION_EXPECTED_GUARD_SPEC`。Controller 会把这里的发布基线和 API Server 中的
+`SentinelAdmissionGuard.spec` 做精确比较：少一个身份、多一个身份或字段不一致都会停止自动修复。
+JSON 不合法时 Controller 会直接拒绝启动，避免用不完整基线运行。
+
 然后依次创建参数、策略和绑定。先给目标 namespace 加灰度标签：
 
 ```bash
@@ -501,7 +508,9 @@ kubectl label namespace sentinelops-workloads \
 ```
 
 灰度阶段不会拦截请求，但不在允许清单中的写入会返回 Warning 并进入 Kubernetes Audit。先观察正常
-发布、SentinelOps 修复、运维脚本和回滚，把合法身份补齐。确认没有误报后，由公司的变更系统临时把
+发布、运维脚本和回滚，把合法身份补齐。此时 Controller 会返回
+`AdmissionFenceNotEnforced`，所以 Agent 可以继续调查和生成方案，但不会自动修改 Deployment。
+确认没有误报后，由公司的变更系统临时把
 目标 namespace 的更新权限、参数对象的更新权限授予 `sentinelops-admission-admin`，并以该身份切换：
 
 ```bash
@@ -560,10 +569,16 @@ kubectl label namespace monitoring sentinelops.io/api-access=true
 ```bash
 kubectl label namespace monitoring sentinelops.io/metrics-access=true
 kubectl apply \
-  -f deploy/production/monitoring/audit-anchor-monitoring.yaml
+  -f deploy/production/monitoring/audit-anchor-monitoring.yaml \
+  -f deploy/production/monitoring/admission-integrity-monitoring.yaml
 ```
 
-这会每 15 秒读取 API 的 `/metrics`，监控待投递、dead letter、最老积压、最近送达时间、最近对账时间和持久化写闸门。两个 API 副本读取的是同一份数据库状态，因此告警规则统一使用 `max()`，不会把同一份积压重复相加。`PrometheusRule` 和 `ServiceMonitor` 依赖 Prometheus Operator CRD；没有安装时不要应用这份可选清单。
+这会每 15 秒读取 API 和 Controller 的 `/metrics`，监控待投递、dead letter、最老积压、最近送达时间、最近对账时间和持久化写闸门。两个 API 副本读取的是同一份数据库状态，因此 API 告警规则统一使用 `max()`，不会把同一份积压重复相加。`PrometheusRule` 和 `ServiceMonitor` 依赖 Prometheus Operator CRD；没有安装时不要应用这份可选清单。
+
+Controller 还会输出准入完整性是否健康、当前是 Audit 还是 Enforced、最后检查时间，以及有限枚举的
+漂移对象和原因。后台检查用于提前告警；真正授权写操作的仍是每次执行前的 fresh preflight，不能拿
+Prometheus 指标代替。准入异常不会让 API 或 Controller readiness 失败，因为系统仍要接收告警、进行
+只读调查并告诉操作员为什么停止写入。
 
 `/ready` 证明 API 已经启动且可以访问事故数据库，不代表模型、监控系统和 Kubernetes 里的目标服务都健康。Executor 和锚定 Publisher 的探针证明各自的领取循环仍在前进；如果进程卡住，心跳过期后 Pod 会退出 Ready 并由 Kubernetes 重启。外部审计服务临时不可用只会让 Outbox 保留待重试记录，不会回滚已经提交的事故处理。
 
@@ -768,8 +783,10 @@ Agent Lease 只负责授权入队；Executor 有自己的 owner、generation、a
 补回 `succeeded` 也只代表集群动作结果已知，事故仍需完成业务恢复验证或由人工确认。
 
 这套 fence 既能阻止 SentinelOps 自己的旧审批和重复动作，也能通过可选的 Kubernetes 准入策略阻止
-普通 Deployment 写账号绕过 Controller。它不能约束能够删除策略、修改准入参数或移除 namespace
-保护标签的 cluster-admin；这些最高权限操作仍要由独立平台身份、双人变更和 Kubernetes Audit 约束。
+普通 Deployment 写账号绕过 Controller。Controller 对策略只拥有精确到资源名的 `get` 权限，没有
+修复策略、修改白名单或切换标签的权限；发现漂移后应由 GitOps 或受审计的平台变更恢复。它不能阻止
+cluster-admin 在一次实时检查之后、Deployment 写入之前再次删除策略，这个极短 TOCTOU 窗口仍属于
+最高集群管理员信任边界；此类操作要由独立平台身份、双人变更和 Kubernetes Audit 约束。
 `production` 环境没有配置数据库时，服务会拒绝启动。
 
 `db-init` 使用带版本号的数据库迁移，不是简单执行 `create_all`。生产部署时应把它作为 API 和

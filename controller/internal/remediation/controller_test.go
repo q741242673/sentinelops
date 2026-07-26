@@ -8,6 +8,7 @@ import (
 	"time"
 
 	opsv1alpha1 "github.com/q741242673/sentinelops/controller/api/v1alpha1"
+	"github.com/q741242673/sentinelops/controller/internal/admissionintegrity"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -89,6 +90,183 @@ func TestRestartAppliesRegisteredAction(t *testing.T) {
 	if got := deployment.Annotations[actionPluginAnnotation]; got != ActionRestart {
 		t.Fatalf("action plugin marker = %q, want %q", got, ActionRestart)
 	}
+	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
+}
+
+func TestAdmissionDriftRejectsBeforeDeploymentWrite(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	checker := &fixedIntegrityChecker{result: admissionintegrity.Result{
+		Healthy: false,
+		Mode:    admissionintegrity.ModeEnforced,
+		Object:  "enforce_binding",
+		Reason:  "read_failed",
+	}}
+	reconciler.AdmissionIntegrity = checker.Check
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "AdmissionIntegrityDrift")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+	if checker.calls != 1 {
+		t.Fatalf("integrity checks = %d, want 1", checker.calls)
+	}
+}
+
+func TestAdmissionReadFailureRejectsAsUnknown(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	checker := &fixedIntegrityChecker{
+		result: admissionintegrity.Result{
+			Healthy: false,
+			Unknown: true,
+			Mode:    admissionintegrity.ModeUnknown,
+			Object:  "workload_policy",
+			Reason:  "read_failed",
+		},
+	}
+	reconciler.AdmissionIntegrity = checker.Check
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "AdmissionIntegrityUnknown")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
+func TestAdmissionAuditModeRejectsAutomaticWrite(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	checker := &fixedIntegrityChecker{
+		result: admissionintegrity.Result{
+			Healthy: false,
+			Mode:    admissionintegrity.ModeAudit,
+			Object:  "namespace",
+			Reason:  "enforcement_not_enabled",
+		},
+	}
+	reconciler.AdmissionIntegrity = checker.Check
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "AdmissionFenceNotEnforced")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
+func TestHealthyAdmissionIntegrityAllowsRegisteredWrite(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	checker := &fixedIntegrityChecker{
+		result: admissionintegrity.Result{
+			Healthy: true,
+			Mode:    admissionintegrity.ModeEnforced,
+		},
+	}
+	reconciler.AdmissionIntegrity = checker.Check
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
+}
+
+func TestAdmissionIntegrityPermitIsExplicitlyFailClosed(t *testing.T) {
+	tests := []struct {
+		name       string
+		result     admissionintegrity.Result
+		wantReason string
+	}{
+		{
+			name: "healthy audit mode",
+			result: admissionintegrity.Result{
+				Healthy: true,
+				Mode:    admissionintegrity.ModeAudit,
+			},
+			wantReason: "AdmissionFenceNotEnforced",
+		},
+		{
+			name: "healthy unknown result",
+			result: admissionintegrity.Result{
+				Healthy: true,
+				Unknown: true,
+				Mode:    admissionintegrity.ModeEnforced,
+			},
+			wantReason: "AdmissionIntegrityUnknown",
+		},
+		{
+			name:       "zero value result",
+			result:     admissionintegrity.Result{},
+			wantReason: "AdmissionFenceNotEnforced",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reconciler, kubeClient, remediation := newTestReconciler(
+				t,
+				ActionRestart,
+				nil,
+			)
+			checker := &fixedIntegrityChecker{result: test.result}
+			reconciler.AdmissionIntegrity = checker.Check
+
+			reconcileOnce(t, reconciler, remediation)
+
+			assertPhase(
+				t,
+				kubeClient,
+				remediation,
+				PhaseRejected,
+				test.wantReason,
+			)
+			assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+		})
+	}
+}
+
+func TestFenceExpiringDuringAdmissionPreflightCannotWrite(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	now := mustTime(t)
+	reconciler.Clock = func() time.Time { return now }
+	reconciler.AdmissionIntegrity = func(context.Context) admissionintegrity.Result {
+		now = remediation.Spec.Fence.ExpiresAt.Time.Add(time.Second)
+		return admissionintegrity.Result{
+			Healthy: true,
+			Mode:    admissionintegrity.ModeEnforced,
+		}
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseStale, "FenceExpired")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
+func TestDisabledAdmissionIntegrityLeavesRegisteredWriteEnabled(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	if reconciler.AdmissionIntegrity != nil {
+		t.Fatal("test setup unexpectedly enabled admission integrity")
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
 	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
 }
 
@@ -428,6 +606,44 @@ func newTestReconciler(
 		Clock:        func() time.Time { return mustTime(t) },
 	}
 	return reconciler, kubeClient, remediation
+}
+
+type fixedIntegrityChecker struct {
+	result admissionintegrity.Result
+	calls  int
+}
+
+func (f *fixedIntegrityChecker) Check(context.Context) admissionintegrity.Result {
+	f.calls++
+	return f.result
+}
+
+func assertNoWriteBoundaryCrossed(
+	t *testing.T,
+	kubeClient client.Client,
+	remediation *opsv1alpha1.SentinelRemediation,
+) {
+	t.Helper()
+	deployment := getDeployment(t, kubeClient)
+	if deployment.Annotations[actionIDAnnotation] != "" ||
+		deployment.Spec.Template.Annotations[actionIDAnnotation] != "" {
+		t.Fatal("admission integrity failure mutated the Deployment")
+	}
+	actual := &opsv1alpha1.SentinelRemediation{}
+	if err := kubeClient.Get(
+		context.Background(),
+		client.ObjectKeyFromObject(remediation),
+		actual,
+	); err != nil {
+		t.Fatalf("get remediation: %v", err)
+	}
+	if actual.Status.Attempt != 0 || actual.Status.StartedAt != nil {
+		t.Fatalf(
+			"write boundary was marked before rejection: attempt=%d startedAt=%v",
+			actual.Status.Attempt,
+			actual.Status.StartedAt,
+		)
+	}
 }
 
 func baseDeployment() *appsv1.Deployment {

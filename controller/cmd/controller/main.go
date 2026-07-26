@@ -3,8 +3,11 @@ package main
 import (
 	"flag"
 	"os"
+	"strconv"
+	"time"
 
 	opsv1alpha1 "github.com/q741242673/sentinelops/controller/api/v1alpha1"
+	"github.com/q741242673/sentinelops/controller/internal/admissionintegrity"
 	"github.com/q741242673/sentinelops/controller/internal/remediation"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -80,10 +83,66 @@ func main() {
 	}
 
 	controllerID := os.Getenv("HOSTNAME")
+	var integrityChecker *admissionintegrity.Checker
+	integrityRequired, err := strconv.ParseBool(
+		envOrDefault("SENTINELOPS_ADMISSION_INTEGRITY_REQUIRED", "false"),
+	)
+	if err != nil {
+		setupLog.Error(err, "invalid admission integrity required setting")
+		os.Exit(1)
+	}
+	if integrityRequired {
+		expectedGuardSpec, err := admissionintegrity.ParseGuardSpec(
+			os.Getenv("SENTINELOPS_ADMISSION_EXPECTED_GUARD_SPEC"),
+		)
+		if err != nil {
+			setupLog.Error(err, "invalid expected admission guard spec")
+			os.Exit(1)
+		}
+		requestTimeout, err := time.ParseDuration(
+			envOrDefault("SENTINELOPS_ADMISSION_REQUEST_TIMEOUT", "5s"),
+		)
+		if err != nil {
+			setupLog.Error(err, "invalid admission request timeout")
+			os.Exit(1)
+		}
+		integrityChecker, err = admissionintegrity.NewChecker(
+			manager.GetAPIReader(),
+			admissionintegrity.Config{
+				Namespace:            watchNamespace,
+				PolicyName:           envOrDefault("SENTINELOPS_ADMISSION_POLICY_NAME", "sentinelops-workload-write-fence"),
+				GovernancePolicyName: envOrDefault("SENTINELOPS_ADMISSION_GOVERNANCE_POLICY_NAME", "sentinelops-admission-governance"),
+				GuardName:            envOrDefault("SENTINELOPS_ADMISSION_GUARD_NAME", "sentinelops-workload-write-fence"),
+				ExpectedGuardSpec:    expectedGuardSpec,
+				RequestTimeout:       requestTimeout,
+			},
+		)
+		if err != nil {
+			setupLog.Error(err, "unable to create admission integrity checker")
+			os.Exit(1)
+		}
+		interval, err := time.ParseDuration(
+			envOrDefault("SENTINELOPS_ADMISSION_RECONCILE_INTERVAL", "15s"),
+		)
+		if err != nil {
+			setupLog.Error(err, "invalid admission reconcile interval")
+			os.Exit(1)
+		}
+		if err := manager.Add(&admissionintegrity.Monitor{
+			Checker:  integrityChecker,
+			Interval: interval,
+		}); err != nil {
+			setupLog.Error(err, "unable to add admission integrity monitor")
+			os.Exit(1)
+		}
+	}
 	reconciler := &remediation.Reconciler{
 		Client:       manager.GetClient(),
 		Scheme:       manager.GetScheme(),
 		ControllerID: controllerID,
+	}
+	if integrityChecker != nil {
+		reconciler.AdmissionIntegrity = integrityChecker.Check
 	}
 	if err := reconciler.SetupWithManager(manager, maxConcurrent); err != nil {
 		setupLog.Error(err, "unable to create remediation controller")
@@ -109,4 +168,11 @@ func main() {
 		setupLog.Error(err, "manager stopped")
 		os.Exit(1)
 	}
+}
+
+func envOrDefault(name string, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }
