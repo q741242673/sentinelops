@@ -29,6 +29,31 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  remediation-controller:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: controller
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: controller/go.mod
+          cache-dependency-path: controller/go.sum
+      - run: go mod verify
+      - name: Verify Go formatting
+        run: |
+          files="$(gofmt -l .)"
+          test -z "$files" || {
+            echo "$files"
+            exit 1
+          }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Build remediation Controller image
+        working-directory: .
+        run: docker build --tag sentinelops-remediation-controller:test controller
+
   postgres-contract:
     runs-on: ubuntu-latest
     services:
