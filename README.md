@@ -274,17 +274,23 @@ Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同�
 
 ## 集群内执行合同：SentinelRemediation
 
-`deploy/production/crds/sentinelremediations.yaml` 定义了下一阶段集群内 Controller 使用的 `SentinelRemediation` CRD。它不是一段让模型自由填写的 YAML，而是服务端从已经落库的 Action Intent 生成的一次性执行合同：
+`deploy/production/crds/sentinelremediations.yaml` 定义了集群内 Controller 使用的 `SentinelRemediation` CRD。它不是一段让模型自由填写的 YAML，而是服务端从已经落库的 Action Intent 生成的一次性执行合同：
 
 - 资源名必须等于 Action Intent 的 SHA-256 幂等摘要；
 - `spec` 创建后不可修改，动作、目标、执行前快照、授权决定和 fence generation 会一起冻结；
 - 动作只能来自当前 Action Plugin 目录，参数必须匹配重启、回滚或扩缩容合同；
 - 目标固定到 Deployment 名称和 UID，前置快照固定到 resourceVersion、generation、当前 revision 和 ReplicaSet；
 - 人工审批必须携带审批身份、版本和摘要，自动策略决定不能伪装成人工审批；
-- Controller 只能通过独立的 `/status` 子资源写回执行阶段、前后 resourceVersion 和结果摘要；
+- Go Controller 只能通过独立的 `/status` 子资源写回执行阶段、前后 resourceVersion 和结果摘要；
 - 成功、失败、拒绝、过期和取消等终态不能被改写，observed generation 也不能倒退。
 
-当前版本先稳定 CRD 和只允许 Executor `create/get/list/watch` 的提交权限，现有 Executor 仍按原路径直接执行注册动作。后续 Controller 接入并通过崩溃恢复验收后，才会删除 Executor 对 Deployment 的写权限。这个过渡状态不会被描述成已经完成了外部 fencing。
+`controller/` 已经实现独立的 Go Controller。它不会执行模型临时生成的命令，只认识重启、精确版本回滚和限定范围扩缩容三种注册动作。真正写 Deployment 前，它会再次核对目标 UID、resourceVersion、generation、当前 ReplicaSet、动作目录摘要、审批绑定和过期时间；任何一项变化都会把旧请求标成 `Stale` 或 `Rejected`。
+
+写入时使用 Kubernetes 自带的 resourceVersion 冲突检查，并把 action ID、动作类型和 fence generation 一起写到 Deployment。即使 API Server 已经接受修改后 Controller 立刻崩溃，重启后的新副本也会从这个标记恢复结果，不会再次触发同一个动作。两个副本通过 Lease 选主，只有 leader 处理写入。
+
+这里的 `Succeeded` 只表示“注册动作已被 Kubernetes 接受且结果可追踪”，不表示业务已经恢复。是否恢复仍由 Agent 的严格验证阶段根据主动请求、Prometheus、Alertmanager 和新 Trace 决定。
+
+当前处于安全迁移期：Controller 已实现并有独立 RBAC、部署清单和崩溃恢复测试，但现有 Executor 还保留原来的 Deployment 写权限。下一步会让 Executor 只创建 `SentinelRemediation`，确认真实 kind 闭环后再删除它的直接写权限。仓库不会把这个过渡状态包装成已经完成外部 fencing。
 
 本地或生产集群需要先安装 CRD：
 
@@ -293,6 +299,14 @@ kubectl apply -f deploy/production/crds/sentinelremediations.yaml
 ```
 
 `scripts/e2e-remediation-contract.sh` 会在真实 Kubernetes API Server 上验证：合法合同可以创建、`spec` 篡改会被拒绝、已经写入的终态不能反向修改。普通 YAML 解析无法覆盖这些 CEL 规则，所以这项检查也被接入了 kind E2E。
+
+Controller 自身可以单独检查：
+
+```bash
+cd controller
+go test -race ./...
+docker build -t sentinelops-remediation-controller:local .
+```
 
 ## 动态变更提案：复杂故障走 GitOps，不让模型直接改集群
 
@@ -382,8 +396,9 @@ sentinelops gitops-publisher \
 
 这套清单会：
 
-- 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 GitOps Publisher 和两个审计锚定 Publisher；
+- 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 Remediation Controller、两个 GitOps Publisher 和两个审计锚定 Publisher；
 - 让 API 使用只读 ServiceAccount；过渡期 Executor 只拥有 Deployment 修复权限，以及创建和查看不可变 `SentinelRemediation` 的权限；
+- 让 Controller 只读取 `SentinelRemediation` 和 ReplicaSet，只更新目标 Deployment 与执行状态，并使用 namespace 内 Lease 选主；
 - 让 GitOps 与锚定 Publisher 都不挂载 Kubernetes Token，分别只访问数据库及自己的外部服务；
 - 使用单独的数据库迁移 Job，迁移进程拿不到 Kubernetes 凭据；
 - 把数据库地址、模型 Key、Webhook Token、审计 Key 和锚定 Token 作为只读 Secret 文件挂载；
@@ -401,6 +416,7 @@ kubectl apply -f deploy/production/crds/sentinelremediations.yaml
 再把下面这些示例值改成实际环境：
 
 - `ghcr.io/your-org/sentinelops:0.1.0-rc.1`：替换为已经构建并最好固定到 digest 的镜像；
+- `ghcr.io/your-org/sentinelops-remediation-controller:0.1.0-rc.1`：替换为 Controller 镜像并固定到 digest；
 - `sentinelops-workloads`：替换为被管理服务所在的 namespace；
 - `prod-cluster-a`：替换为这一套 Alertmanager 的稳定唯一标识；
 - `https://replace-with-independent-audit-sink.example/v1/anchors`：替换为独立审计服务的 HTTPS 地址；
@@ -447,8 +463,10 @@ kubectl -n sentinelops-system wait \
 
 ```bash
 kubectl apply \
+  -f deploy/production/base/remediation-controller-rbac.yaml \
   -f deploy/production/base/api.yaml \
   -f deploy/production/base/executor.yaml \
+  -f deploy/production/base/remediation-controller.yaml \
   -f deploy/production/base/gitops-publisher.yaml \
   -f deploy/production/base/anchor-publisher.yaml \
   -f deploy/production/base/availability.yaml \
@@ -1140,6 +1158,7 @@ src/sentinelops/
 ├── demo.py         # 本地演示的故障注入与环境恢复
 ├── lab_profiles.py # 三种演示流程的服务端绑定规则
 └── runtime.py      # 生产 Agent 的组装入口
+controller/         # Go 集群内执行 Controller、动作合同和幂等恢复测试
 web/                # React + TypeScript 事故控制台
 demo/               # 本地微服务和测试流量
 deploy/             # 生产清单、完整拓扑验收、RBAC 和监控配置
@@ -1163,6 +1182,7 @@ tests/              # 单元测试和安全边界测试
 - 独立 `sentinelops executor`、单独的 Executor generation，以及 Agent 只读/Executor 可写的 RBAC 示例；
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；
 - `SentinelRemediation` v1alpha1 集群内执行合同、不可变 spec、独立 status、终态保护和 create-only Executor 提交权限；
+- Go Remediation Controller：三种注册动作、fresh preflight、resourceVersion CAS、动作标记幂等恢复、Lease 选主、最小 RBAC 和双副本部署；
 - 三段式 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
 - PostgreSQL 告警 fingerprint 生命周期、跨副本原子去重、乱序事件保护和崩溃后补调度；
 - 生产 Webhook 启动门禁、Bearer Token、原始请求体 HMAC、密钥轮换和请求大小边界；
@@ -1174,7 +1194,7 @@ tests/              # 单元测试和安全边界测试
 
 接入生产环境前还需要：
 
-- 实现 Kubernetes 集群内 Controller，把 Executor 从直接写 Deployment 切换为只提交 `SentinelRemediation`，并通过准入控制做外部 fencing；
+- 把 Executor 从直接写 Deployment 切换为只提交 `SentinelRemediation`，完成真实 kind 崩溃恢复闭环后删除旧写权限，并通过准入控制做外部 fencing；
 - 接入企业 Secret 管理和更细的 RBAC；
 - 为外部锚定增加限流和灾难恢复方案。
 

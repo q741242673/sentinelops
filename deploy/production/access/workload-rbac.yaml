@@ -35,6 +35,25 @@ rules:
     verbs: ["create", "get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-workloads
+rules:
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sentinelops-api-readonly
@@ -75,3 +94,17 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: sentinelops-remediation-submit
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-workloads
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-remediation-controller
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-remediation-controller

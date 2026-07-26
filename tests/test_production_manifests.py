@@ -125,6 +125,11 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
 def test_runtime_components_are_separate_hardened_deployments() -> None:
     api = _resource("Deployment", "sentinelops-api", "sentinelops-system")
     executor = _resource("Deployment", "sentinelops-executor", "sentinelops-system")
+    controller = _resource(
+        "Deployment",
+        "sentinelops-remediation-controller",
+        "sentinelops-system",
+    )
     publisher = _resource(
         "Deployment",
         "sentinelops-anchor-publisher",
@@ -138,12 +143,21 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
 
     assert api["spec"]["replicas"] >= 2
     assert executor["spec"]["replicas"] >= 2
+    assert controller["spec"]["replicas"] >= 2
     assert publisher["spec"]["replicas"] >= 2
     assert gitops_publisher["spec"]["replicas"] >= 2
     assert api["spec"]["template"]["spec"]["serviceAccountName"] == "sentinelops-api"
     assert (
         executor["spec"]["template"]["spec"]["serviceAccountName"]
         == "sentinelops-executor"
+    )
+    assert (
+        controller["spec"]["template"]["spec"]["serviceAccountName"]
+        == "sentinelops-remediation-controller"
+    )
+    assert (
+        controller["spec"]["template"]["spec"]["automountServiceAccountToken"]
+        is True
     )
     assert (
         publisher["spec"]["template"]["spec"]["serviceAccountName"]
@@ -163,6 +177,7 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
 
     api_container = _container(api)
     executor_container = _container(executor)
+    controller_container = _container(controller)
     publisher_container = _container(publisher)
     gitops_container = _container(gitops_publisher)
     assert api_container["livenessProbe"]["httpGet"]["path"] == "/health"
@@ -176,6 +191,12 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         executor_container["readinessProbe"]["exec"]["command"][0]
         == "sentinelops-executor-health"
     )
+    assert controller_container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+    assert controller_container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    assert controller_container["image"].endswith(
+        "/sentinelops-remediation-controller:0.1.0-rc.1"
+    )
+    assert "--leader-elect=true" in controller_container["args"]
     assert (
         publisher_container["livenessProbe"]["exec"]["command"][0]
         == "sentinelops-anchor-health"
@@ -197,7 +218,7 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         == gitops_container["image"]
     )
 
-    for deployment in (api, executor, publisher, gitops_publisher):
+    for deployment in (api, executor, controller, publisher, gitops_publisher):
         pod_spec = deployment["spec"]["template"]["spec"]
         container = _container(deployment)
         assert pod_spec["securityContext"]["runAsNonRoot"] is True
@@ -258,6 +279,11 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         "sentinelops-executor-write",
         "sentinelops-workloads",
     )
+    controller_role = _resource(
+        "Role",
+        "sentinelops-remediation-controller",
+        "sentinelops-workloads",
+    )
 
     api_verbs = {verb for rule in api_role["rules"] for verb in rule["verbs"]}
     api_resources = {
@@ -283,6 +309,31 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         for rule in executor_role["rules"]
         if "deployments" in rule["resources"]
     )
+    controller_resources = {
+        resource
+        for rule in controller_role["rules"]
+        for resource in rule["resources"]
+    }
+    assert controller_resources == {
+        "sentinelremediations",
+        "sentinelremediations/status",
+        "deployments",
+        "replicasets",
+    }
+    assert any(
+        set(rule["verbs"]) == {"get", "list", "watch", "update"}
+        for rule in controller_role["rules"]
+        if rule["resources"] == ["deployments"]
+    )
+    assert any(
+        {"update", "patch"} <= set(rule["verbs"])
+        for rule in controller_role["rules"]
+        if rule["resources"] == ["sentinelremediations/status"]
+    )
+    assert all(
+        "delete" not in rule["verbs"] and "create" not in rule["verbs"]
+        for rule in controller_role["rules"]
+    )
 
     api_binding = _resource(
         "RoleBinding",
@@ -292,6 +343,11 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
     executor_binding = _resource(
         "RoleBinding",
         "sentinelops-executor-write",
+        "sentinelops-workloads",
+    )
+    controller_binding = _resource(
+        "RoleBinding",
+        "sentinelops-remediation-controller",
         "sentinelops-workloads",
     )
     assert api_binding["subjects"][0] == {
@@ -304,6 +360,23 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         "name": "sentinelops-executor",
         "namespace": "sentinelops-system",
     }
+    assert controller_binding["subjects"][0] == {
+        "kind": "ServiceAccount",
+        "name": "sentinelops-remediation-controller",
+        "namespace": "sentinelops-system",
+    }
+    leader_role = _resource(
+        "Role",
+        "sentinelops-remediation-controller-leader-election",
+        "sentinelops-system",
+    )
+    assert leader_role["rules"] == [
+        {
+            "apiGroups": ["coordination.k8s.io"],
+            "resources": ["leases"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch"],
+        }
+    ]
     bound_service_accounts = {
         subject["name"]
         for item in _resources()
@@ -319,6 +392,7 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
     for name in (
         "sentinelops-api",
         "sentinelops-executor",
+        "sentinelops-remediation-controller",
         "sentinelops-anchor-publisher",
         "sentinelops-gitops-publisher",
     ):
@@ -349,6 +423,11 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "sentinelops-executor-deny-ingress",
         "sentinelops-system",
     )
+    controller_policy = _resource(
+        "NetworkPolicy",
+        "sentinelops-remediation-controller-ingress",
+        "sentinelops-system",
+    )
     publisher_policy = _resource(
         "NetworkPolicy",
         "sentinelops-anchor-publisher-deny-ingress",
@@ -365,6 +444,12 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "namespaceSelector"
     ]["matchLabels"] == {"sentinelops.io/metrics-access": "true"}
     assert executor_policy["spec"]["ingress"] == []
+    assert controller_policy["spec"]["ingress"][0]["ports"] == [
+        {"protocol": "TCP", "port": 8080}
+    ]
+    assert controller_policy["spec"]["ingress"][0]["from"][0][
+        "namespaceSelector"
+    ]["matchLabels"] == {"sentinelops.io/metrics-access": "true"}
     assert publisher_policy["spec"]["ingress"] == []
     assert gitops_policy["spec"]["ingress"] == []
 

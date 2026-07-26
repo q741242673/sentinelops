@@ -57,6 +57,27 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: sentinelops-remediation-controller-ingress
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-remediation-controller
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              sentinelops.io/metrics-access: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: sentinelops-gitops-publisher-deny-ingress
   namespace: sentinelops-system
   labels:
