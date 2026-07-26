@@ -13,6 +13,7 @@ from sentinelops.api import app
 from sentinelops.config import Settings
 from sentinelops.operator_auth import (
     INCIDENT_APPROVE_PERMISSION,
+    INCIDENT_PROPOSE_PERMISSION,
     INCIDENT_VIEW_PERMISSION,
     UNLOCK_APPROVE_PERMISSION,
     UNLOCK_REQUEST_PERMISSION,
@@ -20,6 +21,8 @@ from sentinelops.operator_auth import (
     operator_auth_configuration_error,
 )
 from sentinelops.storage import SqlIncidentStore
+from sentinelops.tools import ToolRegistry
+from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
 ISSUER = "https://identity.example.test"
 AUDIENCE = "sentinelops-api"
@@ -242,6 +245,86 @@ async def test_api_v1_requires_oidc_but_health_stays_independent(
     assert health.status_code == 200
     assert missing.status_code == 401
     assert accepted.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_dynamic_change_preview_requires_dedicated_oidc_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_key = generate_private_key(public_exponent=65537, key_size=2048)
+    jwks_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json=_jwks(private_key),
+                headers={"Content-Type": "application/json"},
+            )
+        )
+    )
+    settings = _settings(
+        tool_backend="simulator",
+        kubernetes_namespace="sentinelops-demo",
+    )
+    authenticator = OIDCAuthenticator(settings, client=jwks_client)
+    record = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="ManualInvestigationRequired",
+            namespace="sentinelops-demo",
+            service="order-service",
+            severity="critical",
+            summary="需要动态变更提案",
+        ),
+        status=api_module.IncidentStatus.ESCALATED,
+    )
+    api_module.incident_records[record.id] = record
+    monkeypatch.setattr(api_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(api_module, "operator_authenticator", authenticator)
+    monkeypatch.setattr(
+        api_module,
+        "_agent_tool_registry",
+        lambda _settings: ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    viewer_token = _token(
+        private_key,
+        roles=[INCIDENT_VIEW_PERMISSION],
+    )
+    proposer_token = _token(
+        private_key,
+        roles=[INCIDENT_PROPOSE_PERMISSION],
+    )
+    body = {
+        "rationale": "人工调查确认需要适当提高容器 CPU request",
+        "operations": [
+            {
+                "field": "container.resources.requests.cpu",
+                "container": "order-service",
+                "value": "250m",
+            }
+        ],
+    }
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://sentinelops.test",
+        ) as client:
+            denied = await client.post(
+                f"/api/v1/incidents/{record.id}/change-proposals/preview",
+                json=body,
+                headers={"Authorization": f"Bearer {viewer_token}"},
+            )
+            accepted = await client.post(
+                f"/api/v1/incidents/{record.id}/change-proposals/preview",
+                json=body,
+                headers={"Authorization": f"Bearer {proposer_token}"},
+            )
+    finally:
+        api_module.incident_records.pop(record.id, None)
+        await jwks_client.aclose()
+
+    assert denied.status_code == 403
+    assert accepted.status_code == 200
+    assert accepted.json()["executable"] is False
 
 
 @pytest.mark.asyncio

@@ -267,6 +267,37 @@ Executor 并不负责解决所有 Kubernetes 故障。它只执行服务端 Acti
 
 Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同一份合同。动作没有注册、被禁用、目标不属于当前事故、参数被替换或快照字段不完整时，都会在调用 Kubernetes 之前停止。这样可以逐步增加修复覆盖面，但不会因为给模型开放任意 Shell 而失去安全边界。
 
+## 动态变更提案：复杂故障先给人看，不直接执行
+
+当标准 Action Plugin 无法处理故障，而且事故已经停止自动写入时，可以创建一个动态变更预览：
+
+```bash
+curl -X POST \
+  http://localhost:8000/api/v1/incidents/INCIDENT_ID/change-proposals/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rationale": "人工调查确认需要提高 CPU request 并延长 readiness timeout",
+    "operations": [
+      {
+        "field": "container.resources.requests.cpu",
+        "container": "order-service",
+        "value": "250m"
+      },
+      {
+        "field": "container.readinessProbe.timeoutSeconds",
+        "container": "order-service",
+        "value": 3
+      }
+    ]
+  }'
+```
+
+这一步只返回绑定当前 Deployment UID、resourceVersion、generation 和容器镜像的 diff、提案摘要哈希，以及后续可使用的 Strategic Merge Patch。响应固定带有 `executable=false`，不会创建 Action Intent，也不会调用 Kubernetes 写接口。
+
+当前只允许调整已有容器的 CPU/内存 request、limit，以及已有 readiness/liveness probe 的少量数字参数。接口不接受任意 YAML 路径、Shell、`kubectl`、镜像、环境变量、Secret、RBAC、特权容器和删除操作；资源值还有 CPU、内存及 request/limit 关系上限。事故仍在自动处理、目标 namespace 不一致、容器不存在、修改无变化或快照读取失败时都会拒绝。
+
+生产 OIDC 需要单独授予 `sentinelops.incident.propose`。该权限只能生成限时预览，不能批准或执行。下一阶段会把通过检查的预览持久化，并接到独立的 GitOps PR 流程；在这之前它不是可执行修复通道。
+
 ## Kubernetes 生产部署基线
 
 `deploy/production` 提供了一套可以按公司环境改造的控制面清单。它和本地 kind Demo 分开，不会改变 `make console-live` 的运行方式。
@@ -457,7 +488,7 @@ SENTINELOPS_OIDC_AUDIENCE=sentinelops-api
 SENTINELOPS_OIDC_JWKS_URL=https://identity.example.com/.well-known/jwks.json
 ```
 
-默认权限分别为 `sentinelops.incident.view`、`sentinelops.incident.create`、`sentinelops.incident.approve`、`sentinelops.anchor-unlock.request`、`sentinelops.anchor-unlock.approve` 和 `sentinelops.demo.operate`。生产环境关闭 OIDC、使用 HTTP issuer/JWKS，或缺少固定 audience 时会拒绝启动。Alertmanager Webhook 仍使用自己的 Bearer/HMAC 认证，不接受用户 OIDC Token 替代。本地演示可以保持 `SENTINELOPS_OPERATOR_AUTH_MODE=disabled`，此时审计身份会明确标记为 `unverified`，并且不能调用安全闸门解锁接口。
+默认权限分别为 `sentinelops.incident.view`、`sentinelops.incident.create`、`sentinelops.incident.propose`、`sentinelops.incident.approve`、`sentinelops.anchor-unlock.request`、`sentinelops.anchor-unlock.approve` 和 `sentinelops.demo.operate`。生产环境关闭 OIDC、使用 HTTP issuer/JWKS，或缺少固定 audience 时会拒绝启动。Alertmanager Webhook 仍使用自己的 Bearer/HMAC 认证，不接受用户 OIDC Token 替代。本地演示可以保持 `SENTINELOPS_OPERATOR_AUTH_MODE=disabled`，此时审计身份会明确标记为 `unverified`，并且不能调用安全闸门解锁接口。
 
 外部审计出现分叉后，解锁申请必须绑定当前 `integrity_blocked` 代次、变更单和有效期。申请人与批准人必须是两个不同的 OIDC 人类身份，两个角色使用不同权限；原始变更单、说明和审批备注只保存摘要。第二人批准后状态只会进入 `unlock_pending`，`write_blocked` 仍然为真，普通健康对账也不能开闸。
 
@@ -1005,6 +1036,7 @@ OIDC，把 Anchor 放到独立权限域，并使用 HTTPS 和正式 Secret。这
 ```text
 src/sentinelops/
 ├── actions.py      # 可执行修复动作的 Action Plugin 合同与注册表
+├── change_proposals.py # 不可执行的动态变更预览、边界检查和 diff
 ├── agent/          # Agent 执行流程、质量检查和风险策略
 ├── llm/            # 大模型接口和不同服务的适配代码
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图

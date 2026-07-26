@@ -204,6 +204,52 @@ class KubernetesBackend:
             "revisions": [self._replica_set_summary(rs) for rs in owned],
         }
 
+    def _tool_get_deployment_snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        name = arguments["name"]
+        deployment = self.apps.read_namespaced_deployment(
+            name,
+            self.namespace,
+            _request_timeout=self._api_timeout(),
+        )
+        containers = deployment.spec.template.spec.containers or []
+
+        def resource_values(container: Any, group: str) -> dict[str, str]:
+            resources = getattr(container, "resources", None)
+            values = getattr(resources, group, None) if resources is not None else None
+            return {key: str(value) for key, value in (values or {}).items()}
+
+        return {
+            "name": name,
+            "namespace": self.namespace,
+            "uid": str(deployment.metadata.uid),
+            "resource_version": str(deployment.metadata.resource_version),
+            "generation": int(deployment.metadata.generation),
+            "containers": [
+                {
+                    "name": container.name,
+                    "image": container.image,
+                    "resources": {
+                        "requests": resource_values(container, "requests"),
+                        "limits": resource_values(container, "limits"),
+                    },
+                    "readinessProbe": self._probe_snapshot(container.readiness_probe),
+                    "livenessProbe": self._probe_snapshot(container.liveness_probe),
+                }
+                for container in containers
+            ],
+        }
+
+    @staticmethod
+    def _probe_snapshot(probe: Any | None) -> dict[str, int] | None:
+        if probe is None:
+            return None
+        return {
+            "initialDelaySeconds": int(probe.initial_delay_seconds or 0),
+            "periodSeconds": int(probe.period_seconds or 10),
+            "timeoutSeconds": int(probe.timeout_seconds or 1),
+            "failureThreshold": int(probe.failure_threshold or 3),
+        }
+
     @staticmethod
     def _owned_replica_sets(deployment: Any, replica_sets: list[Any]) -> list[Any]:
         deployment_uid = deployment.metadata.uid
