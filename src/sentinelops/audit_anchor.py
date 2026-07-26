@@ -611,6 +611,10 @@ class AuditAnchorPublisher:
                 claim,
                 error=str(exc),
             )
+            await self._block_after_dead_letter(
+                reason=f"publisher_local_integrity:{exc}",
+                sequence=claim.anchor.sequence,
+            )
             self._heartbeat()
             return True
 
@@ -627,6 +631,10 @@ class AuditAnchorPublisher:
                 await self.store.dead_letter_audit_anchor(
                     claim,
                     error=exc.category,
+                )
+                await self._block_after_dead_letter(
+                    reason=f"publisher_delivery_rejected:{exc.category}",
+                    sequence=claim.anchor.sequence,
                 )
             self._heartbeat()
             return True
@@ -703,6 +711,31 @@ class AuditAnchorPublisher:
                 type(gate_exc).__name__,
             )
 
+    async def _block_after_dead_letter(
+        self,
+        *,
+        reason: str,
+        sequence: int,
+    ) -> None:
+        logger.error(
+            "audit anchor entered dead letter; writes are blocked: "
+            "sequence=%s reason=%s",
+            sequence,
+            reason,
+        )
+        try:
+            await self.store.set_audit_anchor_security_state(
+                status="integrity_blocked",
+                write_blocked=True,
+                reason=reason,
+                successful=False,
+            )
+        except Exception as gate_exc:
+            logger.error(
+                "audit anchor dead-letter gate could not be persisted: %s",
+                type(gate_exc).__name__,
+            )
+
     async def _verify_claim(self, claim: AuditAnchorClaim) -> None:
         anchor = claim.anchor
         verification = await self.store.verify_audit_chain(
@@ -772,6 +805,9 @@ class AuditAnchorReconciler:
             # that was closed by an integrity failure. Only the dedicated,
             # challenge-bound unlock workflow may complete that transition.
             return state.status
+        metrics = await self.store.audit_anchor_metrics()
+        if metrics.status_counts.get("dead_letter", 0) > 0:
+            return await self._block("anchor_dead_letter_present")
         if state is None:
             await self.store.set_audit_anchor_security_state(
                 status="initializing",

@@ -25,8 +25,33 @@ fi
 kubectl apply -f "${ROOT_DIR}/deploy/kind/workload.yaml"
 kubectl patch deployment/order-service \
   --namespace sentinelops-demo \
-  --type merge \
-  --patch '{"spec":{"template":{"metadata":{"annotations":{"sentinelops.io/health-status":null}}}}}'
+  --type strategic \
+  --patch '{
+    "spec": {
+      "template": {
+        "metadata": {
+          "annotations": {
+            "ops.sentinelops.io/action-id": null,
+            "ops.sentinelops.io/fence-generation": null,
+            "sentinelops.io/change-cause": "healthy-baseline",
+            "sentinelops.io/fault": null,
+            "sentinelops.io/health-status": null,
+            "sentinelops.io/rolledBackAt": null,
+            "sentinelops.io/version": "1.0.0"
+          }
+        },
+        "spec": {
+          "containers": [
+            {
+              "name": "order-service",
+              "command": null,
+              "args": null
+            }
+          ]
+        }
+      }
+    }
+  }'
 kubectl rollout status deployment/order-service \
   --namespace sentinelops-demo \
   --timeout 120s

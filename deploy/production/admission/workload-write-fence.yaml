@@ -1,0 +1,103 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sentinelops-workload-write-fence
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: ops.sentinelops.io/v1alpha1
+    kind: SentinelAdmissionGuard
+  matchConstraints:
+    matchPolicy: Equivalent
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments"]
+        scope: Namespaced
+      - apiGroups: ["ops.sentinelops.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources:
+          - sentinelremediations
+          - sentinelremediations/status
+        scope: Namespaced
+  variables:
+    - name: isDeployment
+      expression: >-
+        request.resource.group == 'apps'
+        && request.resource.resource == 'deployments'
+    - name: isRemediation
+      expression: >-
+        request.resource.group == 'ops.sentinelops.io'
+        && request.resource.resource == 'sentinelremediations'
+  validations:
+    - expression: >-
+        !variables.isDeployment
+        || request.userInfo.username in params.spec.allowedDeploymentWriters
+      message: >-
+        protected Deployment writes must use an explicitly allowed release
+        identity or the SentinelOps Remediation Controller
+      reason: Forbidden
+    - expression: >-
+        !variables.isRemediation
+        || request.operation != 'CREATE'
+        || request.userInfo.username in params.spec.allowedRemediationCreators
+      message: >-
+        SentinelRemediation contracts can only be created by an allowed
+        Executor identity
+      reason: Forbidden
+    - expression: >-
+        !variables.isRemediation
+        || request.operation != 'UPDATE'
+        || request.subResource == 'status'
+      message: >-
+        SentinelRemediation root resources are immutable
+      reason: Forbidden
+    - expression: >-
+        !variables.isRemediation
+        || request.operation != 'UPDATE'
+        || request.subResource != 'status'
+        || request.userInfo.username
+           in params.spec.allowedRemediationStatusWriters
+      message: >-
+        SentinelRemediation status can only be written by an allowed
+        Controller identity
+      reason: Forbidden
+    - expression: >-
+        !variables.isRemediation
+        || request.operation != 'DELETE'
+        || request.userInfo.username in params.spec.allowedRemediationDeleters
+      message: >-
+        SentinelRemediation deletion requires an explicit retention or
+        break-glass identity
+      reason: Forbidden
+  auditAnnotations:
+    - key: admission-guard
+      valueExpression: >-
+        variables.isDeployment
+          ? 'deployment-write-fence'
+          : 'remediation-contract-fence'
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: sentinelops-workload-write-fence
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  policyName: sentinelops-workload-write-fence
+  validationActions:
+    - Deny
+    - Audit
+  paramRef:
+    name: sentinelops-workload-write-fence
+    namespace: sentinelops-workloads
+    parameterNotFoundAction: Deny
+  matchResources:
+    matchPolicy: Equivalent
+    namespaceSelector:
+      matchLabels:
+        sentinelops.io/admission-protected: "true"

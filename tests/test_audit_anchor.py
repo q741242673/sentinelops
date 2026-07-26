@@ -12,6 +12,7 @@ from sentinelops.audit_anchor import (
     RECEIPT_PROTOCOL,
     AuditAnchorDeliveryError,
     AuditAnchorPublisher,
+    AuditAnchorReconciler,
     HttpAuditAnchorSink,
 )
 from sentinelops.domain import Alert, IncidentRecord
@@ -321,6 +322,46 @@ async def test_publisher_dead_letters_local_tampering_without_http(tmp_path) -> 
     assert row["last_error_sha256"] == canonical_payload_hash(
         "local_chain_invalid"
     )
+    security = await store.audit_anchor_security_state()
+    assert security is not None
+    assert security.status == "integrity_blocked"
+    assert security.write_blocked is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciler_keeps_dead_lettered_stream_fail_closed(
+    tmp_path,
+) -> None:
+    store = await _store(tmp_path)
+    await store.save(_record(), expected_version=None, graph_state=None)
+    claim = await store.claim_audit_anchor(
+        owner_id="publisher-a",
+        ttl_seconds=60,
+    )
+    assert claim is not None
+    await store.dead_letter_audit_anchor(
+        claim,
+        error="local_chain_invalid",
+    )
+
+    class UnexpectedSink:
+        async def fetch_inventory(self):
+            raise AssertionError(
+                "dead letters must block before remote reconciliation"
+            )
+
+    reconciler = AuditAnchorReconciler(
+        store,
+        UnexpectedSink(),  # type: ignore[arg-type]
+        max_staleness_seconds=30,
+    )
+    status = await reconciler.reconcile_once()
+
+    assert status == "integrity_blocked"
+    security = await store.audit_anchor_security_state()
+    assert security is not None
+    assert security.write_blocked is True
     await store.close()
 
 
@@ -357,6 +398,44 @@ async def test_retryable_delivery_failure_keeps_only_error_hash(tmp_path) -> Non
     assert row["status"] == "pending"
     assert row["last_error_sha256"] == canonical_payload_hash("http_500")
     assert TOKEN not in str(dict(row))
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_delivery_failure_dead_letters_and_blocks_writes(
+    tmp_path,
+) -> None:
+    store = await _store(tmp_path)
+    await store.save(_record(), expected_version=None, graph_state=None)
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="receiver rejected anchor")
+
+    sink, client = _sink(handler)
+    publisher = AuditAnchorPublisher(
+        store,
+        sink,
+        owner_id="publisher-a",
+        claim_ttl_seconds=60,
+        poll_interval_seconds=0.1,
+        retry_base_seconds=1,
+        retry_max_seconds=10,
+    )
+    try:
+        assert await publisher.run_once() is True
+    finally:
+        await client.aclose()
+
+    async with store.engine.connect() as connection:
+        row = (
+            await connection.execute(select(audit_anchor_outbox))
+        ).mappings().one()
+    assert row["status"] == "dead_letter"
+    assert row["last_error_sha256"] == canonical_payload_hash("http_400")
+    security = await store.audit_anchor_security_state()
+    assert security is not None
+    assert security.status == "integrity_blocked"
+    assert security.write_blocked is True
     await store.close()
 
 
