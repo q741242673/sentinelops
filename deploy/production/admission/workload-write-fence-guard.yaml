@@ -6,6 +6,8 @@ metadata:
   labels:
     app.kubernetes.io/part-of: sentinelops
 spec:
+  allowedPolicyManagers:
+    - system:serviceaccount:sentinelops-system:sentinelops-admission-admin
   allowedDeploymentWriters:
     - system:serviceaccount:sentinelops-system:sentinelops-remediation-controller
   allowedRemediationCreators:

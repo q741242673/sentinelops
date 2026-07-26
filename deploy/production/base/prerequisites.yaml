@@ -35,6 +35,15 @@ automountServiceAccountToken: true
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  name: sentinelops-admission-admin
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
   name: sentinelops-migrator
   namespace: sentinelops-system
   labels:

@@ -10,12 +10,28 @@ CONTROLLER_USER="system:serviceaccount:sentinelops-system:sentinelops-remediatio
 EXECUTOR_USER="system:serviceaccount:sentinelops-system:sentinelops-executor"
 INTRUDER_USER="system:serviceaccount:sentinelops-system:sentinelops-admission-intruder"
 GC_USER="system:serviceaccount:sentinelops-system:sentinelops-remediation-gc"
+PLATFORM_ADMIN_USER="system:serviceaccount:sentinelops-system:sentinelops-admission-admin"
 CREATED_GUARD_CRD=false
 
 cleanup() {
+  kubectl delete validatingadmissionpolicybinding \
+    "${POLICY_NAME}-governance" \
+    --ignore-not-found >/dev/null
+  kubectl delete validatingadmissionpolicy \
+    "${POLICY_NAME}-governance" \
+    --ignore-not-found >/dev/null
+  kubectl delete validatingadmissionpolicybinding \
+    "${POLICY_NAME}-audit" \
+    --ignore-not-found >/dev/null
   kubectl delete validatingadmissionpolicybinding "${POLICY_NAME}" \
     --ignore-not-found >/dev/null
   kubectl delete validatingadmissionpolicy "${POLICY_NAME}" \
+    --ignore-not-found >/dev/null
+  kubectl delete clusterrolebinding \
+    "${POLICY_NAME}-namespace-writers" \
+    --ignore-not-found >/dev/null
+  kubectl delete clusterrole \
+    "${POLICY_NAME}-namespace-writer" \
     --ignore-not-found >/dev/null
   kubectl delete namespace "${NAMESPACE}" \
     --ignore-not-found \
@@ -64,6 +80,9 @@ rules:
   - apiGroups: ["ops.sentinelops.io"]
     resources: ["sentinelremediations/status"]
     verbs: ["get", "update", "patch"]
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentineladmissionguards"]
+    verbs: ["get", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -83,10 +102,38 @@ subjects:
   - kind: ServiceAccount
     name: sentinelops-remediation-gc
     namespace: sentinelops-system
+  - kind: ServiceAccount
+    name: sentinelops-admission-admin
+    namespace: sentinelops-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: admission-e2e-writer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ${POLICY_NAME}-namespace-writer
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ${POLICY_NAME}-namespace-writers
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-admission-intruder
+    namespace: sentinelops-system
+  - kind: ServiceAccount
+    name: sentinelops-admission-admin
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ${POLICY_NAME}-namespace-writer
 ---
 apiVersion: ops.sentinelops.io/v1alpha1
 kind: SentinelAdmissionGuard
@@ -94,6 +141,8 @@ metadata:
   name: ${POLICY_NAME}
   namespace: ${NAMESPACE}
 spec:
+  allowedPolicyManagers:
+    - ${PLATFORM_ADMIN_USER}
   allowedDeploymentWriters:
     - ${CONTROLLER_USER}
   allowedRemediationCreators:
@@ -106,6 +155,7 @@ YAML
 
 sed \
   -e "s/sentinelops-workload-write-fence/${POLICY_NAME}/g" \
+  -e "s/sentinelops-admission-governance/${POLICY_NAME}-governance/g" \
   -e "s/namespace: sentinelops-workloads/namespace: ${NAMESPACE}/g" \
   -e "s/sentinelops.io\\/admission-protected/sentinelops.io\\/admission-e2e-protected/g" \
   "${ROOT_DIR}/deploy/production/admission/workload-write-fence.yaml" \
@@ -114,15 +164,24 @@ kubectl wait \
   --for=jsonpath='{.status.observedGeneration}'=1 \
   "validatingadmissionpolicy/${POLICY_NAME}" \
   --timeout=60s
+kubectl wait \
+  --for=jsonpath='{.status.observedGeneration}'=1 \
+  "validatingadmissionpolicy/${POLICY_NAME}-governance" \
+  --timeout=60s
 
 warnings="$(
   kubectl get validatingadmissionpolicy "${POLICY_NAME}" \
     -o jsonpath='{.status.typeChecking.expressionWarnings}'
 )"
 [[ -z "${warnings}" || "${warnings}" == "[]" ]]
+governance_warnings="$(
+  kubectl get validatingadmissionpolicy "${POLICY_NAME}-governance" \
+    -o jsonpath='{.status.typeChecking.expressionWarnings}'
+)"
+[[ -z "${governance_warnings}" || "${governance_warnings}" == "[]" ]]
 
 kubectl label namespace "${NAMESPACE}" \
-  sentinelops.io/admission-e2e-protected=true \
+  sentinelops.io/admission-audit=true \
   --overwrite
 sleep 2
 
@@ -130,6 +189,61 @@ kubectl auth can-i update deployments \
   --as "${INTRUDER_USER}" \
   --namespace "${NAMESPACE}" \
   | grep --quiet '^yes$'
+
+set +e
+audit_output="$(
+  kubectl patch deployment admission-target \
+    --namespace "${NAMESPACE}" \
+    --type merge \
+    --patch '{"metadata":{"annotations":{"sentinelops.io/audit-write":"true"}}}' \
+    --as "${INTRUDER_USER}" 2>&1
+)"
+audit_status=$?
+set -e
+[[ "${audit_status}" -eq 0 ]]
+grep --quiet "Warning.*protected Deployment writes" <<<"${audit_output}"
+
+set +e
+intruder_guard_output="$(
+  kubectl patch sentineladmissionguard "${POLICY_NAME}" \
+    --namespace "${NAMESPACE}" \
+    --type merge \
+    --patch '{"metadata":{"annotations":{"sentinelops.io/intruder":"true"}}}' \
+    --as "${INTRUDER_USER}" 2>&1
+)"
+intruder_guard_status=$?
+set -e
+[[ "${intruder_guard_status}" -ne 0 ]]
+grep --quiet "changes require an explicitly allowed policy manager" \
+  <<<"${intruder_guard_output}"
+
+kubectl patch sentineladmissionguard "${POLICY_NAME}" \
+  --namespace "${NAMESPACE}" \
+  --type merge \
+  --patch '{"metadata":{"annotations":{"sentinelops.io/managed":"true"}}}' \
+  --as "${PLATFORM_ADMIN_USER}"
+
+kubectl label namespace "${NAMESPACE}" \
+  sentinelops.io/admission-audit- \
+  --overwrite
+kubectl label namespace "${NAMESPACE}" \
+  sentinelops.io/admission-e2e-protected=true \
+  --overwrite \
+  --as "${PLATFORM_ADMIN_USER}"
+sleep 2
+
+set +e
+intruder_label_output="$(
+  kubectl label namespace "${NAMESPACE}" \
+    sentinelops.io/admission-e2e-protected- \
+    --as "${INTRUDER_USER}" 2>&1
+)"
+intruder_label_status=$?
+set -e
+[[ "${intruder_label_status}" -ne 0 ]]
+grep --quiet "enforcement label can only be changed" \
+  <<<"${intruder_label_output}"
+
 kubectl patch deployment admission-target \
   --namespace "${NAMESPACE}" \
   --type merge \
