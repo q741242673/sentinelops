@@ -272,6 +272,8 @@ class IncidentStore(Protocol):
         retry_after_seconds: float,
     ) -> AuditAnchor: ...
 
+    async def expedite_audit_anchor_retries(self) -> int: ...
+
     async def dead_letter_audit_anchor(
         self,
         claim: AuditAnchorClaim,

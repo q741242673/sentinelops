@@ -2040,6 +2040,29 @@ class SqlIncidentStore:
             )
         return await self._require_anchor(claim.anchor.anchor_id)
 
+    async def expedite_audit_anchor_retries(self) -> int:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            expedited = await connection.execute(
+                update(audit_anchor_outbox)
+                .where(
+                    audit_anchor_outbox.c.status == "pending",
+                    audit_anchor_outbox.c.next_attempt_at > now.isoformat(),
+                    audit_anchor_outbox.c.last_error_sha256.is_not(None),
+                )
+                .values(
+                    next_attempt_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            count = int(expedited.rowcount or 0)
+            if count:
+                await self._bump_anchor_inventory_epoch(
+                    connection,
+                    now=now,
+                )
+            return count
+
     async def dead_letter_audit_anchor(
         self,
         claim: AuditAnchorClaim,

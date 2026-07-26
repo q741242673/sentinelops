@@ -361,6 +361,42 @@ async def test_retryable_delivery_failure_keeps_only_error_hash(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_successful_reconciliation_can_expedite_retryable_anchor(
+    tmp_path,
+) -> None:
+    store = await _store(tmp_path)
+    await store.save(_record(), expected_version=None, graph_state=None)
+    first = await store.claim_audit_anchor(
+        owner_id="publisher-a",
+        ttl_seconds=60,
+    )
+    assert first is not None
+    await store.retry_audit_anchor(
+        first,
+        error="inventory_transport_error",
+        retry_after_seconds=300,
+    )
+
+    assert (
+        await store.claim_audit_anchor(
+            owner_id="publisher-b",
+            ttl_seconds=60,
+        )
+        is None
+    )
+    assert await store.expedite_audit_anchor_retries() == 1
+    retried = await store.claim_audit_anchor(
+        owner_id="publisher-b",
+        ttl_seconds=60,
+    )
+    assert retried is not None
+    assert retried.anchor.anchor_id == first.anchor.anchor_id
+    assert retried.anchor.attempt_count == 2
+    assert await store.expedite_audit_anchor_retries() == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_publisher_health_pulse_continues_while_store_call_is_blocked() -> None:
     store = BlockingAnchorStore()
     pulses = 0
