@@ -70,6 +70,10 @@ flowchart TB
     CATALOG --> QUEUE["PostgreSQL Action Intent 队列"]
     QUEUE --> EXECUTOR["独立 Executor"]
     EXECUTOR --> WRITE["带版本条件的集群操作"]
+    AGENT --> PROPOSAL["不可变变更提案"]
+    PROPOSAL --> OUTBOX["PostgreSQL GitOps Outbox"]
+    OUTBOX --> PUBLISHER["独立 GitOps Publisher"]
+    PUBLISHER --> GATEWAY["公司 GitOps Gateway / 代码变更请求"]
     WRITE --> K8S
     K8S --> VERIFY["恢复检查"]
     PROM --> VERIFY
@@ -83,6 +87,7 @@ flowchart TB
 - **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
 - **独立 Executor**：单独进程领取 Action Intent，重新检查事故、审批、领取版本和取消状态后才调用 Kubernetes。只有这个进程需要集群写权限。
+- **独立 GitOps Publisher**：只领取已经过边界检查并保存到数据库的动态提案，再交给公司 GitOps Gateway 创建代码变更请求。API、Agent 和 Executor 都不持有代码仓库写权限。
 - **集群与监控环境**：本地使用 kind 运行微服务、Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector。
 
 ## 前端演示
@@ -267,7 +272,7 @@ Executor 并不负责解决所有 Kubernetes 故障。它只执行服务端 Acti
 
 Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同一份合同。动作没有注册、被禁用、目标不属于当前事故、参数被替换或快照字段不完整时，都会在调用 Kubernetes 之前停止。这样可以逐步增加修复覆盖面，但不会因为给模型开放任意 Shell 而失去安全边界。
 
-## 动态变更提案：复杂故障先给人看，不直接执行
+## 动态变更提案：复杂故障走 GitOps，不让模型直接改集群
 
 当标准 Action Plugin 无法处理故障，而且事故已经停止自动写入时，可以创建一个动态变更预览：
 
@@ -296,7 +301,27 @@ curl -X POST \
 
 当前只允许调整已有容器的 CPU/内存 request、limit，以及已有 readiness/liveness probe 的少量数字参数。接口不接受任意 YAML 路径、Shell、`kubectl`、镜像、环境变量、Secret、RBAC、特权容器和删除操作；资源值还有 CPU、内存及 request/limit 关系上限。事故仍在自动处理、目标 namespace 不一致、容器不存在、修改无变化或快照读取失败时都会拒绝。
 
-生产 OIDC 需要单独授予 `sentinelops.incident.propose`。该权限只能生成限时预览，不能批准或执行。下一阶段会把通过检查的预览持久化，并接到独立的 GitOps PR 流程；在这之前它不是可执行修复通道。
+确认预览后，向不带 `/preview` 的地址提交同一份请求：
+
+```bash
+curl -X POST \
+  http://localhost:8000/api/v1/incidents/INCIDENT_ID/change-proposals \
+  -H 'Content-Type: application/json' \
+  -d @proposal.json
+```
+
+服务端不会相信浏览器之前拿到的预览，而是重新读取 Deployment 并重新生成提案。提案正文、目标快照和 SHA-256 摘要会作为一份不可变记录，与 GitOps Outbox 和审计事件在同一个数据库事务中提交；重复提交同一份内容会返回同一个提案，不会创建两份代码变更。
+
+独立进程 `sentinelops gitops-publisher` 使用短租约领取 Outbox。只有这个进程能读取 GitOps Token，它把固定格式的 patch 发给公司 GitOps Gateway，并要求 Gateway 返回同时绑定 `proposal_id` 和 `proposal_digest` 的代码变更地址与 commit revision。网络失败会有上限地退避重试；格式错误、摘要不一致或过期提案进入失败状态，不能伪装成已发布。
+
+```dotenv
+SENTINELOPS_GITOPS_GATEWAY_URL=https://gitops-gateway.example/v1/proposals
+SENTINELOPS_GITOPS_BEARER_TOKEN_FILE=/var/run/secrets/sentinelops/gitops-token
+```
+
+Gateway 才负责使用 GitHub App、GitLab Project Token 或公司内部机器人创建分支和 PR/MR。SentinelOps API、Agent、Executor 都不需要仓库写凭据；GitOps 合并和实际部署仍由现有 CODEOWNERS、CI、策略检查和发布系统决定。这里实现的是可靠的提案提交通道，不是让大模型绕过评审直接应用 YAML。
+
+生产 OIDC 需要单独授予 `sentinelops.incident.propose`。该权限可以预览并提交受限提案，但不能批准标准修复、直接修改集群或合并代码变更。
 
 ## Kubernetes 生产部署基线
 
@@ -304,9 +329,9 @@ curl -X POST \
 
 这套清单会：
 
-- 在 `sentinelops-system` 运行两个 API、两个独立 Executor 和两个审计锚定 Publisher；
+- 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 GitOps Publisher 和两个审计锚定 Publisher；
 - 让 API 使用只读 ServiceAccount，让 Executor 只拥有 Deployment 修复权限；
-- 让锚定 Publisher 不挂载 Kubernetes Token，只访问数据库和外部审计服务；
+- 让 GitOps 与锚定 Publisher 都不挂载 Kubernetes Token，分别只访问数据库及自己的外部服务；
 - 使用单独的数据库迁移 Job，迁移进程拿不到 Kubernetes 凭据；
 - 把数据库地址、模型 Key、Webhook Token、审计 Key 和锚定 Token 作为只读 Secret 文件挂载；
 - 使用非 root 用户、只读根文件系统、默认 seccomp、资源限制和最小 Linux capabilities；
@@ -328,7 +353,7 @@ curl -X POST \
 kubectl apply -f deploy/production/base/prerequisites.yaml
 ```
 
-Secret 不在仓库中提供模板，避免占位密码被误部署。把下面六个值分别保存成只包含一行内容的本地文件，再创建 Secret：
+Secret 不在仓库中提供模板，避免占位密码被误部署。把下面七个值分别保存成只包含一行内容的本地文件，再创建 Secret：
 
 ```bash
 kubectl -n sentinelops-system create secret generic sentinelops-runtime \
@@ -336,6 +361,7 @@ kubectl -n sentinelops-system create secret generic sentinelops-runtime \
   --from-file=audit-hmac-key=./secrets/audit-hmac-key \
   --from-file=audit-anchor-token=./secrets/audit-anchor-token \
   --from-file=audit-anchor-reconcile-token=./secrets/audit-anchor-reconcile-token \
+  --from-file=gitops-token=./secrets/gitops-token \
   --from-file=webhook-bearer-token=./secrets/webhook-bearer-token \
   --from-file=model-api-key=./secrets/model-api-key
 ```
@@ -364,6 +390,7 @@ kubectl -n sentinelops-system wait \
 kubectl apply \
   -f deploy/production/base/api.yaml \
   -f deploy/production/base/executor.yaml \
+  -f deploy/production/base/gitops-publisher.yaml \
   -f deploy/production/base/anchor-publisher.yaml \
   -f deploy/production/base/availability.yaml \
   -f deploy/production/base/network-policy.yaml
@@ -469,7 +496,7 @@ sentinelops anchor-service
 
 参考服务会拒绝 sequence 倒退、跳号、分叉和错误 predecessor；完全相同的重试返回第一次保存的同一份 receipt 和签名。生产环境应把它替换为独立权限的 PostgreSQL 审计服务、SIEM 或 WORM/Object Lock 存储，SQLite 示例不能当成不可篡改设施。写入 Token 和只读对账 Token 应使用不同权限。
 
-`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次。
+`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次；`0009_gitops_proposal_outbox` 保存不可变动态提案及其独立发布队列。
 
 这里准确的说法是“篡改可检测，并可把已投递链头锚定到外部”，不是绝对不可篡改：
 
@@ -541,7 +568,7 @@ SENTINELOPS_EXECUTOR_RESULT_TIMEOUT_SECONDS=120
 ```
 
 数据库 deadline 同时限制连接池等待、SQL 执行和锁等待，避免后台 Worker
-因为一条没有上限的数据库调用长期卡住。Executor 和审计锚点 Publisher
+因为一条没有上限的数据库调用长期卡住。Executor、GitOps Publisher 和审计锚点 Publisher
 使用独立进程心跳；外部依赖异常时审计安全闸门仍会关闭，但 Kubernetes
 不会因为一次慢调用反复重启仍然存活的进程。
 
@@ -557,6 +584,12 @@ sentinelops serve
 
 ```bash
 sentinelops executor
+```
+
+需要把动态提案送入代码评审时，再在不持有 Kubernetes Token 的独立进程中启动：
+
+```bash
+sentinelops gitops-publisher
 ```
 
 事故快照、时间线事件、审批状态、Worker Lease 和 Action Intent 会写入数据库；等待人工审批的
@@ -1037,6 +1070,7 @@ OIDC，把 Anchor 放到独立权限域，并使用 HTTPS 和正式 Secret。这
 src/sentinelops/
 ├── actions.py      # 可执行修复动作的 Action Plugin 合同与注册表
 ├── change_proposals.py # 不可执行的动态变更预览、边界检查和 diff
+├── gitops.py       # 独立 GitOps Gateway 投递、回执绑定和重试
 ├── agent/          # Agent 执行流程、质量检查和风险策略
 ├── llm/            # 大模型接口和不同服务的适配代码
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图
@@ -1067,6 +1101,7 @@ tests/              # 单元测试和安全边界测试
 - PostgreSQL 事故快照、追加式事件、一次性审批和等待审批状态的重启恢复；
 - 带数据库 fencing generation 的 Worker Lease，以及写操作 Action Intent、审批自动过期和崩溃结果判定；
 - 独立 `sentinelops executor`、单独的 Executor generation，以及 Agent 只读/Executor 可写的 RBAC 示例；
+- 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；
 - 三段式 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
 - PostgreSQL 告警 fingerprint 生命周期、跨副本原子去重、乱序事件保护和崩溃后补调度；
 - 生产 Webhook 启动门禁、Bearer Token、原始请求体 HMAC、密钥轮换和请求大小边界；

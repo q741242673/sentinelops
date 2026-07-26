@@ -7,7 +7,7 @@ from alembic.config import Config
 
 from sentinelops.storage.base import IncidentStore
 
-HEAD_REVISIONS = ("0008_anchor_unlock_workflow",)
+HEAD_REVISIONS = ("0009_gitops_proposal_outbox",)
 
 
 class SchemaRevisionError(RuntimeError):

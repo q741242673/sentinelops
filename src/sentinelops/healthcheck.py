@@ -42,3 +42,9 @@ def anchor_main() -> None:
         worker_name="Audit Anchor Publisher",
     )
 
+
+def gitops_main() -> None:
+    _main(
+        environment_variable="SENTINELOPS_GITOPS_PUBLISHER_HEALTH_FILE",
+        worker_name="GitOps Publisher",
+    )

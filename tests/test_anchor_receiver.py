@@ -505,6 +505,55 @@ async def test_reconciliation_network_grace_expires_fail_closed(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_successful_inventory_reconciliation_wakes_delivery_backoff(
+    tmp_path,
+) -> None:
+    store = SqlIncidentStore(
+        f"sqlite+aiosqlite:///{tmp_path / 'reconcile-wakeup.db'}"
+    )
+    await store.setup()
+    record = IncidentRecord(
+        alert=Alert(
+            name="ReconcileWakeup",
+            namespace="sentinelops-tests",
+            service="orders",
+            severity="warning",
+            summary="wake retry backoff after signed inventory recovery",
+        )
+    )
+    await store.save(record, expected_version=None, graph_state=None)
+    first = await store.claim_audit_anchor(
+        owner_id="publisher-a",
+        ttl_seconds=60,
+    )
+    assert first is not None
+    await store.retry_audit_anchor(
+        first,
+        error="inventory_transport_error",
+        retry_after_seconds=300,
+    )
+
+    class EmptyInventory:
+        async def fetch_inventory(self):
+            return []
+
+    reconciler = AuditAnchorReconciler(
+        store,
+        EmptyInventory(),  # type: ignore[arg-type]
+        max_staleness_seconds=300,
+    )
+
+    assert await reconciler.reconcile_once() == "healthy"
+    retried = await store.claim_audit_anchor(
+        owner_id="publisher-b",
+        ttl_seconds=60,
+    )
+    assert retried is not None
+    assert retried.anchor.anchor_id == first.anchor.anchor_id
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_reconciler_reports_the_actual_sticky_gate_state(tmp_path) -> None:
     store = SqlIncidentStore(
         f"sqlite+aiosqlite:///{tmp_path / 'sticky-state.db'}"

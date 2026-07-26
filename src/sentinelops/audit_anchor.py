@@ -869,6 +869,11 @@ class AuditAnchorReconciler:
             ):
                 return await self._block("delivered_anchor_fork")
 
+        # A successful, signed inventory reconciliation is a strong recovery
+        # signal. Wake retryable deliveries that were deferred while the
+        # receiver was unavailable so an old exponential backoff cannot block
+        # the ordered stream after the remote service has recovered.
+        await self.store.expedite_audit_anchor_retries()
         updated = await self.store.set_audit_anchor_security_state(
             status="healthy",
             write_blocked=False,

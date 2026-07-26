@@ -36,3 +36,16 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: sentinelops-anchor-publisher
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sentinelops-gitops-publisher
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-gitops-publisher

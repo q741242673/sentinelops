@@ -1214,7 +1214,8 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                 and int(database_snapshot.get("hmac_audit_events", 0) or 0) == audit_events
             )
             checks["migration_head_applied"] = (
-                database_snapshot.get("schema_revision") == "0008_anchor_unlock_workflow"
+                database_snapshot.get("schema_revision")
+                == "0009_gitops_proposal_outbox"
             )
             checks["agent_resolved"] = incident_status == "resolved"
             checks["deployment_restored"] = (
