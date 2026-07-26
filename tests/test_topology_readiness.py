@@ -458,6 +458,7 @@ def test_committed_security_report_proves_identity_and_external_anchor() -> None
         == snapshot["audit_head_sequence"]
     )
     assert snapshot["anchor_outbox_undelivered"] == 0
+    assert snapshot.get("anchor_outbox_blockers", []) == []
     assert trial["security"]["operator_auth_mode"] == "oidc"
     assert trial["security"]["anchor_receiver_id"] == "kind-security-anchor"
     assert "api_key" not in raw.casefold()

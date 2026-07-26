@@ -305,6 +305,20 @@ SELECT json_build_object(
     WHERE incident_id = '{incident_id}'
       AND status <> 'delivered'
   ),
+  'anchor_outbox_blockers', COALESCE((
+    SELECT json_agg(json_build_object(
+      'sequence', sequence,
+      'status', status,
+      'attempt_count', attempt_count,
+      'claim_generation', claim_generation,
+      'next_attempt_at', next_attempt_at,
+      'claim_until', claim_until,
+      'last_error_sha256', last_error_sha256
+    ) ORDER BY sequence)
+    FROM sentinelops_audit_anchor_outbox
+    WHERE incident_id = '{incident_id}'
+      AND status <> 'delivered'
+  ), '[]'::json),
   'latest_anchor_receipt', (
     SELECT receipt FROM sentinelops_audit_anchor_outbox
     WHERE incident_id = '{incident_id}'
@@ -736,7 +750,16 @@ async def _wait_for_anchored_head(
         ):
             return latest
         await asyncio.sleep(0.25)
-    raise RuntimeError("audit anchor Publisher did not deliver the final local audit head")
+    blockers = latest.get("anchor_outbox_blockers")
+    blocker_summary = (
+        json.dumps(blockers, ensure_ascii=False, sort_keys=True)
+        if isinstance(blockers, list)
+        else "unavailable"
+    )
+    raise RuntimeError(
+        "audit anchor Publisher did not deliver the final local audit head; "
+        f"blockers={blocker_summary}"
+    )
 
 
 async def _external_anchor_receipt(
