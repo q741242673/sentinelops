@@ -1,0 +1,372 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: sentinelremediations.ops.sentinelops.io
+  labels:
+    app.kubernetes.io/name: sentinelremediation
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  group: ops.sentinelops.io
+  scope: Namespaced
+  names:
+    kind: SentinelRemediation
+    listKind: SentinelRemediationList
+    plural: sentinelremediations
+    singular: sentinelremediation
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Action
+          type: string
+          jsonPath: .spec.action.plugin
+        - name: Target
+          type: string
+          jsonPath: .spec.target.name
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Fence
+          type: integer
+          jsonPath: .spec.fence.generation
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          x-kubernetes-validations:
+            - rule: self.metadata.name == self.spec.actionId
+              message: metadata.name must equal the immutable Action Intent digest
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              description: Immutable, host-generated request for one registered remediation action.
+              x-kubernetes-map-type: atomic
+              required:
+                - actionId
+                - incidentId
+                - action
+                - target
+                - precondition
+                - authorization
+                - fence
+              x-kubernetes-validations:
+                - rule: self == oldSelf
+                  message: SentinelRemediation spec is immutable
+                - rule: self.action.parameters.name == self.target.name
+                  message: action parameters must identify the exact target Deployment
+                - rule: >-
+                    (self.action.plugin == 'rollback_deployment'
+                    && has(self.precondition.rollbackTarget)
+                    && self.precondition.rollbackTarget.revision == self.action.parameters.revision)
+                    || (self.action.plugin != 'rollback_deployment'
+                    && !has(self.precondition.rollbackTarget))
+                  message: rollback health proof must exist only for the requested rollback revision
+              properties:
+                actionId:
+                  type: string
+                  description: SHA-256 idempotency digest of the durable Action Intent.
+                  pattern: "^[a-f0-9]{64}$"
+                incidentId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                action:
+                  type: object
+                  required:
+                    - plugin
+                    - catalogDigest
+                    - parameters
+                  x-kubernetes-validations:
+                    - rule: >-
+                        (self.plugin == 'restart_deployment'
+                        && !has(self.parameters.revision)
+                        && !has(self.parameters.replicas))
+                        || (self.plugin == 'rollback_deployment'
+                        && has(self.parameters.revision)
+                        && !has(self.parameters.replicas))
+                        || (self.plugin == 'scale_deployment'
+                        && !has(self.parameters.revision)
+                        && has(self.parameters.replicas))
+                      message: parameters must match the registered Action Plugin
+                  properties:
+                    plugin:
+                      type: string
+                      enum:
+                        - restart_deployment
+                        - rollback_deployment
+                        - scale_deployment
+                    catalogDigest:
+                      type: string
+                      description: SHA-256 digest of the server-owned Action Plugin contract.
+                      pattern: "^[a-f0-9]{64}$"
+                    parameters:
+                      type: object
+                      required:
+                        - name
+                      properties:
+                        name:
+                          type: string
+                          minLength: 1
+                          maxLength: 253
+                          pattern: "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$"
+                        revision:
+                          type: integer
+                          minimum: 1
+                        replicas:
+                          type: integer
+                          minimum: 0
+                          maximum: 100
+                target:
+                  type: object
+                  required:
+                    - apiVersion
+                    - kind
+                    - namespace
+                    - name
+                    - uid
+                  properties:
+                    apiVersion:
+                      type: string
+                      enum:
+                        - apps/v1
+                    kind:
+                      type: string
+                      enum:
+                        - Deployment
+                    namespace:
+                      type: string
+                      minLength: 1
+                      maxLength: 63
+                      pattern: "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
+                    name:
+                      type: string
+                      minLength: 1
+                      maxLength: 253
+                      pattern: "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$"
+                    uid:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                precondition:
+                  type: object
+                  description: Snapshot that must still match immediately before execution.
+                  required:
+                    - snapshotDigest
+                    - resourceVersion
+                    - generation
+                    - desiredReplicas
+                    - paused
+                    - currentRevision
+                    - currentReplicaSetUid
+                    - currentTemplateHash
+                    - capturedAt
+                  properties:
+                    snapshotDigest:
+                      type: string
+                      pattern: "^[a-f0-9]{64}$"
+                    resourceVersion:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    generation:
+                      type: integer
+                      minimum: 1
+                    desiredReplicas:
+                      type: integer
+                      minimum: 0
+                      maximum: 100
+                    paused:
+                      type: boolean
+                    currentRevision:
+                      type: integer
+                      minimum: 1
+                    currentReplicaSetUid:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    currentTemplateHash:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    capturedAt:
+                      type: string
+                      format: date-time
+                    rollbackTarget:
+                      type: object
+                      required:
+                        - revision
+                        - replicaSetUid
+                        - healthProofDigest
+                      properties:
+                        revision:
+                          type: integer
+                          minimum: 1
+                        replicaSetUid:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
+                        healthProofDigest:
+                          type: string
+                          pattern: "^[a-f0-9]{64}$"
+                authorization:
+                  type: object
+                  required:
+                    - decision
+                    - policyDigest
+                  x-kubernetes-validations:
+                    - rule: >-
+                        self.decision != 'human_approval'
+                        || (has(self.approvalId)
+                        && has(self.approvalVersion)
+                        && has(self.approvalDigest))
+                      message: human approval must include its immutable identity and digest
+                    - rule: >-
+                        self.decision != 'risk_policy'
+                        || (!has(self.approvalId)
+                        && !has(self.approvalVersion)
+                        && !has(self.approvalDigest))
+                      message: automatic risk-policy decisions cannot carry approval fields
+                  properties:
+                    decision:
+                      type: string
+                      enum:
+                        - risk_policy
+                        - human_approval
+                    policyDigest:
+                      type: string
+                      pattern: "^[a-f0-9]{64}$"
+                    approvalId:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    approvalVersion:
+                      type: integer
+                      minimum: 1
+                    approvalDigest:
+                      type: string
+                      pattern: "^[a-f0-9]{64}$"
+                fence:
+                  type: object
+                  required:
+                    - generation
+                    - expiresAt
+                  properties:
+                    generation:
+                      type: integer
+                      minimum: 1
+                    expiresAt:
+                      type: string
+                      format: date-time
+            status:
+              type: object
+              x-kubernetes-validations:
+                - rule: >-
+                    !has(oldSelf.phase)
+                    || !(oldSelf.phase in ['Succeeded', 'Failed', 'Rejected', 'Stale', 'Cancelled'])
+                    || (has(self.phase) && self.phase == oldSelf.phase)
+                  message: terminal remediation phases cannot be changed
+                - rule: >-
+                    !has(oldSelf.observedGeneration)
+                    || !has(self.observedGeneration)
+                    || self.observedGeneration >= oldSelf.observedGeneration
+                  message: observedGeneration cannot move backwards
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - Claimed
+                    - Executing
+                    - Succeeded
+                    - Failed
+                    - Rejected
+                    - Stale
+                    - Unknown
+                    - Cancelled
+                observedGeneration:
+                  type: integer
+                  minimum: 1
+                controllerId:
+                  type: string
+                  minLength: 1
+                  maxLength: 253
+                attempt:
+                  type: integer
+                  minimum: 1
+                startedAt:
+                  type: string
+                  format: date-time
+                finishedAt:
+                  type: string
+                  format: date-time
+                reason:
+                  type: string
+                  maxLength: 1024
+                result:
+                  type: object
+                  properties:
+                    beforeResourceVersion:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    afterResourceVersion:
+                      type: string
+                      minLength: 1
+                      maxLength: 128
+                    observedActionId:
+                      type: string
+                      pattern: "^[a-f0-9]{64}$"
+                    outcomeDigest:
+                      type: string
+                      pattern: "^[a-f0-9]{64}$"
+                    message:
+                      type: string
+                      maxLength: 1024
+                conditions:
+                  type: array
+                  maxItems: 16
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys:
+                    - type
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - reason
+                      - message
+                      - lastTransitionTime
+                    properties:
+                      type:
+                        type: string
+                        minLength: 1
+                        maxLength: 64
+                      status:
+                        type: string
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                      reason:
+                        type: string
+                        minLength: 1
+                        maxLength: 128
+                      message:
+                        type: string
+                        maxLength: 1024
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
