@@ -25,6 +25,16 @@ rules:
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-remediation-submit
+  namespace: sentinelops-workloads
+rules:
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations"]
+    verbs: ["create", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sentinelops-api-readonly
@@ -51,3 +61,17 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: sentinelops-executor-write
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-remediation-submit
+  namespace: sentinelops-workloads
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-executor
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-remediation-submit

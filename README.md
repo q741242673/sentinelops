@@ -272,6 +272,28 @@ Executor 并不负责解决所有 Kubernetes 故障。它只执行服务端 Acti
 
 Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同一份合同。动作没有注册、被禁用、目标不属于当前事故、参数被替换或快照字段不完整时，都会在调用 Kubernetes 之前停止。这样可以逐步增加修复覆盖面，但不会因为给模型开放任意 Shell 而失去安全边界。
 
+## 集群内执行合同：SentinelRemediation
+
+`deploy/production/crds/sentinelremediations.yaml` 定义了下一阶段集群内 Controller 使用的 `SentinelRemediation` CRD。它不是一段让模型自由填写的 YAML，而是服务端从已经落库的 Action Intent 生成的一次性执行合同：
+
+- 资源名必须等于 Action Intent 的 SHA-256 幂等摘要；
+- `spec` 创建后不可修改，动作、目标、执行前快照、授权决定和 fence generation 会一起冻结；
+- 动作只能来自当前 Action Plugin 目录，参数必须匹配重启、回滚或扩缩容合同；
+- 目标固定到 Deployment 名称和 UID，前置快照固定到 resourceVersion、generation、当前 revision 和 ReplicaSet；
+- 人工审批必须携带审批身份、版本和摘要，自动策略决定不能伪装成人工审批；
+- Controller 只能通过独立的 `/status` 子资源写回执行阶段、前后 resourceVersion 和结果摘要；
+- 成功、失败、拒绝、过期和取消等终态不能被改写，observed generation 也不能倒退。
+
+当前版本先稳定 CRD 和只允许 Executor `create/get/list/watch` 的提交权限，现有 Executor 仍按原路径直接执行注册动作。后续 Controller 接入并通过崩溃恢复验收后，才会删除 Executor 对 Deployment 的写权限。这个过渡状态不会被描述成已经完成了外部 fencing。
+
+本地或生产集群需要先安装 CRD：
+
+```bash
+kubectl apply -f deploy/production/crds/sentinelremediations.yaml
+```
+
+`scripts/e2e-remediation-contract.sh` 会在真实 Kubernetes API Server 上验证：合法合同可以创建、`spec` 篡改会被拒绝、已经写入的终态不能反向修改。普通 YAML 解析无法覆盖这些 CEL 规则，所以这项检查也被接入了 kind E2E。
+
 ## 动态变更提案：复杂故障走 GitOps，不让模型直接改集群
 
 当标准 Action Plugin 无法处理故障，而且事故已经停止自动写入时，可以创建一个动态变更预览：
@@ -361,7 +383,7 @@ sentinelops gitops-publisher \
 这套清单会：
 
 - 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 GitOps Publisher 和两个审计锚定 Publisher；
-- 让 API 使用只读 ServiceAccount，让 Executor 只拥有 Deployment 修复权限；
+- 让 API 使用只读 ServiceAccount；过渡期 Executor 只拥有 Deployment 修复权限，以及创建和查看不可变 `SentinelRemediation` 的权限；
 - 让 GitOps 与锚定 Publisher 都不挂载 Kubernetes Token，分别只访问数据库及自己的外部服务；
 - 使用单独的数据库迁移 Job，迁移进程拿不到 Kubernetes 凭据；
 - 把数据库地址、模型 Key、Webhook Token、审计 Key 和锚定 Token 作为只读 Secret 文件挂载；
@@ -370,7 +392,13 @@ sentinelops gitops-publisher \
 - 使用 PDB 和节点拓扑分散，减少维护节点时同时中断所有副本的风险；
 - 默认拒绝访问 Executor，并只允许明确标记过的 namespace 访问 API 端口。
 
-先把下面这些示例值改成实际环境：
+先安装集群级 CRD：
+
+```bash
+kubectl apply -f deploy/production/crds/sentinelremediations.yaml
+```
+
+再把下面这些示例值改成实际环境：
 
 - `ghcr.io/your-org/sentinelops:0.1.0-rc.1`：替换为已经构建并最好固定到 digest 的镜像；
 - `sentinelops-workloads`：替换为被管理服务所在的 namespace；
@@ -1134,6 +1162,7 @@ tests/              # 单元测试和安全边界测试
 - 带数据库 fencing generation 的 Worker Lease，以及写操作 Action Intent、审批自动过期和崩溃结果判定；
 - 独立 `sentinelops executor`、单独的 Executor generation，以及 Agent 只读/Executor 可写的 RBAC 示例；
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；
+- `SentinelRemediation` v1alpha1 集群内执行合同、不可变 spec、独立 status、终态保护和 create-only Executor 提交权限；
 - 三段式 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
 - PostgreSQL 告警 fingerprint 生命周期、跨副本原子去重、乱序事件保护和崩溃后补调度；
 - 生产 Webhook 启动门禁、Bearer Token、原始请求体 HMAC、密钥轮换和请求大小边界；
@@ -1145,7 +1174,7 @@ tests/              # 单元测试和安全边界测试
 
 接入生产环境前还需要：
 
-- 如果需要自动重试 unknown 操作，引入 Kubernetes 准入控制器或集群内 Controller 做外部 fencing；
+- 实现 Kubernetes 集群内 Controller，把 Executor 从直接写 Deployment 切换为只提交 `SentinelRemediation`，并通过准入控制做外部 fencing；
 - 接入企业 Secret 管理和更细的 RBAC；
 - 为外部锚定增加限流和灾难恢复方案。
 
