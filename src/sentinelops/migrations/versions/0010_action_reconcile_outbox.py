@@ -1,6 +1,6 @@
 """Add the fenced Controller outcome reconciliation outbox.
 
-Revision ID: 0010_action_reconciliation_outbox
+Revision ID: 0010_action_reconcile_outbox
 Revises: 0009_gitops_proposal_outbox
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0010_action_reconciliation_outbox"
+revision = "0010_action_reconcile_outbox"
 down_revision = "0009_gitops_proposal_outbox"
 branch_labels = None
 depends_on = None

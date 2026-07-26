@@ -21,7 +21,7 @@
 升级与迁移：
 
 - 数据库必须先运行 Alembic migration，当前 schema head 为
-  `0010_action_reconciliation_outbox`；
+  `0010_action_reconcile_outbox`；
 - API、Executor、Migration Job 和 Anchor Publisher 必须使用同一镜像版本；
 - 生产部署应把清单里的示例镜像替换为 RC 镜像的不可变 digest；
 - 旧 SQLite 本地演示可以继续使用，但多副本生产模式必须使用 PostgreSQL。

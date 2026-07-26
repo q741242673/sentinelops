@@ -471,7 +471,7 @@ kubectl apply -f deploy/production/access/workload-rbac.yaml
 ```
 
 数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`。升级到包含
-`0010_action_reconciliation_outbox` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
+`0010_action_reconcile_outbox` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
 执行的 Action Intent；旧 Executor 不会写入新对账表，若让它和迁移并发运行会产生无法自动恢复的
 遗漏。PostgreSQL 迁移还会在回填和孤儿检查期间锁住 Action Intent 表，但这不能代替停止旧进程：
 
@@ -598,7 +598,7 @@ sentinelops anchor-service
 
 参考服务会拒绝 sequence 倒退、跳号、分叉和错误 predecessor；完全相同的重试返回第一次保存的同一份 receipt 和签名。生产环境应把它替换为独立权限的 PostgreSQL 审计服务、SIEM 或 WORM/Object Lock 存储，SQLite 示例不能当成不可篡改设施。写入 Token 和只读对账 Token 应使用不同权限。
 
-`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次；`0009_gitops_proposal_outbox` 保存不可变动态提案及其独立发布队列；`0010_action_reconciliation_outbox` 为跨过写入分界的操作保存带租约的 Controller 结果对账任务。
+`0005_audit_anchor_outbox` 会为已有事故的当前链头建立一个迁移检查点，而不是补造所有历史锚点；`0006_audit_anchor_security_gate` 增加持久化安全闸门；`0007_audit_anchor_observability` 为积压年龄查询增加组合索引；`0008_anchor_unlock_workflow` 保存双人解锁申请、追加式决策记录和审计清单代次；`0009_gitops_proposal_outbox` 保存不可变动态提案及其独立发布队列；`0010_action_reconcile_outbox` 为跨过写入分界的操作保存带租约的 Controller 结果对账任务。
 
 这里准确的说法是“篡改可检测，并可把已投递链头锚定到外部”，不是绝对不可篡改：
 
