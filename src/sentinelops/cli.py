@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import socket
@@ -27,6 +28,10 @@ from sentinelops.config import Settings, get_settings
 from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.executor import ExecutorWorker
 from sentinelops.gitops import GitOpsPublisher, HttpGitOpsSink
+from sentinelops.gitops_gateway import (
+    GitHubPullRequestClient,
+    create_gitops_gateway_app,
+)
 from sentinelops.healthcheck import check_heartbeat
 from sentinelops.lab_profiles import build_simulated_lab_agent
 from sentinelops.migration import require_current_schema, upgrade_database
@@ -93,7 +98,10 @@ async def run_live(approve: bool, service: str, trace_id: str, summary: str) -> 
 
 def initialize_database() -> None:
     settings = get_settings()
-    database_url = settings.resolved_database_url()
+    try:
+        database_url = settings.resolved_database_url()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not database_url:
         raise SystemExit("Set SENTINELOPS_DATABASE_URL before running db-init")
     upgrade_database(database_url)
@@ -169,13 +177,21 @@ async def run_executor() -> None:
         await store.close()
 
 
-async def run_gitops_publisher() -> None:
-    settings = get_settings()
+async def run_gitops_publisher(env_file: str | None = None) -> None:
+    settings = (
+        Settings(_env_file=env_file)
+        if env_file is not None
+        else get_settings()
+    )
     production = settings.environment.strip().casefold() in {
         "prod",
         "production",
     }
-    database_url = settings.resolved_database_url()
+    try:
+        database_url = settings.resolved_database_url()
+        bearer_token = settings.resolved_gitops_bearer_token()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not database_url:
         raise SystemExit(
             "Set SENTINELOPS_DATABASE_URL before running gitops-publisher"
@@ -184,7 +200,6 @@ async def run_gitops_publisher() -> None:
         raise SystemExit(
             "Set SENTINELOPS_GITOPS_GATEWAY_URL before running gitops-publisher"
         )
-    bearer_token = settings.resolved_gitops_bearer_token()
     if not bearer_token:
         raise SystemExit("Set a dedicated SENTINELOPS_GITOPS_BEARER_TOKEN")
     if production and len(bearer_token.encode()) < 32:
@@ -198,19 +213,23 @@ async def run_gitops_publisher() -> None:
         raise SystemExit(
             "GitOps claim TTL must exceed the HTTP timeout by more than 5 seconds"
         )
-    secrets_in_other_trust_domains = {
-        settings.resolved_audit_hmac_key(),
-        settings.resolved_audit_anchor_bearer_token(),
-        settings.resolved_webhook_bearer_token(),
-        settings.resolved_webhook_signing_secret(),
-    }
+    try:
+        audit_hmac_key = settings.resolved_audit_hmac_key()
+        secrets_in_other_trust_domains = {
+            audit_hmac_key,
+            settings.resolved_audit_anchor_bearer_token(),
+            settings.resolved_webhook_bearer_token(),
+            settings.resolved_webhook_signing_secret(),
+        }
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if bearer_token in secrets_in_other_trust_domains:
         raise SystemExit(
             "GitOps Bearer Token must not reuse another SentinelOps secret"
         )
     store = SqlIncidentStore(
         database_url,
-        audit_hmac_key=settings.resolved_audit_hmac_key(),
+        audit_hmac_key=audit_hmac_key,
         audit_key_id=settings.audit_key_id,
         operation_timeout_seconds=settings.database_operation_timeout_seconds,
     )
@@ -244,6 +263,70 @@ async def run_gitops_publisher() -> None:
     finally:
         await sink.close()
         await store.close()
+
+
+def run_gitops_gateway(
+    host: str,
+    port: int,
+    env_file: str | None = None,
+) -> None:
+    settings = (
+        Settings(_env_file=env_file)
+        if env_file is not None
+        else get_settings()
+    )
+    production = settings.environment.strip().casefold() in {
+        "prod",
+        "production",
+    }
+    try:
+        inbound_token = settings.resolved_gitops_bearer_token()
+        github_token = settings.resolved_gitops_github_token()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    if not inbound_token:
+        raise SystemExit(
+            "Set SENTINELOPS_GITOPS_BEARER_TOKEN for the Gateway"
+        )
+    if not github_token:
+        raise SystemExit(
+            "Set SENTINELOPS_GITOPS_GITHUB_TOKEN for the Gateway"
+        )
+    if not settings.gitops_github_repository:
+        raise SystemExit(
+            "Set SENTINELOPS_GITOPS_GITHUB_REPOSITORY=owner/repo"
+        )
+    if hmac.compare_digest(inbound_token, github_token):
+        raise SystemExit(
+            "Gateway inbound Token must not reuse the GitHub repository Token"
+        )
+    if production and (
+        len(inbound_token.encode()) < 32
+        or len(github_token.encode()) < 32
+    ):
+        raise SystemExit(
+            "Production Gateway Tokens must each contain at least 32 bytes"
+        )
+    try:
+        github = GitHubPullRequestClient(
+            api_url=settings.gitops_github_api_url,
+            repository=settings.gitops_github_repository,
+            base_branch=settings.gitops_github_base_branch,
+            proposal_path_prefix=settings.gitops_github_proposal_path,
+            token=github_token,
+            timeout_seconds=settings.gitops_github_timeout_seconds,
+            deadline_seconds=settings.gitops_github_deadline_seconds,
+        )
+        gateway = create_gitops_gateway_app(
+            github,
+            inbound_token=inbound_token,
+            production=production,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    uvicorn.run(gateway, host=host, port=port)
+
+
 async def run_anchor_publisher() -> None:
     settings = get_settings()
     production = settings.environment.strip().casefold() in {"prod", "production"}
@@ -533,10 +616,18 @@ def main() -> None:
         "anchor-publisher",
         help="Publish durable audit-chain anchors to an independent sink",
     )
-    subparsers.add_parser(
+    gitops_publisher = subparsers.add_parser(
         "gitops-publisher",
         help="Publish immutable proposals through the independent GitOps gateway",
     )
+    gitops_publisher.add_argument("--env-file")
+    gitops_gateway = subparsers.add_parser(
+        "gitops-gateway",
+        help="Run the reference GitHub Draft PR gateway",
+    )
+    gitops_gateway.add_argument("--host", default="127.0.0.1")
+    gitops_gateway.add_argument("--port", type=int, default=8020)
+    gitops_gateway.add_argument("--env-file")
     anchor_service = subparsers.add_parser(
         "anchor-service",
         help="Run the local reference audit-anchor receiver",
@@ -577,7 +668,9 @@ def main() -> None:
     elif args.command == "anchor-publisher":
         asyncio.run(run_anchor_publisher())
     elif args.command == "gitops-publisher":
-        asyncio.run(run_gitops_publisher())
+        asyncio.run(run_gitops_publisher(args.env_file))
+    elif args.command == "gitops-gateway":
+        run_gitops_gateway(args.host, args.port, args.env_file)
     elif args.command == "anchor-service":
         run_anchor_service(args.host, args.port)
     elif args.command == "executor-health":

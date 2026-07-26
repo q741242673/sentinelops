@@ -127,6 +127,14 @@ class Settings(BaseSettings):
     gitops_retry_base_seconds: float = Field(default=2, ge=0.5, le=60)
     gitops_retry_max_seconds: float = Field(default=300, ge=10, le=3600)
     gitops_publisher_health_file: str | None = None
+    gitops_github_api_url: str = "https://api.github.com"
+    gitops_github_repository: str | None = None
+    gitops_github_base_branch: str = "main"
+    gitops_github_proposal_path: str = "sentinelops/proposals"
+    gitops_github_token: SecretStr | None = None
+    gitops_github_token_file: str | None = None
+    gitops_github_timeout_seconds: float = Field(default=15, gt=0, le=120)
+    gitops_github_deadline_seconds: float = Field(default=45, gt=0, le=300)
     anchor_service_database_url: str | None = None
     anchor_service_database_url_file: str | None = None
     anchor_service_bearer_token: SecretStr | None = None
@@ -271,6 +279,13 @@ class Settings(BaseSettings):
             self.gitops_bearer_token,
             self.gitops_bearer_token_file,
             setting_name="SENTINELOPS_GITOPS_BEARER_TOKEN",
+        )
+
+    def resolved_gitops_github_token(self) -> str | None:
+        return _secret_value(
+            self.gitops_github_token,
+            self.gitops_github_token_file,
+            setting_name="SENTINELOPS_GITOPS_GITHUB_TOKEN",
         )
 
     def resolved_anchor_service_database_url(self) -> str | None:
