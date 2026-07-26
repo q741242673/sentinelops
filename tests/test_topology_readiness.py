@@ -316,6 +316,18 @@ def test_security_manifests_separate_identity_and_anchor_trust_domains() -> None
         publisher_env["SENTINELOPS_AUDIT_ANCHOR_TRUSTED_RECEIVER_ID"]["value"]
         == "kind-security-anchor"
     )
+    retry_base = float(
+        publisher_env[
+            "SENTINELOPS_AUDIT_ANCHOR_RETRY_BASE_SECONDS"
+        ]["value"]
+    )
+    retry_max = float(
+        publisher_env[
+            "SENTINELOPS_AUDIT_ANCHOR_RETRY_MAX_SECONDS"
+        ]["value"]
+    )
+    assert 0 < retry_base <= retry_max
+    assert retry_max < 120
     assert "secretKeyRef" in publisher_env["SENTINELOPS_AUDIT_ANCHOR_BEARER_TOKEN"]["valueFrom"]
 
 
