@@ -78,6 +78,7 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
         runtime["SENTINELOPS_DATABASE_OPERATION_TIMEOUT_SECONDS"]
     ) <= 120
     assert runtime["SENTINELOPS_EXECUTOR_MODE"] == "external"
+    assert runtime["SENTINELOPS_EXECUTOR_BACKEND"] == "controller"
     assert runtime["SENTINELOPS_DATABASE_URL_FILE"].startswith("/var/run/secrets/")
     assert runtime["SENTINELOPS_AUDIT_HMAC_KEY_FILE"].startswith(
         "/var/run/secrets/"
@@ -272,11 +273,11 @@ def test_migration_job_is_bounded_and_has_no_cluster_credentials() -> None:
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
 
 
-def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
+def test_rbac_keeps_api_readonly_and_controller_as_only_workload_writer() -> None:
     api_role = _resource("Role", "sentinelops-api-readonly", "sentinelops-workloads")
-    executor_role = _resource(
+    submit_role = _resource(
         "Role",
-        "sentinelops-executor-write",
+        "sentinelops-remediation-submit",
         "sentinelops-workloads",
     )
     controller_role = _resource(
@@ -292,22 +293,15 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
     assert api_verbs <= {"get", "list", "watch"}
     assert "secrets" not in api_resources
 
-    executor_resources = {
+    submit_resources = {
         resource
-        for rule in executor_role["rules"]
+        for rule in submit_role["rules"]
         for resource in rule["resources"]
     }
-    assert executor_resources <= {
-        "deployments",
-        "deployments/status",
-        "deployments/scale",
-        "replicasets",
-    }
-    assert "secrets" not in executor_resources
-    assert any(
-        {"patch", "update"} <= set(rule["verbs"])
-        for rule in executor_role["rules"]
-        if "deployments" in rule["resources"]
+    assert submit_resources == {"sentinelremediations"}
+    assert all(
+        set(rule["verbs"]) <= {"create", "get", "list", "watch"}
+        for rule in submit_role["rules"]
     )
     controller_resources = {
         resource
@@ -340,9 +334,9 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         "sentinelops-api-readonly",
         "sentinelops-workloads",
     )
-    executor_binding = _resource(
+    submit_binding = _resource(
         "RoleBinding",
-        "sentinelops-executor-write",
+        "sentinelops-remediation-submit",
         "sentinelops-workloads",
     )
     controller_binding = _resource(
@@ -355,7 +349,7 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         "name": "sentinelops-api",
         "namespace": "sentinelops-system",
     }
-    assert executor_binding["subjects"][0] == {
+    assert submit_binding["subjects"][0] == {
         "kind": "ServiceAccount",
         "name": "sentinelops-executor",
         "namespace": "sentinelops-system",
@@ -375,7 +369,12 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
             "apiGroups": ["coordination.k8s.io"],
             "resources": ["leases"],
             "verbs": ["get", "list", "watch", "create", "update", "patch"],
-        }
+        },
+        {
+            "apiGroups": [""],
+            "resources": ["events"],
+            "verbs": ["create", "patch"],
+        },
     ]
     bound_service_accounts = {
         subject["name"]

@@ -304,9 +304,10 @@ async def test_production_startup_rejects_old_revision_without_modifying_it(
     settings = Settings(
         environment="production",
         database_url=database_url,
-        database_auto_create=False,
-        executor_mode="external",
-        alertmanager_source_id="migration-production-test",
+            database_auto_create=False,
+            executor_mode="external",
+            executor_backend="controller",
+            alertmanager_source_id="migration-production-test",
         alertmanager_webhook_auth_mode="bearer",
         alertmanager_webhook_bearer_token=(
             "migration-production-test-token-0001"

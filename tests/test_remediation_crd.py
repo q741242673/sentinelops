@@ -160,6 +160,9 @@ def test_status_preserves_terminal_results_and_never_rewinds_generation() -> Non
         status["properties"]["conditions"]["x-kubernetes-list-map-keys"]
         == ["type"]
     )
+    condition = status["properties"]["conditions"]["items"]
+    assert "observedGeneration" in condition["required"]
+    assert condition["properties"]["observedGeneration"]["minimum"] == 0
 
 
 def test_executor_can_submit_and_observe_but_not_mutate_remediation_specs() -> None:

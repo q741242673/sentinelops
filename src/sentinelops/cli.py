@@ -35,6 +35,7 @@ from sentinelops.gitops_gateway import (
 from sentinelops.healthcheck import check_heartbeat
 from sentinelops.lab_profiles import build_simulated_lab_agent
 from sentinelops.migration import require_current_schema, upgrade_database
+from sentinelops.remediation_controller import KubernetesRemediationGateway
 from sentinelops.runtime import build_agent
 from sentinelops.storage import SqlIncidentStore
 from sentinelops.tools import build_tool_registry
@@ -130,8 +131,9 @@ async def run_executor() -> None:
     if not database_url:
         raise SystemExit("Set SENTINELOPS_DATABASE_URL before running executor")
     audit_hmac_key = settings.resolved_audit_hmac_key()
+    production = settings.environment.strip().casefold() in {"prod", "production"}
     if (
-        settings.environment.strip().casefold() in {"prod", "production"}
+        production
         and (
             not audit_hmac_key
             or len(audit_hmac_key.encode()) < 32
@@ -141,6 +143,14 @@ async def run_executor() -> None:
         raise SystemExit(
             "Production Executor requires a dedicated audit HMAC key and key ID"
         )
+    if production and settings.executor_backend != "controller":
+        raise SystemExit(
+            "Production Executor must submit SentinelRemediation through the Controller"
+        )
+    if settings.executor_backend == "controller" and settings.tool_backend != "kubernetes":
+        raise SystemExit(
+            "Controller Executor backend requires SENTINELOPS_TOOL_BACKEND=kubernetes"
+        )
     store = SqlIncidentStore(
         database_url,
         audit_hmac_key=audit_hmac_key,
@@ -148,10 +158,24 @@ async def run_executor() -> None:
         operation_timeout_seconds=settings.database_operation_timeout_seconds,
     )
     owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
+    remediation_gateway = (
+        KubernetesRemediationGateway(
+            settings.kubernetes_namespace,
+            poll_interval_seconds=settings.executor_poll_interval_seconds,
+            result_timeout_seconds=settings.executor_result_timeout_seconds,
+        )
+        if settings.executor_backend == "controller"
+        else None
+    )
     worker = ExecutorWorker(
         store,
-        build_tool_registry(settings, allow_guarded_writes=True),
+        (
+            build_tool_registry(settings, allow_guarded_writes=True)
+            if remediation_gateway is None
+            else None
+        ),
         owner_id=owner_id,
+        remediation_gateway=remediation_gateway,
         claim_ttl_seconds=settings.executor_claim_ttl_seconds,
         poll_interval_seconds=settings.executor_poll_interval_seconds,
         health_callback=(

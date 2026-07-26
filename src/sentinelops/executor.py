@@ -11,6 +11,7 @@ from sentinelops.agent.execution import (
     ActionOutcomeUnknown,
 )
 from sentinelops.domain import RemediationAction, ToolResult
+from sentinelops.remediation_controller import RemediationGateway
 from sentinelops.storage.base import (
     ActionIntentConflictError,
     IncidentStore,
@@ -122,14 +123,15 @@ class QueuedActionExecutor(ActionExecutor):
 
 
 class ExecutorWorker:
-    """Independent worker that is the sole owner of Kubernetes write credentials."""
+    """Independent worker that submits the only Controller execution contract."""
 
     def __init__(
         self,
         store: IncidentStore,
-        tools: ToolRegistry,
+        tools: ToolRegistry | None,
         *,
         owner_id: str,
+        remediation_gateway: RemediationGateway | None = None,
         claim_ttl_seconds: float = 60,
         poll_interval_seconds: float = 0.5,
         health_callback: Callable[[], None] | None = None,
@@ -137,6 +139,9 @@ class ExecutorWorker:
     ) -> None:
         self.store = store
         self.tools = tools
+        self.remediation_gateway = remediation_gateway
+        if self.tools is None and self.remediation_gateway is None:
+            raise ValueError("Executor requires a direct tool registry or Controller gateway")
         self.owner_id = owner_id
         self.claim_ttl_seconds = claim_ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
@@ -163,11 +168,15 @@ class ExecutorWorker:
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
             dispatched = await self.store.mark_action_dispatched(claim)
-            result = await self.tools.call_guarded(
-                dispatched.action.tool_name,
-                dispatched.action.arguments,
-                dispatched.precondition,
-            )
+            if self.remediation_gateway is not None:
+                result = await self.remediation_gateway.execute(dispatched)
+            else:
+                assert self.tools is not None
+                result = await self.tools.call_guarded(
+                    dispatched.action.tool_name,
+                    dispatched.action.arguments,
+                    dispatched.precondition,
+                )
         except BaseException as exc:
             with suppress(Exception):
                 await self.store.mark_action_unknown(

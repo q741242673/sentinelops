@@ -1,6 +1,7 @@
 package remediation
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -76,6 +77,48 @@ func CatalogDigest(name string) (string, bool) {
 	return digestJSON(contract), true
 }
 
+func AuthorizationPolicyDigest(
+	actionPlugin string,
+	decision string,
+	catalogDigest string,
+) string {
+	return digestJSON(map[string]string{
+		"actionPlugin":  actionPlugin,
+		"catalogDigest": catalogDigest,
+		"decision":      decision,
+		"version":       "v1",
+	})
+}
+
+func HumanApprovalDigest(
+	actionID string,
+	approvalID string,
+	approvalVersion int64,
+	policyDigest string,
+) string {
+	return digestJSON(map[string]any{
+		"actionId":        actionID,
+		"approvalId":      approvalID,
+		"approvalVersion": approvalVersion,
+		"decision":        "human_approval",
+		"policyDigest":    policyDigest,
+	})
+}
+
+func RollbackHealthProofDigest(
+	subject string,
+	version string,
+	verifiedAt string,
+	verifier string,
+) string {
+	return digestJSON(map[string]string{
+		"subject":    subject,
+		"verifiedAt": verifiedAt,
+		"verifier":   verifier,
+		"version":    version,
+	})
+}
+
 func SnapshotDigest(precondition opsv1alpha1.ExecutionPrecondition) string {
 	payload := map[string]any{
 		"capturedAt":           precondition.CapturedAt,
@@ -98,6 +141,20 @@ func digestJSON(value any) string {
 	if err != nil {
 		panic(fmt.Sprintf("canonical contract value is not serializable: %v", err))
 	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var canonical any
+	if err := decoder.Decode(&canonical); err != nil {
+		panic(fmt.Sprintf("canonical contract value cannot be decoded: %v", err))
+	}
+	payload, err = json.Marshal(canonical)
+	if err != nil {
+		panic(fmt.Sprintf("canonical contract value cannot be encoded: %v", err))
+	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:])
+}
+
+func prefixedDigestJSON(value any) string {
+	return "sha256:" + digestJSON(value)
 }

@@ -69,7 +69,9 @@ flowchart TB
     PREFLIGHT --> CATALOG["Action Plugin 合同"]
     CATALOG --> QUEUE["PostgreSQL Action Intent 队列"]
     QUEUE --> EXECUTOR["独立 Executor"]
-    EXECUTOR --> WRITE["带版本条件的集群操作"]
+    EXECUTOR --> CONTRACT["不可变 SentinelRemediation"]
+    CONTRACT --> CONTROLLER["Go Remediation Controller"]
+    CONTROLLER --> WRITE["带版本条件的集群操作"]
     AGENT --> PROPOSAL["不可变变更提案"]
     PROPOSAL --> OUTBOX["PostgreSQL GitOps Outbox"]
     OUTBOX --> PUBLISHER["独立 GitOps Publisher"]
@@ -81,12 +83,13 @@ flowchart TB
     VERIFY --> API
 ```
 
-项目分成四块：
+项目分成七块：
 
 - **前端控制台**：用 React 和 TypeScript 编写，实时显示 Agent 正在做什么、查了哪些证据、为什么暂停、最终是否恢复。
 - **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
-- **独立 Executor**：单独进程领取 Action Intent，重新检查事故、审批、领取版本和取消状态后才调用 Kubernetes。只有这个进程需要集群写权限。
+- **独立 Executor**：单独进程领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
+- **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间。
 - **独立 GitOps Publisher**：只领取已经过边界检查并保存到数据库的动态提案，再交给公司 GitOps Gateway 创建代码变更请求。API、Agent 和 Executor 都不持有代码仓库写权限。
 - **集群与监控环境**：本地使用 kind 运行微服务、Prometheus、Alertmanager、Loki、Tempo 和 OpenTelemetry Collector。
 
@@ -124,10 +127,10 @@ SentinelOps 给大模型加了几条硬限制：
 7. **模型不能修改无关服务**：重启、回滚和扩缩容默认只能作用于当前告警对应的服务和 namespace，参数不合法时会在调用 Kubernetes 前被拒绝；回滚目标还必须带有服务端认可的明确健康标记。
 8. **旧审批不能覆盖新状态**：批准后会重新查询 rollout history。新版本发布、副本配置变化，或同一版本的副本数、就绪副本数发生变化，都会让旧审批失效；通过后写操作仍会再次检查当前状态，并携带最新 resourceVersion，防止校验与写入之间的并发覆盖。
 9. **MCP 只能读取证据**：MCP Server 不公开重启、回滚和扩缩容。所有集群写入必须经过 IncidentAgent 的规划、审批和执行前复查；普通工具入口也会拒绝写操作。
-10. **写操作有持久身份**：配置数据库后，每个集群写操作会先保存不可变的 Action Intent。独立 Executor 只能领取一次；已经跨过写入分界但没有可信结果的操作会标记为未知并停止，不能在重启后自动重放。
+10. **写操作有持久身份**：配置数据库后，每个集群写操作会先保存不可变的 Action Intent，再生成同名的 `SentinelRemediation`。Controller 会把 action ID 写进 Deployment；Controller 在 API Server 接受写入后崩溃，也能依据这个标记恢复结果而不重复执行。
 11. **重复告警只能创建一个事故**：多 API 副本通过 PostgreSQL 原子认领 `Alertmanager 来源 + fingerprint + startsAt`。resolved 后保留记录，迟到的旧 firing 不会重新开事故，上一轮 resolved 也不能关闭下一轮告警。
 12. **外部请求不能伪造告警**：生产环境拒绝匿名 Webhook。原生 Alertmanager 可以使用 Bearer Token；经过签名网关时也可以使用覆盖时间戳和原始请求体的 HMAC-SHA256。重复认证头、过期签名、压缩体和超大请求都会在解析告警前被拒绝。
-13. **Executor 只执行注册动作**：写工具还必须有对应的 Action Plugin。插件由服务端声明参数、最低风险、目标字段、审批方式、恢复验证方式和执行快照要求；只在提示词里出现、临时加入工具白名单或缺少完整快照的动作都不能进入 Kubernetes 后端。
+13. **Controller 只执行注册动作**：写操作必须有对应的 Action Plugin。插件由服务端声明参数、最低风险、目标字段、审批方式、恢复验证方式和执行快照要求；只在提示词里出现、临时加入工具白名单或缺少完整快照的动作都不能进入 Kubernetes 后端。
 
 ## 快速运行：不需要 Kubernetes 和模型 Key
 
@@ -242,9 +245,10 @@ SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 kubectl apply -f deploy/rbac.yaml
 ```
 
-示例会创建两个身份：`sentinelops-agent` 只能读取 Pod、事件、日志和发布历史；
-`sentinelops-executor` 才能滚动重启、回滚和扩缩容。请在接入生产集群前继续按实际 namespace
-和操作类型缩小权限。模型本身拿不到任意 Shell、Secret、写权限或特权 Pod 权限。
+这份 `deploy/rbac.yaml` 是本地开发时的直连示例：`sentinelops-agent` 只能读取 Pod、事件、日志和发布历史，
+`sentinelops-executor` 可以调用受保护的写工具。生产清单使用更严格的 Controller 模式：Executor 只能创建和
+查看不可变的 `SentinelRemediation`，只有 Go Controller 能修改 Deployment。模型本身拿不到任意 Shell、
+Secret、写权限或特权 Pod 权限。
 
 故障注入和环境重置接口默认不开放。`make console` 和 `make console-live` 会在本地脚本里显式开启；如果单独启动后端，只有隔离的演示环境才应设置 `SENTINELOPS_DEMO_ENABLED=true`，并且 Kubernetes namespace 必须与 `SENTINELOPS_DEMO_NAMESPACE` 完全一致。生产环境即使误开开关也会拒绝这些写入。
 
@@ -259,7 +263,7 @@ MCP 不直接公开滚动重启、回滚或扩缩容。修复动作必须进入 
 
 ## Action Plugin：如何安全增加一种修复能力
 
-Executor 并不负责解决所有 Kubernetes 故障。它只执行服务端 Action Catalog 中已经注册的动作。目前注册了滚动重启、精确版本回滚和限定范围扩缩容。
+SentinelOps 并不试图自动解决所有 Kubernetes 故障。生产 Controller 只执行服务端 Action Catalog 中已经注册的动作。目前注册了滚动重启、精确版本回滚和限定范围扩缩容。
 
 一个新动作不能只加一段提示词或一个 Kubernetes 调用。它必须同时声明：
 
@@ -290,7 +294,18 @@ Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同�
 
 这里的 `Succeeded` 只表示“注册动作已被 Kubernetes 接受且结果可追踪”，不表示业务已经恢复。是否恢复仍由 Agent 的严格验证阶段根据主动请求、Prometheus、Alertmanager 和新 Trace 决定。
 
-当前处于安全迁移期：Controller 已实现并有独立 RBAC、部署清单和崩溃恢复测试，但现有 Executor 还保留原来的 Deployment 写权限。下一步会让 Executor 只创建 `SentinelRemediation`，确认真实 kind 闭环后再删除它的直接写权限。仓库不会把这个过渡状态包装成已经完成外部 fencing。
+生产执行链已经切换完成：Executor 领取数据库中的 Action Intent 后，只创建和读取
+`SentinelRemediation`；它的生产 RBAC 不再包含 Deployment 写权限。Go Controller 是生产清单中唯一的
+Deployment 写入者。仓库中的本地开发模式仍可选择直连后端，方便离线测试，但生产启动门禁会拒绝这种配置。
+
+真实 kind 闭环可以单独运行：
+
+```bash
+scripts/e2e-remediation-controller.sh
+```
+
+这项测试会使用真正的 Executor ServiceAccount 短期 Token 创建合同，等待 Controller 修改真实 Deployment，
+再由 API Server 证明该身份可以创建合同，但不能修改合同或 Deployment。
 
 本地或生产集群需要先安装 CRD：
 
@@ -397,7 +412,7 @@ sentinelops gitops-publisher \
 这套清单会：
 
 - 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 Remediation Controller、两个 GitOps Publisher 和两个审计锚定 Publisher；
-- 让 API 使用只读 ServiceAccount；过渡期 Executor 只拥有 Deployment 修复权限，以及创建和查看不可变 `SentinelRemediation` 的权限；
+- 让 API 使用只读 ServiceAccount；Executor 只能创建和查看不可变的 `SentinelRemediation`，没有 Deployment 写权限；
 - 让 Controller 只读取 `SentinelRemediation` 和 ReplicaSet，只更新目标 Deployment 与执行状态，并使用 namespace 内 Lease 选主；
 - 让 GitOps 与锚定 Publisher 都不挂载 Kubernetes Token，分别只访问数据库及自己的外部服务；
 - 使用单独的数据库迁移 Job，迁移进程拿不到 Kubernetes 凭据；
@@ -640,6 +655,7 @@ SENTINELOPS_WORKER_LEASE_TTL_SECONDS=60
 SENTINELOPS_WORKER_LEASE_HEARTBEAT_SECONDS=15
 SENTINELOPS_WORKER_RECONCILIATION_INTERVAL_SECONDS=5
 SENTINELOPS_EXECUTOR_MODE=external
+SENTINELOPS_EXECUTOR_BACKEND=controller
 SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS=60
 SENTINELOPS_EXECUTOR_RESULT_TIMEOUT_SECONDS=120
 ```
@@ -679,10 +695,13 @@ sentinelops gitops-publisher
 结果未知时禁止自动重试；结果已经保存时保留真实 ToolResult，并升级人工完成恢复验证。
 
 Agent Lease 只负责授权入队；Executor 有自己的 owner、generation、attempt ID 和领取期限。
-领取后、写入前崩溃可以安全地重新排队；一旦进入 `dispatched`，系统就把它视为“外部写可能发生”，
-超时后只能标记 `unknown`，不会交给另一个 Executor 自动重放。这个设计提供的是持久化的
-at-most-once 自动派发，不是 exactly-once。Kubernetes API 本身仍不识别数据库 generation；
-如果未来要自动重试 unknown 操作，还需要准入控制器或集群内 Controller 配合，不能只依靠数据库。
+领取后、合同创建前崩溃可以安全地重新排队；一旦进入 `dispatched`，数据库仍按“外部写可能发生”
+处理，超时后标记 `unknown`，不会交给另一个 Executor 猜测重放。合同创建后，Controller 会按 action ID
+幂等执行；Controller 自身在写入后崩溃，可以从 Deployment 标记恢复执行结果。当前版本不会自动把一个
+已经标成 `unknown` 的数据库任务重新判成成功，这种情况仍交给人工核对。
+
+这套 fence 能阻止 SentinelOps 自己的旧审批和重复动作，但不能阻止集群中其他高权限账号绕过 Controller
+直接修改 Deployment。要把边界扩展到所有写入者，还需要接入准入策略，并统一约束发布系统和人工权限。
 `production` 环境没有配置数据库时，服务会拒绝启动。
 
 `db-init` 使用带版本号的数据库迁移，不是简单执行 `create_all`。生产部署时应把它作为 API 和
@@ -1153,7 +1172,8 @@ src/sentinelops/
 ├── llm/            # 大模型接口和不同服务的适配代码
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图
 ├── tools/          # Kubernetes、监控和 Git 查询工具
-├── executor.py     # 独立写任务领取、fencing 和结果回写
+├── executor.py     # 独立 Action Intent 领取、合同提交和结果回写
+├── remediation_controller.py # 生成不可变 CR、提交并等待 Go Controller 结果
 ├── api.py          # FastAPI 接口、告警接收和实时进度
 ├── demo.py         # 本地演示的故障注入与环境恢复
 ├── lab_profiles.py # 三种演示流程的服务端绑定规则
@@ -1179,9 +1199,10 @@ tests/              # 单元测试和安全边界测试
 - kind、监控系统和 GitHub Actions 端到端测试；
 - PostgreSQL 事故快照、追加式事件、一次性审批和等待审批状态的重启恢复；
 - 带数据库 fencing generation 的 Worker Lease，以及写操作 Action Intent、审批自动过期和崩溃结果判定；
-- 独立 `sentinelops executor`、单独的 Executor generation，以及 Agent 只读/Executor 可写的 RBAC 示例；
+- 独立 `sentinelops executor`、单独的 Executor generation，以及生产环境 create-only 的修复合同提交权限；
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；
 - `SentinelRemediation` v1alpha1 集群内执行合同、不可变 spec、独立 status、终态保护和 create-only Executor 提交权限；
+- Python Executor 到 Go Remediation Controller 的真实执行链：跨语言合同摘要、create-only CR、真实 ServiceAccount Token、最小 RBAC 和 kind Deployment 写入验证；
 - Go Remediation Controller：三种注册动作、fresh preflight、resourceVersion CAS、动作标记幂等恢复、Lease 选主、最小 RBAC 和双副本部署；
 - 三段式 Alembic 数据库迁移、生产启动版本门禁，以及 SQLite/PostgreSQL 数据保留回归测试；
 - PostgreSQL 告警 fingerprint 生命周期、跨副本原子去重、乱序事件保护和崩溃后补调度；
@@ -1194,7 +1215,8 @@ tests/              # 单元测试和安全边界测试
 
 接入生产环境前还需要：
 
-- 把 Executor 从直接写 Deployment 切换为只提交 `SentinelRemediation`，完成真实 kind 崩溃恢复闭环后删除旧写权限，并通过准入控制做外部 fencing；
+- 使用准入策略约束 Controller 之外的 Deployment 写入者，把 fence 从 SentinelOps 内部边界扩展到整个集群；
+- 增加 `unknown` Action Intent 与 Controller 终态的自动对账，在 Executor 失联后恢复数据库结果；
 - 接入企业 Secret 管理和更细的 RBAC；
 - 为外部锚定增加限流和灾难恢复方案。
 

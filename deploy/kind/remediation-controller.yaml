@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sentinelops-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-system
+automountServiceAccountToken: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sentinelops-executor
+  namespace: sentinelops-system
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-remediation-controller-leader-election
+  namespace: sentinelops-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-remediation-controller-leader-election
+  namespace: sentinelops-system
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-remediation-controller
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-remediation-controller-leader-election
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-demo
+rules:
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-demo
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-remediation-controller
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-remediation-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sentinelops-remediation-submit
+  namespace: sentinelops-demo
+rules:
+  - apiGroups: ["ops.sentinelops.io"]
+    resources: ["sentinelremediations"]
+    verbs: ["create", "get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sentinelops-remediation-submit
+  namespace: sentinelops-demo
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-executor
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sentinelops-remediation-submit
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-remediation-controller
+  namespace: sentinelops-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-remediation-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-remediation-controller
+    spec:
+      serviceAccountName: sentinelops-remediation-controller
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: sentinelops-remediation-controller:e2e
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect=true
+            - --leader-election-namespace=sentinelops-system
+            - --max-concurrent-reconciles=2
+            - --metrics-bind-address=0
+            - --health-probe-bind-address=:8081
+          env:
+            - name: SENTINELOPS_KUBERNETES_NAMESPACE
+              value: sentinelops-demo
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            periodSeconds: 2
+            timeoutSeconds: 2
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
