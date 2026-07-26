@@ -1,0 +1,15 @@
+apiVersion: ops.sentinelops.io/v1alpha1
+kind: SentinelAdmissionGuard
+metadata:
+  name: sentinelops-workload-write-fence
+  namespace: sentinelops-workloads
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  allowedDeploymentWriters:
+    - system:serviceaccount:sentinelops-system:sentinelops-remediation-controller
+  allowedRemediationCreators:
+    - system:serviceaccount:sentinelops-system:sentinelops-executor
+  allowedRemediationStatusWriters:
+    - system:serviceaccount:sentinelops-system:sentinelops-remediation-controller
+  allowedRemediationDeleters: []

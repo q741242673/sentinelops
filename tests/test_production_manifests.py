@@ -18,7 +18,11 @@ def _resources() -> list[dict[str, Any]]:
     return resources
 
 
-def _resource(kind: str, name: str, namespace: str) -> dict[str, Any]:
+def _resource(
+    kind: str,
+    name: str,
+    namespace: str | None,
+) -> dict[str, Any]:
     matches = [
         item
         for item in _resources()
@@ -385,6 +389,102 @@ def test_rbac_keeps_api_readonly_and_controller_as_only_workload_writer() -> Non
     }
     assert "sentinelops-anchor-publisher" not in bound_service_accounts
     assert "sentinelops-gitops-publisher" not in bound_service_accounts
+
+
+def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None:
+    guard_crd = _resource(
+        "CustomResourceDefinition",
+        "sentineladmissionguards.ops.sentinelops.io",
+        None,
+    )
+    guard_schema = guard_crd["spec"]["versions"][0]["schema"][
+        "openAPIV3Schema"
+    ]["properties"]["spec"]
+    assert set(guard_schema["required"]) == {
+        "allowedDeploymentWriters",
+        "allowedRemediationCreators",
+        "allowedRemediationStatusWriters",
+        "allowedRemediationDeleters",
+    }
+    for field in guard_schema["properties"].values():
+        assert field["type"] == "array"
+        assert field["x-kubernetes-list-type"] == "set"
+        assert field["maxItems"] <= 32
+
+    guard = _resource(
+        "SentinelAdmissionGuard",
+        "sentinelops-workload-write-fence",
+        "sentinelops-workloads",
+    )["spec"]
+    controller = (
+        "system:serviceaccount:sentinelops-system:"
+        "sentinelops-remediation-controller"
+    )
+    executor = (
+        "system:serviceaccount:sentinelops-system:sentinelops-executor"
+    )
+    assert guard == {
+        "allowedDeploymentWriters": [controller],
+        "allowedRemediationCreators": [executor],
+        "allowedRemediationStatusWriters": [controller],
+        "allowedRemediationDeleters": [],
+    }
+
+    policy = _resource(
+        "ValidatingAdmissionPolicy",
+        "sentinelops-workload-write-fence",
+        None,
+    )["spec"]
+    assert policy["failurePolicy"] == "Fail"
+    assert policy["paramKind"] == {
+        "apiVersion": "ops.sentinelops.io/v1alpha1",
+        "kind": "SentinelAdmissionGuard",
+    }
+    matched_resources = {
+        resource
+        for rule in policy["matchConstraints"]["resourceRules"]
+        for resource in rule["resources"]
+    }
+    assert matched_resources == {
+        "deployments",
+        "sentinelremediations",
+        "sentinelremediations/status",
+    }
+    validation_text = " ".join(
+        validation["expression"] for validation in policy["validations"]
+    )
+    assert "allowedDeploymentWriters" in validation_text
+    assert "allowedRemediationCreators" in validation_text
+    assert "allowedRemediationStatusWriters" in validation_text
+    assert "allowedRemediationDeleters" in validation_text
+    assert "request.subResource == 'status'" in validation_text
+    assert "request.userInfo.username" in validation_text
+    assert all(
+        validation["reason"] == "Forbidden"
+        for validation in policy["validations"]
+    )
+    assert policy["auditAnnotations"][0]["key"] == "admission-guard"
+
+    binding = _resource(
+        "ValidatingAdmissionPolicyBinding",
+        "sentinelops-workload-write-fence",
+        None,
+    )["spec"]
+    assert set(binding["validationActions"]) == {"Deny", "Audit"}
+    assert binding["paramRef"] == {
+        "name": "sentinelops-workload-write-fence",
+        "namespace": "sentinelops-workloads",
+        "parameterNotFoundAction": "Deny",
+    }
+    assert binding["matchResources"]["namespaceSelector"][
+        "matchLabels"
+    ] == {"sentinelops.io/admission-protected": "true"}
+    assert all(
+        "sentineladmissionguards" not in rule.get("resources", [])
+        for resource in _resources()
+        if resource["kind"] == "Role"
+        for rule in resource["rules"]
+    )
 
 
 def test_pdb_service_and_ingress_policy_match_deployments() -> None:
