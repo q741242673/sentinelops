@@ -50,6 +50,17 @@ KUBERNETES_READ_TOOL_SPECS = [
         risk=RiskLevel.READ_ONLY,
     ),
     ToolSpec(
+        name="get_deployment_snapshot",
+        description="Read a sanitized deployment snapshot for a bounded change preview",
+        risk=RiskLevel.READ_ONLY,
+        input_schema={
+            "type": "object",
+            "properties": {"name": KUBERNETES_NAME_SCHEMA},
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    ),
+    ToolSpec(
         name="get_service_metrics",
         description="Read service or workload health metrics",
         risk=RiskLevel.READ_ONLY,

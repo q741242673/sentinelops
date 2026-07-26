@@ -19,6 +19,13 @@ from pydantic import BaseModel, Field, ValidationError
 
 from sentinelops import __version__
 from sentinelops.agent import IncidentAgent
+from sentinelops.change_proposals import (
+    ChangeProposalPreview,
+    ChangeProposalRejected,
+    ChangeProposalRequest,
+    DeploymentSnapshot,
+    build_change_proposal,
+)
 from sentinelops.config import Settings, get_settings
 from sentinelops.demo import (
     build_demo_alert,
@@ -43,6 +50,7 @@ from sentinelops.operator_auth import (
     DEMO_OPERATE_PERMISSION,
     INCIDENT_APPROVE_PERMISSION,
     INCIDENT_CREATE_PERMISSION,
+    INCIDENT_PROPOSE_PERMISSION,
     INCIDENT_VIEW_PERMISSION,
     UNLOCK_APPROVE_PERMISSION,
     UNLOCK_REQUEST_PERMISSION,
@@ -122,6 +130,8 @@ async def _operator_auth_middleware(
             permission = UNLOCK_REQUEST_PERMISSION
         else:
             permission = INCIDENT_VIEW_PERMISSION
+    elif request.method == "POST" and path.endswith("/change-proposals/preview"):
+        permission = INCIDENT_PROPOSE_PERMISSION
     elif path.endswith("/approval"):
         permission = INCIDENT_APPROVE_PERMISSION
     elif request.method == "POST" and path == "/api/v1/incidents":
@@ -2055,6 +2065,54 @@ async def get_incident(incident_id: str) -> IncidentRecord:
         return incident_records[incident_id]
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Incident not found") from exc
+
+
+@app.post(
+    "/api/v1/incidents/{incident_id}/change-proposals/preview",
+    response_model=ChangeProposalPreview,
+)
+async def preview_incident_change_proposal(
+    incident_id: str,
+    body: ChangeProposalRequest,
+) -> ChangeProposalPreview:
+    record = await get_incident(incident_id)
+    if record.status not in {IncidentStatus.ESCALATED, IncidentStatus.FAILED}:
+        raise HTTPException(
+            status_code=409,
+            detail="只有已停止自动写入的事故才能创建动态变更提案",
+        )
+    settings = get_settings()
+    if record.alert.namespace != settings.kubernetes_namespace:
+        raise HTTPException(
+            status_code=409,
+            detail="事故 namespace 与当前控制面绑定的 namespace 不一致",
+        )
+    tools = _agent_tool_registry(settings)
+    snapshot_result = await tools.call(
+        "get_deployment_snapshot",
+        {"name": record.alert.service},
+    )
+    if not snapshot_result.success:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "无法读取目标 Deployment 的安全快照："
+                f"{snapshot_result.error or 'unknown error'}"
+            ),
+        )
+    try:
+        snapshot = DeploymentSnapshot.model_validate(snapshot_result.content)
+        return build_change_proposal(
+            incident_id=incident_id,
+            alert=record.alert,
+            request=body,
+            snapshot=snapshot,
+        )
+    except (ChangeProposalRejected, ValidationError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"动态变更提案未通过安全检查：{exc}",
+        ) from exc
 
 
 @app.get("/api/v1/incidents/{incident_id}/events")

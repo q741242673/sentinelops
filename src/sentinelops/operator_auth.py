@@ -21,6 +21,7 @@ MAX_JWKS_KEYS = 100
 UNLOCK_REQUEST_PERMISSION = "sentinelops.anchor-unlock.request"
 UNLOCK_APPROVE_PERMISSION = "sentinelops.anchor-unlock.approve"
 INCIDENT_APPROVE_PERMISSION = "sentinelops.incident.approve"
+INCIDENT_PROPOSE_PERMISSION = "sentinelops.incident.propose"
 INCIDENT_VIEW_PERMISSION = "sentinelops.incident.view"
 INCIDENT_CREATE_PERMISSION = "sentinelops.incident.create"
 DEMO_OPERATE_PERMISSION = "sentinelops.demo.operate"

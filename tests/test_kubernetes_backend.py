@@ -122,6 +122,69 @@ def test_owned_replica_sets_are_filtered_and_sorted() -> None:
     assert KubernetesBackend._replica_set_summary(result[0])["health_status"] == "unknown"
 
 
+def test_deployment_snapshot_exposes_only_bounded_change_fields() -> None:
+    backend = object.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.apps = Mock()
+    backend.apps.read_namespaced_deployment.return_value = ns(
+        metadata=ns(uid="deployment-uid", resource_version="42", generation=7),
+        spec=ns(
+            template=ns(
+                spec=ns(
+                    containers=[
+                        ns(
+                            name="order-service",
+                            image="order-service@sha256:abc",
+                            resources=ns(
+                                requests={"cpu": "100m", "memory": "128Mi"},
+                                limits={"cpu": "500m", "memory": "512Mi"},
+                            ),
+                            readiness_probe=ns(
+                                initial_delay_seconds=2,
+                                period_seconds=5,
+                                timeout_seconds=1,
+                                failure_threshold=3,
+                            ),
+                            liveness_probe=None,
+                            env=[
+                                ns(
+                                    name="DATABASE_URL",
+                                    value="must-not-leak",
+                                )
+                            ],
+                            security_context=ns(privileged=True),
+                        )
+                    ]
+                )
+            )
+        ),
+    )
+
+    result = backend._tool_get_deployment_snapshot({"name": "order-service"})
+
+    assert result["uid"] == "deployment-uid"
+    assert result["resource_version"] == "42"
+    assert result["containers"] == [
+        {
+            "name": "order-service",
+            "image": "order-service@sha256:abc",
+            "resources": {
+                "requests": {"cpu": "100m", "memory": "128Mi"},
+                "limits": {"cpu": "500m", "memory": "512Mi"},
+            },
+            "readinessProbe": {
+                "initialDelaySeconds": 2,
+                "periodSeconds": 5,
+                "timeoutSeconds": 1,
+                "failureThreshold": 3,
+            },
+            "livenessProbe": None,
+        }
+    ]
+    assert "env" not in result["containers"][0]
+    assert "securityContext" not in result["containers"][0]
+
+
 def test_replica_set_health_requires_a_valid_revision_bound_proof() -> None:
     healthy = KubernetesBackend._replica_set_summary(replica_set(1, healthy_proof=True))
     inherited = KubernetesBackend._replica_set_summary(

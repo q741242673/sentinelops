@@ -143,6 +143,38 @@ class SimulatedKubernetesBackend:
             "revisions": revisions,
         }
 
+    def _tool_get_deployment_snapshot(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        name = arguments.get("name", "order-service")
+        return {
+            "name": name,
+            "namespace": "sentinelops-demo",
+            "uid": f"sim-deployment-{name}",
+            "resource_version": f"sim-rv-{self.current_revision}",
+            "generation": self.current_revision,
+            "containers": [
+                {
+                    "name": name,
+                    "image": f"{name}:1.0.0",
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits": {"cpu": "500m", "memory": "512Mi"},
+                    },
+                    "readinessProbe": {
+                        "initialDelaySeconds": 2,
+                        "periodSeconds": 5,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 3,
+                    },
+                    "livenessProbe": {
+                        "initialDelaySeconds": 5,
+                        "periodSeconds": 10,
+                        "timeoutSeconds": 1,
+                        "failureThreshold": 3,
+                    },
+                }
+            ],
+        }
+
     def _tool_get_service_metrics(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.resolved:
             error_rate, p95_ms, pool = 0.002, 180, 0.42
