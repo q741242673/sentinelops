@@ -140,6 +140,8 @@ async def test_empty_database_upgrades_to_single_head_and_is_idempotent(tmp_path
         "sentinelops_audit_heads",
         "sentinelops_incident_events",
         "sentinelops_incidents",
+        "sentinelops_change_proposals",
+        "sentinelops_gitops_proposal_outbox",
         "sentinelops_worker_leases",
     }
     await reopened.close()

@@ -26,6 +26,7 @@ from sentinelops.audit_anchor import (
 from sentinelops.config import Settings, get_settings
 from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.executor import ExecutorWorker
+from sentinelops.gitops import GitOpsPublisher, HttpGitOpsSink
 from sentinelops.healthcheck import check_heartbeat
 from sentinelops.lab_profiles import build_simulated_lab_agent
 from sentinelops.migration import require_current_schema, upgrade_database
@@ -168,6 +169,81 @@ async def run_executor() -> None:
         await store.close()
 
 
+async def run_gitops_publisher() -> None:
+    settings = get_settings()
+    production = settings.environment.strip().casefold() in {
+        "prod",
+        "production",
+    }
+    database_url = settings.resolved_database_url()
+    if not database_url:
+        raise SystemExit(
+            "Set SENTINELOPS_DATABASE_URL before running gitops-publisher"
+        )
+    if not settings.gitops_gateway_url:
+        raise SystemExit(
+            "Set SENTINELOPS_GITOPS_GATEWAY_URL before running gitops-publisher"
+        )
+    bearer_token = settings.resolved_gitops_bearer_token()
+    if not bearer_token:
+        raise SystemExit("Set a dedicated SENTINELOPS_GITOPS_BEARER_TOKEN")
+    if production and len(bearer_token.encode()) < 32:
+        raise SystemExit(
+            "Production GitOps Publisher requires a token of at least 32 bytes"
+        )
+    if (
+        settings.gitops_claim_ttl_seconds
+        <= settings.gitops_timeout_seconds + 5
+    ):
+        raise SystemExit(
+            "GitOps claim TTL must exceed the HTTP timeout by more than 5 seconds"
+        )
+    secrets_in_other_trust_domains = {
+        settings.resolved_audit_hmac_key(),
+        settings.resolved_audit_anchor_bearer_token(),
+        settings.resolved_webhook_bearer_token(),
+        settings.resolved_webhook_signing_secret(),
+    }
+    if bearer_token in secrets_in_other_trust_domains:
+        raise SystemExit(
+            "GitOps Bearer Token must not reuse another SentinelOps secret"
+        )
+    store = SqlIncidentStore(
+        database_url,
+        audit_hmac_key=settings.resolved_audit_hmac_key(),
+        audit_key_id=settings.audit_key_id,
+        operation_timeout_seconds=settings.database_operation_timeout_seconds,
+    )
+    sink = HttpGitOpsSink(
+        settings.gitops_gateway_url,
+        bearer_token=bearer_token,
+        timeout_seconds=settings.gitops_timeout_seconds,
+        require_https=production,
+    )
+    publisher = GitOpsPublisher(
+        store,
+        sink,
+        owner_id=f"{socket.gethostname()}:{os.getpid()}:{uuid4()}",
+        claim_ttl_seconds=settings.gitops_claim_ttl_seconds,
+        poll_interval_seconds=settings.gitops_poll_interval_seconds,
+        retry_base_seconds=settings.gitops_retry_base_seconds,
+        retry_max_seconds=settings.gitops_retry_max_seconds,
+        health_callback=(
+            lambda: (
+                _touch_executor_health_file(
+                    settings.gitops_publisher_health_file or ""
+                )
+                if settings.gitops_publisher_health_file
+                else None
+            )
+        ),
+    )
+    try:
+        await require_current_schema(store)
+        await publisher.run_forever()
+    finally:
+        await sink.close()
+        await store.close()
 async def run_anchor_publisher() -> None:
     settings = get_settings()
     production = settings.environment.strip().casefold() in {"prod", "production"}
@@ -457,6 +533,10 @@ def main() -> None:
         "anchor-publisher",
         help="Publish durable audit-chain anchors to an independent sink",
     )
+    subparsers.add_parser(
+        "gitops-publisher",
+        help="Publish immutable proposals through the independent GitOps gateway",
+    )
     anchor_service = subparsers.add_parser(
         "anchor-service",
         help="Run the local reference audit-anchor receiver",
@@ -496,6 +576,8 @@ def main() -> None:
         asyncio.run(run_executor())
     elif args.command == "anchor-publisher":
         asyncio.run(run_anchor_publisher())
+    elif args.command == "gitops-publisher":
+        asyncio.run(run_gitops_publisher())
     elif args.command == "anchor-service":
         run_anchor_service(args.host, args.port)
     elif args.command == "executor-health":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -29,6 +30,7 @@ from sqlalchemy.engine import Connection, Engine, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from sentinelops.change_proposals import ChangeProposalPreview
 from sentinelops.domain import IncidentRecord, IncidentStatus, TimelineEvent
 from sentinelops.storage.anchor import (
     AUDIT_ANCHOR_SECURITY_STREAM_ID,
@@ -59,11 +61,14 @@ from sentinelops.storage.base import (
     ApprovalConflictError,
     AuditAnchorConflictError,
     AuditAnchorUnlockConflictError,
+    ChangeProposalConflictError,
     ExecutorClaim,
+    GitOpsProposalClaim,
     LeaseConflictError,
     LeaseToken,
     StoreConflictError,
     StoredActionIntent,
+    StoredChangeProposal,
     StoredIncident,
 )
 
@@ -296,6 +301,44 @@ action_intents = Table(
     Column("claimed_at", String(40), nullable=True),
     Column("dispatched_at", String(40), nullable=True),
     Column("finished_at", String(40), nullable=True),
+)
+
+change_proposals = Table(
+    "sentinelops_change_proposals",
+    metadata,
+    Column("proposal_id", String(64), primary_key=True),
+    Column("proposal_digest", String(64), nullable=False, unique=True),
+    Column("incident_id", String(64), nullable=False, index=True),
+    Column("status", String(24), nullable=False, index=True),
+    Column("version", BigInteger, nullable=False),
+    Column("preview", JSON, nullable=False),
+    Column("submitted_by", String(200), nullable=False),
+    Column("submitted_assurance", String(24), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+    Column("published_at", String(40), nullable=True),
+    Column("receipt", JSON, nullable=True),
+)
+
+gitops_proposal_outbox = Table(
+    "sentinelops_gitops_proposal_outbox",
+    metadata,
+    Column("proposal_id", String(64), primary_key=True),
+    Column("status", String(24), nullable=False, index=True),
+    Column("attempt_count", Integer, nullable=False),
+    Column("next_attempt_at", String(40), nullable=False),
+    Column("claimed_by", String(200), nullable=True),
+    Column("claim_generation", BigInteger, nullable=False),
+    Column("attempt_id", String(64), nullable=True, unique=True),
+    Column("claim_until", String(40), nullable=True),
+    Column("last_error_sha256", String(64), nullable=True),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+Index(
+    "ix_sentinelops_gitops_outbox_status_next_attempt",
+    gitops_proposal_outbox.c.status,
+    gitops_proposal_outbox.c.next_attempt_at,
 )
 
 alert_bindings = Table(
@@ -2034,6 +2077,502 @@ class SqlIncidentStore:
             )
         return await self._require_anchor(claim.anchor.anchor_id)
 
+    async def submit_change_proposal(
+        self,
+        preview: ChangeProposalPreview,
+        *,
+        actor_id: str,
+        actor_assurance: str,
+    ) -> StoredChangeProposal:
+        payload = preview.model_dump(mode="json")
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            if preview.expires_at <= now:
+                raise ChangeProposalConflictError("动态变更提案预览已过期")
+            incident_status = (
+                await connection.execute(
+                    select(incidents.c.status).where(
+                        incidents.c.id == preview.incident_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if incident_status not in {
+                IncidentStatus.ESCALATED.value,
+                IncidentStatus.FAILED.value,
+            }:
+                raise ChangeProposalConflictError(
+                    "事故不再处于允许提交动态变更提案的状态"
+                )
+            existing = (
+                (
+                    await connection.execute(
+                        select(change_proposals).where(
+                            change_proposals.c.proposal_id
+                            == preview.proposal_id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is not None:
+                if (
+                    existing["proposal_digest"] != preview.proposal_digest
+                    or existing["preview"] != payload
+                ):
+                    raise ChangeProposalConflictError(
+                        "proposal_id 已绑定到不同的不可变提案"
+                    )
+                return self._stored_change_proposal(existing)
+            timestamp = now.isoformat()
+            try:
+                await connection.execute(
+                    insert(change_proposals).values(
+                        proposal_id=preview.proposal_id,
+                        proposal_digest=preview.proposal_digest,
+                        incident_id=preview.incident_id,
+                        status="submitted",
+                        version=1,
+                        preview=payload,
+                        submitted_by=actor_id,
+                        submitted_assurance=actor_assurance,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                        published_at=None,
+                        receipt=None,
+                    )
+                )
+                await connection.execute(
+                    insert(gitops_proposal_outbox).values(
+                        proposal_id=preview.proposal_id,
+                        status="pending",
+                        attempt_count=0,
+                        next_attempt_at=timestamp,
+                        claimed_by=None,
+                        claim_generation=0,
+                        attempt_id=None,
+                        claim_until=None,
+                        last_error_sha256=None,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                    )
+                )
+            except IntegrityError as exc:
+                raise ChangeProposalConflictError(
+                    "相同提案已被并发提交"
+                ) from exc
+            await self._append_audit_event(
+                connection,
+                incident_id=preview.incident_id,
+                operation_id=f"change-proposal:submitted:{preview.proposal_id}",
+                event_type="change_proposal.submitted",
+                source_component="api",
+                actor_type="human",
+                actor_id=actor_id,
+                actor_assurance=actor_assurance,
+                subject_type="change_proposal",
+                subject_id=preview.proposal_id,
+                payload={
+                    "proposal_id": preview.proposal_id,
+                    "proposal_digest": preview.proposal_digest,
+                    "execution_channel": preview.execution_channel,
+                    "target": preview.target,
+                    "expires_at": preview.expires_at.isoformat(),
+                },
+            )
+        stored = await self.get_change_proposal(preview.proposal_id)
+        assert stored is not None
+        return stored
+
+    async def get_change_proposal(
+        self,
+        proposal_id: str,
+    ) -> StoredChangeProposal | None:
+        async with self.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        select(change_proposals).where(
+                            change_proposals.c.proposal_id == proposal_id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return self._stored_change_proposal(row) if row is not None else None
+
+    async def claim_gitops_proposal(
+        self,
+        *,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> GitOpsProposalClaim | None:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            expired_ids = list(
+                (
+                    await connection.execute(
+                        select(gitops_proposal_outbox.c.proposal_id).where(
+                            gitops_proposal_outbox.c.status == "claimed",
+                            gitops_proposal_outbox.c.claim_until
+                            <= now.isoformat(),
+                        )
+                    )
+                ).scalars()
+            )
+            if expired_ids:
+                await connection.execute(
+                    update(gitops_proposal_outbox)
+                    .where(
+                        gitops_proposal_outbox.c.proposal_id.in_(expired_ids)
+                    )
+                    .values(
+                        status="pending",
+                        claimed_by=None,
+                        attempt_id=None,
+                        claim_until=None,
+                        updated_at=now.isoformat(),
+                    )
+                )
+                await connection.execute(
+                    update(change_proposals)
+                    .where(change_proposals.c.proposal_id.in_(expired_ids))
+                    .values(
+                        status="submitted",
+                        version=change_proposals.c.version + 1,
+                        updated_at=now.isoformat(),
+                    )
+                )
+            row = (
+                (
+                    await connection.execute(
+                    select(change_proposals, gitops_proposal_outbox)
+                    .join(
+                        change_proposals,
+                        change_proposals.c.proposal_id
+                        == gitops_proposal_outbox.c.proposal_id,
+                    )
+                    .join(
+                        incidents,
+                        incidents.c.id == change_proposals.c.incident_id,
+                    )
+                    .add_columns(
+                        incidents.c.status.label("incident_status")
+                    )
+                        .where(
+                            gitops_proposal_outbox.c.status == "pending",
+                            gitops_proposal_outbox.c.next_attempt_at
+                            <= now.isoformat(),
+                            change_proposals.c.status == "submitted",
+                        )
+                        .order_by(
+                            gitops_proposal_outbox.c.next_attempt_at.asc(),
+                            gitops_proposal_outbox.c.created_at.asc(),
+                        )
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            proposal = self._stored_change_proposal(row)
+            invalid_reason = (
+                "proposal_expired"
+                if proposal.preview.expires_at <= now
+                else (
+                    "incident_no_longer_escalated"
+                    if row["incident_status"]
+                    not in {
+                        IncidentStatus.ESCALATED.value,
+                        IncidentStatus.FAILED.value,
+                    }
+                    else None
+                )
+            )
+            if invalid_reason is not None:
+                await connection.execute(
+                    update(gitops_proposal_outbox)
+                    .where(
+                        gitops_proposal_outbox.c.proposal_id
+                        == proposal.preview.proposal_id
+                    )
+                    .values(
+                        status="dead_letter",
+                        last_error_sha256=canonical_payload_hash(
+                            invalid_reason
+                        ),
+                        updated_at=now.isoformat(),
+                    )
+                )
+                await connection.execute(
+                    update(change_proposals)
+                    .where(
+                        change_proposals.c.proposal_id
+                        == proposal.preview.proposal_id
+                    )
+                    .values(
+                        status="failed",
+                        version=change_proposals.c.version + 1,
+                        updated_at=now.isoformat(),
+                    )
+                )
+                await self._append_audit_event(
+                    connection,
+                    incident_id=proposal.preview.incident_id,
+                    operation_id=(
+                        f"change-proposal:invalidated:"
+                        f"{proposal.preview.proposal_id}"
+                    ),
+                    event_type="change_proposal.invalidated",
+                    source_component="gitops-publisher",
+                    actor_type="service",
+                    actor_id=owner_id,
+                    actor_assurance="internal",
+                    subject_type="change_proposal",
+                    subject_id=proposal.preview.proposal_id,
+                    payload={
+                        "proposal_id": proposal.preview.proposal_id,
+                        "proposal_digest": proposal.preview.proposal_digest,
+                        "reason": invalid_reason,
+                    },
+                )
+                return None
+            generation = int(row["claim_generation"]) + 1
+            attempt_count = int(row["attempt_count"]) + 1
+            attempt_id = str(uuid4())
+            expires_at = now + timedelta(seconds=ttl_seconds)
+            claimed = await connection.execute(
+                update(gitops_proposal_outbox)
+                .where(
+                    gitops_proposal_outbox.c.proposal_id
+                    == proposal.preview.proposal_id,
+                    gitops_proposal_outbox.c.status == "pending",
+                )
+                .values(
+                    status="claimed",
+                    attempt_count=attempt_count,
+                    claimed_by=owner_id,
+                    claim_generation=generation,
+                    attempt_id=attempt_id,
+                    claim_until=expires_at.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if claimed.rowcount != 1:
+                raise ChangeProposalConflictError(
+                    "GitOps 提案已被其他 Publisher 领取"
+                )
+            await connection.execute(
+                update(change_proposals)
+                .where(
+                    change_proposals.c.proposal_id
+                    == proposal.preview.proposal_id,
+                    change_proposals.c.status == "submitted",
+                )
+                .values(
+                    status="publishing",
+                    version=change_proposals.c.version + 1,
+                    updated_at=now.isoformat(),
+                )
+            )
+            claimed_proposal = StoredChangeProposal(
+                **{
+                    **proposal.__dict__,
+                    "status": "publishing",
+                    "version": proposal.version + 1,
+                    "updated_at": now,
+                }
+            )
+            return GitOpsProposalClaim(
+                proposal=claimed_proposal,
+                owner_id=owner_id,
+                generation=generation,
+                attempt_id=attempt_id,
+                attempt_count=attempt_count,
+                expires_at=expires_at,
+            )
+
+    async def complete_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        receipt: dict[str, object],
+    ) -> StoredChangeProposal:
+        encoded_receipt = json.dumps(
+            receipt,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        if len(encoded_receipt) > 65_536:
+            raise ChangeProposalConflictError("GitOps receipt 超过 64 KiB")
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            completed = await self._fence_gitops_claim(
+                connection,
+                claim,
+                now=now,
+                outbox_values={
+                    "status": "delivered",
+                    "claimed_by": None,
+                    "attempt_id": None,
+                    "claim_until": None,
+                    "last_error_sha256": None,
+                    "updated_at": now.isoformat(),
+                },
+                proposal_values={
+                    "status": "published",
+                    "version": change_proposals.c.version + 1,
+                    "receipt": receipt,
+                    "published_at": now.isoformat(),
+                    "updated_at": now.isoformat(),
+                },
+            )
+            await self._append_audit_event(
+                connection,
+                incident_id=completed.preview.incident_id,
+                operation_id=(
+                    f"change-proposal:published:{completed.preview.proposal_id}"
+                ),
+                event_type="change_proposal.published",
+                source_component="gitops-publisher",
+                actor_type="service",
+                actor_id=claim.owner_id,
+                actor_assurance="internal",
+                subject_type="change_proposal",
+                subject_id=completed.preview.proposal_id,
+                payload={
+                    "proposal_id": completed.preview.proposal_id,
+                    "proposal_digest": completed.preview.proposal_digest,
+                    "receipt_sha256": canonical_payload_hash(receipt),
+                },
+            )
+        stored = await self.get_change_proposal(
+            claim.proposal.preview.proposal_id
+        )
+        assert stored is not None
+        return stored
+
+    async def retry_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        error: str,
+        retry_after_seconds: float,
+    ) -> StoredChangeProposal:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._fence_gitops_claim(
+                connection,
+                claim,
+                now=now,
+                outbox_values={
+                    "status": "pending",
+                    "next_attempt_at": (
+                        now + timedelta(seconds=max(0.1, retry_after_seconds))
+                    ).isoformat(),
+                    "claimed_by": None,
+                    "attempt_id": None,
+                    "claim_until": None,
+                    "last_error_sha256": canonical_payload_hash(error),
+                    "updated_at": now.isoformat(),
+                },
+                proposal_values={
+                    "status": "submitted",
+                    "version": change_proposals.c.version + 1,
+                    "updated_at": now.isoformat(),
+                },
+            )
+        stored = await self.get_change_proposal(
+            claim.proposal.preview.proposal_id
+        )
+        assert stored is not None
+        return stored
+
+    async def dead_letter_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        error: str,
+    ) -> StoredChangeProposal:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._fence_gitops_claim(
+                connection,
+                claim,
+                now=now,
+                outbox_values={
+                    "status": "dead_letter",
+                    "claimed_by": None,
+                    "attempt_id": None,
+                    "claim_until": None,
+                    "last_error_sha256": canonical_payload_hash(error),
+                    "updated_at": now.isoformat(),
+                },
+                proposal_values={
+                    "status": "failed",
+                    "version": change_proposals.c.version + 1,
+                    "updated_at": now.isoformat(),
+                },
+            )
+        stored = await self.get_change_proposal(
+            claim.proposal.preview.proposal_id
+        )
+        assert stored is not None
+        return stored
+
+    async def _fence_gitops_claim(
+        self,
+        connection: Any,
+        claim: GitOpsProposalClaim,
+        *,
+        now: datetime,
+        outbox_values: dict[str, object],
+        proposal_values: dict[str, object],
+    ) -> StoredChangeProposal:
+        proposal_id = claim.proposal.preview.proposal_id
+        updated = await connection.execute(
+            update(gitops_proposal_outbox)
+            .where(
+                gitops_proposal_outbox.c.proposal_id == proposal_id,
+                gitops_proposal_outbox.c.status == "claimed",
+                gitops_proposal_outbox.c.claimed_by == claim.owner_id,
+                gitops_proposal_outbox.c.claim_generation == claim.generation,
+                gitops_proposal_outbox.c.attempt_id == claim.attempt_id,
+                gitops_proposal_outbox.c.claim_until > now.isoformat(),
+            )
+            .values(**outbox_values)
+        )
+        if updated.rowcount != 1:
+            raise ChangeProposalConflictError(
+                "GitOps 提案领取已失效，拒绝覆盖发布状态"
+            )
+        proposal_updated = await connection.execute(
+            update(change_proposals)
+            .where(
+                change_proposals.c.proposal_id == proposal_id,
+                change_proposals.c.status == "publishing",
+            )
+            .values(**proposal_values)
+        )
+        if proposal_updated.rowcount != 1:
+            raise ChangeProposalConflictError("提案状态已被并发更新")
+        row = (
+            (
+                await connection.execute(
+                    select(change_proposals).where(
+                        change_proposals.c.proposal_id == proposal_id
+                    )
+                )
+            )
+            .mappings()
+            .one()
+        )
+        return self._stored_change_proposal(row)
     async def save(
         self,
         record: IncidentRecord,
@@ -4298,6 +4837,19 @@ class SqlIncidentStore:
             graph_state=row["graph_state"],
         )
 
+    @staticmethod
+    def _stored_change_proposal(row: Any) -> StoredChangeProposal:
+        return StoredChangeProposal(
+            preview=ChangeProposalPreview.model_validate(row["preview"]),
+            status=row["status"],
+            version=int(row["version"]),
+            submitted_by=row["submitted_by"],
+            submitted_assurance=row["submitted_assurance"],
+            created_at=_stored_time(row["created_at"]),
+            updated_at=_stored_time(row["updated_at"]),
+            published_at=_stored_time(row["published_at"]),
+            receipt=row["receipt"],
+        )
     async def _append_events(self, connection: Any, record: IncidentRecord) -> None:
         existing = int(
             (

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
+from sentinelops.change_proposals import ChangeProposalPreview
 from sentinelops.domain import IncidentRecord, RemediationAction, ToolResult
 from sentinelops.storage.anchor import (
     AuditAnchor,
@@ -39,6 +40,10 @@ class AuditAnchorConflictError(RuntimeError):
 
 class AuditAnchorUnlockConflictError(RuntimeError):
     """An audit-anchor unlock request is stale, invalid, or unsafe."""
+
+
+class ChangeProposalConflictError(RuntimeError):
+    """A change proposal or its GitOps delivery claim is stale or invalid."""
 
 
 @dataclass(frozen=True)
@@ -79,6 +84,12 @@ ActionIntentStatus = Literal[
 
 AlertFiringOutcome = Literal["accepted", "deduplicated", "stale"]
 AlertResolutionOutcome = Literal["resolved", "duplicate", "stale", "unknown"]
+ChangeProposalStatus = Literal[
+    "submitted",
+    "publishing",
+    "published",
+    "failed",
+]
 
 
 @dataclass(frozen=True)
@@ -115,6 +126,29 @@ class AlertResolution:
     incident_id: str | None
     generation: int
     incident: StoredIncident | None
+
+
+@dataclass(frozen=True)
+class StoredChangeProposal:
+    preview: ChangeProposalPreview
+    status: ChangeProposalStatus
+    version: int
+    submitted_by: str
+    submitted_assurance: str
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None
+    receipt: dict[str, object] | None
+
+
+@dataclass(frozen=True)
+class GitOpsProposalClaim:
+    proposal: StoredChangeProposal
+    owner_id: str
+    generation: int
+    attempt_id: str
+    attempt_count: int
+    expires_at: datetime
 
 
 class IncidentStore(Protocol):
@@ -244,6 +278,48 @@ class IncidentStore(Protocol):
         *,
         error: str,
     ) -> AuditAnchor: ...
+
+    async def submit_change_proposal(
+        self,
+        preview: ChangeProposalPreview,
+        *,
+        actor_id: str,
+        actor_assurance: str,
+    ) -> StoredChangeProposal: ...
+
+    async def get_change_proposal(
+        self,
+        proposal_id: str,
+    ) -> StoredChangeProposal | None: ...
+
+    async def claim_gitops_proposal(
+        self,
+        *,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> GitOpsProposalClaim | None: ...
+
+    async def complete_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        receipt: dict[str, object],
+    ) -> StoredChangeProposal: ...
+
+    async def retry_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        error: str,
+        retry_after_seconds: float,
+    ) -> StoredChangeProposal: ...
+
+    async def dead_letter_gitops_proposal(
+        self,
+        claim: GitOpsProposalClaim,
+        *,
+        error: str,
+    ) -> StoredChangeProposal: ...
 
     async def save(
         self,

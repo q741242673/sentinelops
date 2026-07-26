@@ -24,6 +24,7 @@ from sentinelops.change_proposals import (
     ChangeProposalRejected,
     ChangeProposalRequest,
     DeploymentSnapshot,
+    SubmittedChangeProposal,
     build_change_proposal,
 )
 from sentinelops.config import Settings, get_settings
@@ -64,6 +65,7 @@ from sentinelops.storage import (
     AuditAnchorUnlockConflictError,
     AuditAnchorUnlockDecision,
     AuditAnchorUnlockRequest,
+    ChangeProposalConflictError,
     DurableActionJournal,
     IncidentStore,
     LeaseConflictError,
@@ -130,7 +132,10 @@ async def _operator_auth_middleware(
             permission = UNLOCK_REQUEST_PERMISSION
         else:
             permission = INCIDENT_VIEW_PERMISSION
-    elif request.method == "POST" and path.endswith("/change-proposals/preview"):
+    elif request.method == "POST" and (
+        path.endswith("/change-proposals/preview")
+        or path.endswith("/change-proposals")
+    ):
         permission = INCIDENT_PROPOSE_PERMISSION
     elif path.endswith("/approval"):
         permission = INCIDENT_APPROVE_PERMISSION
@@ -2075,6 +2080,13 @@ async def preview_incident_change_proposal(
     incident_id: str,
     body: ChangeProposalRequest,
 ) -> ChangeProposalPreview:
+    return await _build_incident_change_proposal(incident_id, body)
+
+
+async def _build_incident_change_proposal(
+    incident_id: str,
+    body: ChangeProposalRequest,
+) -> ChangeProposalPreview:
     record = await get_incident(incident_id)
     if record.status not in {IncidentStatus.ESCALATED, IncidentStatus.FAILED}:
         raise HTTPException(
@@ -2113,6 +2125,66 @@ async def preview_incident_change_proposal(
             status_code=422,
             detail=f"动态变更提案未通过安全检查：{exc}",
         ) from exc
+
+
+@app.post(
+    "/api/v1/incidents/{incident_id}/change-proposals",
+    response_model=SubmittedChangeProposal,
+    status_code=202,
+)
+async def submit_incident_change_proposal(
+    incident_id: str,
+    body: ChangeProposalRequest,
+    request: Request,
+) -> SubmittedChangeProposal:
+    if incident_store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="提交 GitOps 提案需要持久化数据库",
+        )
+    identity = getattr(request.state, "operator_identity", None)
+    if not isinstance(identity, OperatorIdentity):
+        identity = await _require_operator(
+            request,
+            permission=INCIDENT_PROPOSE_PERMISSION,
+        )
+    preview = await _build_incident_change_proposal(incident_id, body)
+    try:
+        stored = await incident_store.submit_change_proposal(
+            preview,
+            actor_id=identity.subject_hash,
+            actor_assurance=identity.assurance,
+        )
+    except ChangeProposalConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return SubmittedChangeProposal.model_validate(
+        stored,
+        from_attributes=True,
+    )
+
+
+@app.get(
+    "/api/v1/change-proposals/{proposal_id}",
+    response_model=SubmittedChangeProposal,
+)
+async def get_submitted_change_proposal(
+    proposal_id: str,
+) -> SubmittedChangeProposal:
+    if incident_store is None:
+        raise HTTPException(
+            status_code=503,
+            detail="查询 GitOps 提案需要持久化数据库",
+        )
+    stored = await incident_store.get_change_proposal(proposal_id)
+    if stored is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Change proposal not found",
+        )
+    return SubmittedChangeProposal.model_validate(
+        stored,
+        from_attributes=True,
+    )
 
 
 @app.get("/api/v1/incidents/{incident_id}/events")

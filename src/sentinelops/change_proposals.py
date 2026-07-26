@@ -120,6 +120,18 @@ class ChangeProposalPreview(BaseModel):
     expires_at: datetime
 
 
+class SubmittedChangeProposal(BaseModel):
+    preview: ChangeProposalPreview
+    status: str
+    version: int
+    submitted_by: str
+    submitted_assurance: str
+    created_at: datetime
+    updated_at: datetime
+    published_at: datetime | None
+    receipt: dict[str, Any] | None
+
+
 class ChangeProposalRejected(ValueError):
     pass
 

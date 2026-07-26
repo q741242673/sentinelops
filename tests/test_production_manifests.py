@@ -65,6 +65,11 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
         "sentinelops-anchor",
         "sentinelops-system",
     )["data"]
+    gitops = _resource(
+        "ConfigMap",
+        "sentinelops-gitops",
+        "sentinelops-system",
+    )["data"]
 
     assert runtime["SENTINELOPS_ENVIRONMENT"] == "production"
     assert runtime["SENTINELOPS_TOOL_BACKEND"] == "kubernetes"
@@ -111,6 +116,10 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
         "sentinelops-system",
     )["data"]["receipt-public-keys.json"]
     assert "replace-key-id" in keyring
+    assert gitops["SENTINELOPS_GITOPS_GATEWAY_URL"].startswith("https://")
+    assert gitops["SENTINELOPS_GITOPS_BEARER_TOKEN_FILE"].startswith(
+        "/var/run/secrets/"
+    )
 
 
 def test_runtime_components_are_separate_hardened_deployments() -> None:
@@ -121,10 +130,16 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         "sentinelops-anchor-publisher",
         "sentinelops-system",
     )
+    gitops_publisher = _resource(
+        "Deployment",
+        "sentinelops-gitops-publisher",
+        "sentinelops-system",
+    )
 
     assert api["spec"]["replicas"] >= 2
     assert executor["spec"]["replicas"] >= 2
     assert publisher["spec"]["replicas"] >= 2
+    assert gitops_publisher["spec"]["replicas"] >= 2
     assert api["spec"]["template"]["spec"]["serviceAccountName"] == "sentinelops-api"
     assert (
         executor["spec"]["template"]["spec"]["serviceAccountName"]
@@ -135,10 +150,21 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         == "sentinelops-anchor-publisher"
     )
     assert publisher["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+    assert (
+        gitops_publisher["spec"]["template"]["spec"]["serviceAccountName"]
+        == "sentinelops-gitops-publisher"
+    )
+    assert (
+        gitops_publisher["spec"]["template"]["spec"][
+            "automountServiceAccountToken"
+        ]
+        is False
+    )
 
     api_container = _container(api)
     executor_container = _container(executor)
     publisher_container = _container(publisher)
+    gitops_container = _container(gitops_publisher)
     assert api_container["livenessProbe"]["httpGet"]["path"] == "/health"
     assert api_container["readinessProbe"]["httpGet"]["path"] == "/ready"
     assert api_container["startupProbe"]["httpGet"]["path"] == "/health"
@@ -158,11 +184,20 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         publisher_container["readinessProbe"]["exec"]["command"][0]
         == "sentinelops-anchor-health"
     )
+    assert (
+        gitops_container["readinessProbe"]["exec"]["command"][0]
+        == "sentinelops-gitops-health"
+    )
     assert executor_container["startupProbe"]["timeoutSeconds"] >= 5
     assert publisher_container["startupProbe"]["timeoutSeconds"] >= 5
-    assert api_container["image"] == executor_container["image"] == publisher_container["image"]
+    assert (
+        api_container["image"]
+        == executor_container["image"]
+        == publisher_container["image"]
+        == gitops_container["image"]
+    )
 
-    for deployment in (api, executor, publisher):
+    for deployment in (api, executor, publisher, gitops_publisher):
         pod_spec = deployment["spec"]["template"]["spec"]
         container = _container(deployment)
         assert pod_spec["securityContext"]["runAsNonRoot"] is True
@@ -191,6 +226,14 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
             "key": "audit-anchor-reconcile-token",
             "path": "audit-anchor-reconcile-token",
         },
+    ]
+    gitops_secret_items = gitops_publisher["spec"]["template"]["spec"][
+        "volumes"
+    ][0]["projected"]["sources"][0]["secret"]["items"]
+    assert gitops_secret_items == [
+        {"key": "database-url", "path": "database-url"},
+        {"key": "audit-hmac-key", "path": "audit-hmac-key"},
+        {"key": "gitops-token", "path": "gitops-token"},
     ]
 
 
@@ -269,6 +312,7 @@ def test_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
         if subject.get("kind") == "ServiceAccount"
     }
     assert "sentinelops-anchor-publisher" not in bound_service_accounts
+    assert "sentinelops-gitops-publisher" not in bound_service_accounts
 
 
 def test_pdb_service_and_ingress_policy_match_deployments() -> None:
@@ -276,6 +320,7 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "sentinelops-api",
         "sentinelops-executor",
         "sentinelops-anchor-publisher",
+        "sentinelops-gitops-publisher",
     ):
         pdb = _resource("PodDisruptionBudget", name, "sentinelops-system")
         deployment = _resource("Deployment", name, "sentinelops-system")
@@ -309,6 +354,11 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "sentinelops-anchor-publisher-deny-ingress",
         "sentinelops-system",
     )
+    gitops_policy = _resource(
+        "NetworkPolicy",
+        "sentinelops-gitops-publisher-deny-ingress",
+        "sentinelops-system",
+    )
     assert api_policy["spec"]["policyTypes"] == ["Ingress"]
     assert api_policy["spec"]["ingress"][0]["ports"][0]["port"] == 8000
     assert api_policy["spec"]["ingress"][1]["from"][0][
@@ -316,6 +366,7 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
     ]["matchLabels"] == {"sentinelops.io/metrics-access": "true"}
     assert executor_policy["spec"]["ingress"] == []
     assert publisher_policy["spec"]["ingress"] == []
+    assert gitops_policy["spec"]["ingress"] == []
 
 
 def test_audit_anchor_monitoring_uses_replica_safe_queries() -> None:

@@ -16,6 +16,7 @@ from sentinelops.change_proposals import (
 )
 from sentinelops.config import Settings
 from sentinelops.domain import Alert, IncidentRecord, IncidentStatus
+from sentinelops.storage import SqlIncidentStore
 from sentinelops.tools import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
@@ -315,3 +316,64 @@ async def test_api_rejects_dynamic_preview_for_live_automatic_incident(
 
     assert response.status_code == 409
     assert "已停止自动写入" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_api_submits_fresh_proposal_to_durable_gitops_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    store = SqlIncidentStore(
+        f"sqlite+aiosqlite:///{tmp_path / 'proposal-api.db'}"
+    )
+    await store.setup()
+    record = IncidentRecord(
+        alert=_alert(),
+        status=IncidentStatus.ESCALATED,
+    )
+    await store.save(record, expected_version=None, graph_state=None)
+    api_module.incident_store = store
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(
+            tool_backend="simulator",
+            kubernetes_namespace="sentinelops-demo",
+        ),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_agent_tool_registry",
+        lambda _settings: ToolRegistry(SimulatedKubernetesBackend()),
+    )
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            submitted = await client.post(
+                f"/api/v1/incidents/{record.id}/change-proposals",
+                json={
+                    "rationale": "人工调查确认需要适当提高容器的 CPU request",
+                    "operations": [
+                        {
+                            "field": "container.resources.requests.cpu",
+                            "container": "order-service",
+                            "value": "250m",
+                        }
+                    ],
+                },
+            )
+            proposal_id = submitted.json()["preview"]["proposal_id"]
+            fetched = await client.get(
+                f"/api/v1/change-proposals/{proposal_id}"
+            )
+    finally:
+        api_module.incident_store = None
+        await store.close()
+
+    assert submitted.status_code == 202
+    assert submitted.json()["status"] == "submitted"
+    assert fetched.status_code == 200
+    assert fetched.json()["preview"]["proposal_id"] == proposal_id
