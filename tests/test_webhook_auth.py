@@ -170,7 +170,11 @@ async def test_hmac_auth_covers_exact_body_and_rejects_tampering_and_old_time(
     future_headers = _hmac_headers(
         body,
         secret=secret,
-        timestamp=timestamp + 31,
+        timestamp=(
+            timestamp
+            + settings.alertmanager_webhook_signature_future_skew_seconds
+            + 5
+        ),
     )
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
