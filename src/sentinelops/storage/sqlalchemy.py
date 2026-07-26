@@ -495,9 +495,14 @@ class SqlIncidentStore:
         async with self.engine.connect() as connection:
             head = (
                 await connection.execute(
-                    select(audit_heads).where(
-                        audit_heads.c.incident_id == incident_id
-                    )
+                    select(audit_heads)
+                    .where(audit_heads.c.incident_id == incident_id)
+                    # PostgreSQL READ COMMITTED may otherwise observe the
+                    # head before a concurrent append and the events after
+                    # it, falsely reporting a broken chain. The append path
+                    # takes FOR UPDATE on this same row, so FOR SHARE keeps
+                    # both verification reads on one stable chain boundary.
+                    .with_for_update(read=True)
                 )
             ).mappings().one_or_none()
             rows = list(
