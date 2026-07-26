@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NAMESPACE="sentinelops-demo"
 POLICY_NAME="sentinelops-workload-write-fence"
 CONTROLLER_DEPLOYMENT="sentinelops-remediation-controller"
+TARGET_DEPLOYMENT="admission-integrity-target"
 POLICY_MANAGER="system:serviceaccount:sentinelops-system:sentinelops-admission-admin"
 E2E_ADMIN_BINDING="sentinelops-admission-integrity-e2e-admin"
 EXPECTED_GUARD_SPEC='{"allowedPolicyManagers":["system:serviceaccount:sentinelops-system:sentinelops-admission-admin"],"allowedDeploymentWriters":["system:serviceaccount:sentinelops-system:sentinelops-remediation-controller"],"allowedRemediationCreators":["system:serviceaccount:sentinelops-system:sentinelops-executor"],"allowedRemediationStatusWriters":["system:serviceaccount:sentinelops-system:sentinelops-remediation-controller"],"allowedRemediationDeleters":[]}'
@@ -22,6 +23,9 @@ cleanup() {
     sentinelops.io/admission-protected- \
     --overwrite \
     --as "${POLICY_MANAGER}" >/dev/null 2>&1 || true
+  kubectl delete deployment "${TARGET_DEPLOYMENT}" \
+    --namespace "${NAMESPACE}" \
+    --ignore-not-found >/dev/null 2>&1 || true
   kubectl delete clusterrolebinding "${E2E_ADMIN_BINDING}" \
     --ignore-not-found >/dev/null
 }
@@ -37,6 +41,16 @@ sed \
   -e "s/namespace: sentinelops-workloads/namespace: ${NAMESPACE}/g" \
   "${ROOT_DIR}/deploy/production/admission/workload-write-fence-guard.yaml" \
   | kubectl apply -f -
+kubectl create deployment "${TARGET_DEPLOYMENT}" \
+  --namespace "${NAMESPACE}" \
+  --image nginx:1.27-alpine \
+  --dry-run=client \
+  -o yaml \
+  | kubectl apply -f -
+kubectl rollout status \
+  "deployment/${TARGET_DEPLOYMENT}" \
+  --namespace "${NAMESPACE}" \
+  --timeout=120s
 kubectl label namespace "${NAMESPACE}" \
   sentinelops.io/admission-audit- \
   sentinelops.io/admission-protected=true \
@@ -90,6 +104,7 @@ executor_token="$(
 
 SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
 SENTINELOPS_E2E_SINGLE_CONTROLLER_ACTION=true \
+SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
   "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
 
 kubectl label namespace "${NAMESPACE}" \
@@ -99,6 +114,7 @@ kubectl label namespace "${NAMESPACE}" \
   --as "${POLICY_MANAGER}"
 SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
 SENTINELOPS_E2E_EXPECT_CONTROLLER_REJECTION=AdmissionFenceNotEnforced \
+SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
   "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
 kubectl label namespace "${NAMESPACE}" \
   sentinelops.io/admission-audit- \
@@ -109,11 +125,13 @@ kubectl label namespace "${NAMESPACE}" \
 kubectl delete validatingadmissionpolicybinding "${POLICY_NAME}"
 SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
 SENTINELOPS_E2E_EXPECT_CONTROLLER_REJECTION=AdmissionIntegrityUnknown \
+SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
   "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
 
 restore_policy
 SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
 SENTINELOPS_E2E_SINGLE_CONTROLLER_ACTION=true \
+SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
   "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
 
 cleanup

@@ -27,8 +27,8 @@ from sentinelops.storage import SqlIncidentStore
 from sentinelops.storage.base import StoredActionIntent
 from sentinelops.tools.kubernetes import KubernetesBackend
 
-NAMESPACE = "sentinelops-demo"
-DEPLOYMENT = "order-service"
+NAMESPACE = os.environ.get("SENTINELOPS_E2E_NAMESPACE", "sentinelops-demo")
+DEPLOYMENT = os.environ.get("SENTINELOPS_E2E_DEPLOYMENT", "order-service")
 
 
 def executor_custom_objects_api() -> client.CustomObjectsApi:
@@ -86,7 +86,7 @@ async def wait_for_rollout(
         ):
             return
         if asyncio.get_running_loop().time() >= deadline:
-            raise TimeoutError("order-service rollout did not become ready")
+            raise TimeoutError(f"{DEPLOYMENT} rollout did not become ready")
         await asyncio.sleep(0.5)
 
 
