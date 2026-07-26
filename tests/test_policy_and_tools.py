@@ -4,10 +4,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from sentinelops.actions import (
+    STANDARD_ACTION_CATALOG,
+    ActionCatalog,
+    ActionPlugin,
+    VerificationProfile,
+)
 from sentinelops.agent.policy import ActionPolicy
 from sentinelops.domain import RemediationAction, RiskLevel, ToolResult
 from sentinelops.llm.rule_based import RuleBasedProvider
-from sentinelops.tools.base import tool_call_fingerprint
+from sentinelops.tools.base import ToolSpec, tool_call_fingerprint
 from sentinelops.tools.registry import ToolRegistry
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
@@ -20,6 +26,37 @@ def action(tool_name: str, risk: RiskLevel) -> RemediationAction:
         expected_outcome="test",
         risk=risk,
     )
+
+
+def execution_precondition(
+    tool_name: str,
+    arguments: dict[str, object],
+) -> dict[str, object]:
+    precondition: dict[str, object] = {
+        "action_fingerprint": "approved-action",
+        "tool_name": tool_name,
+        "target": arguments["name"],
+        "namespace": "default",
+        "deployment_uid": "deployment-uid",
+        "generation": 2,
+        "resource_version": "17",
+        "desired_replicas": 1,
+        "paused": False,
+        "current_revision": 2,
+        "current_replica_set_uid": "replica-set-uid",
+        "current_template_hash": "template-hash",
+        "current_replicas": 1,
+        "current_ready_replicas": 0,
+        "captured_at": "2099-07-26T00:00:00+00:00",
+        "expires_at": "2099-07-26T00:15:00+00:00",
+    }
+    if tool_name == "rollback_deployment":
+        precondition["rollback_target"] = {
+            "revision": arguments["revision"],
+            "replica_set_uid": "healthy-replica-set",
+            "health_proof": {"subject": "healthy-revision"},
+        }
+    return precondition
 
 
 def test_policy_requires_approval_above_threshold() -> None:
@@ -102,7 +139,11 @@ async def test_registry_accepts_valid_write_argument_boundaries(
     backend.call.return_value = ToolResult(tool_name=tool_name, success=True)
     registry = ToolRegistry(backend)
 
-    result = await registry.call_guarded(tool_name, arguments, {"snapshot": "test"})
+    result = await registry.call_guarded(
+        tool_name,
+        arguments,
+        execution_precondition(tool_name, arguments),
+    )
 
     assert result.success is True
     guarded_arguments = backend.call.await_args.args[1]
@@ -169,9 +210,9 @@ async def test_registry_binds_guard_to_validated_tool_and_public_arguments() -> 
         "rollback_deployment",
         arguments,
         {
+            **execution_precondition("rollback_deployment", arguments),
             "guarded_tool_name": "restart_deployment",
             "public_arguments_fingerprint": "attacker-controlled",
-            "deployment_uid": "deployment-uid",
         },
     )
 
@@ -183,6 +224,134 @@ async def test_registry_binds_guard_to_validated_tool_and_public_arguments() -> 
         "public_arguments_fingerprint"
     ] == tool_call_fingerprint("rollback_deployment", arguments)
     assert guarded_arguments["_precondition"]["deployment_uid"] == "deployment-uid"
+
+
+def test_standard_action_catalog_declares_execution_contracts() -> None:
+    plugins = {plugin.name: plugin for plugin in STANDARD_ACTION_CATALOG.list()}
+
+    assert set(plugins) == {
+        "restart_deployment",
+        "rollback_deployment",
+        "scale_deployment",
+    }
+    assert plugins["rollback_deployment"].reversible is True
+    assert plugins["restart_deployment"].destructive is False
+    assert (
+        plugins["scale_deployment"].verification_profile
+        == VerificationProfile.WORKLOAD_STRICT
+    )
+    assert "resource_version" in plugins["restart_deployment"].required_preconditions
+    assert "rollback_target" in plugins["rollback_deployment"].required_preconditions
+
+
+def test_action_catalog_rejects_duplicate_and_read_only_plugins() -> None:
+    plugin = ActionPlugin(
+        name="safe_action",
+        description="test action",
+        risk=RiskLevel.LOW,
+        input_schema={
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+        target_argument="name",
+        reversible=True,
+    )
+    with pytest.raises(ValueError, match="Duplicate"):
+        ActionCatalog([plugin, plugin])
+    with pytest.raises(ValueError, match="cannot be read-only"):
+        ActionCatalog([plugin.model_copy(update={"risk": RiskLevel.READ_ONLY})])
+
+
+def test_registry_rejects_write_spec_without_matching_action_plugin() -> None:
+    with pytest.raises(ValueError, match="no enabled Action Plugin"):
+        ToolRegistry(
+            AsyncMock(),
+            specs=[
+                ToolSpec(
+                    name="arbitrary_shell",
+                    description="unsafe dynamic command",
+                    risk=RiskLevel.CRITICAL,
+                    input_schema={
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                )
+            ],
+        )
+
+
+def test_registry_rejects_action_spec_that_weakens_plugin_contract() -> None:
+    plugin = STANDARD_ACTION_CATALOG.require("rollback_deployment")
+    with pytest.raises(ValueError, match="does not match"):
+        ToolRegistry(
+            AsyncMock(),
+            specs=[
+                ToolSpec(
+                    name=plugin.name,
+                    description=plugin.description,
+                    risk=RiskLevel.LOW,
+                    input_schema=plugin.input_schema,
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_guarded_write_rejects_missing_plugin_preconditions() -> None:
+    backend = AsyncMock()
+    registry = ToolRegistry(backend)
+
+    result = await registry.call_guarded(
+        "restart_deployment",
+        {"name": "order-service"},
+        {
+            "tool_name": "restart_deployment",
+            "target": "order-service",
+            "resource_version": "17",
+        },
+    )
+
+    assert result.success is False
+    assert "Execution precondition is missing" in str(result.error)
+    backend.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guarded_write_rejects_target_mismatch_at_catalog_boundary() -> None:
+    backend = AsyncMock()
+    registry = ToolRegistry(backend)
+    arguments = {"name": "order-service"}
+    precondition = execution_precondition("restart_deployment", arguments)
+    precondition["target"] = "unrelated-service"
+
+    result = await registry.call_guarded(
+        "restart_deployment",
+        arguments,
+        precondition,
+    )
+
+    assert result.success is False
+    assert "target does not match" in str(result.error)
+    backend.call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_guarded_write_rejects_expired_plugin_snapshot() -> None:
+    backend = AsyncMock()
+    registry = ToolRegistry(backend)
+    arguments = {"name": "order-service"}
+    precondition = execution_precondition("restart_deployment", arguments)
+    precondition["expires_at"] = "2020-01-01T00:00:00+00:00"
+
+    result = await registry.call_guarded(
+        "restart_deployment",
+        arguments,
+        precondition,
+    )
+
+    assert result.success is False
+    assert "has expired" in str(result.error)
+    backend.call.assert_not_awaited()
 
 
 def test_rule_provider_infers_bad_rollout_from_live_cluster_evidence() -> None:
