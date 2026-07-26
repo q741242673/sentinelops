@@ -17,6 +17,11 @@ restore_policy() {
 }
 cleanup() {
   restore_policy
+  kubectl label namespace "${NAMESPACE}" \
+    sentinelops.io/admission-audit- \
+    sentinelops.io/admission-protected- \
+    --overwrite \
+    --as "${POLICY_MANAGER}" >/dev/null 2>&1 || true
   kubectl delete clusterrolebinding "${E2E_ADMIN_BINDING}" \
     --ignore-not-found >/dev/null
 }
