@@ -156,6 +156,22 @@ func TestCatalogDigestMismatchRejectsRequest(t *testing.T) {
 	assertPhase(t, kubeClient, remediation, PhaseRejected, "CatalogDigestMismatch")
 }
 
+func TestFenceMustBindCapturedDeploymentGeneration(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	remediation.Spec.Fence.Generation++
+	if err := kubeClient.Update(context.Background(), remediation); err != nil {
+		t.Fatalf("change fence generation: %v", err)
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "FenceGenerationMismatch")
+}
+
 func TestCrashAfterWriteRecoversWithoutRepeatingAction(t *testing.T) {
 	reconciler, kubeClient, remediation := newTestReconciler(
 		t,
@@ -228,7 +244,7 @@ func TestCopiedActionMarkerOnReplacementDeploymentIsNotTrusted(t *testing.T) {
 	deployment.UID = types.UID("replacement-deployment-uid")
 	deployment.Annotations[actionIDAnnotation] = remediation.Name
 	deployment.Annotations[actionPluginAnnotation] = ActionRestart
-	deployment.Annotations[fenceGenerationAnnotation] = "7"
+	deployment.Annotations[fenceGenerationAnnotation] = "4"
 	if deployment.Spec.Template.Annotations == nil {
 		deployment.Spec.Template.Annotations = map[string]string{}
 	}
@@ -251,7 +267,7 @@ func TestActionMarkerMustBindRegisteredPlugin(t *testing.T) {
 	deployment := getDeployment(t, kubeClient)
 	deployment.Annotations[actionIDAnnotation] = remediation.Name
 	deployment.Annotations[actionPluginAnnotation] = ActionScale
-	deployment.Annotations[fenceGenerationAnnotation] = "7"
+	deployment.Annotations[fenceGenerationAnnotation] = "4"
 	if deployment.Spec.Template.Annotations == nil {
 		deployment.Spec.Template.Annotations = map[string]string{}
 	}
@@ -481,7 +497,7 @@ func baseRemediation(action string) *opsv1alpha1.SentinelRemediation {
 				PolicyDigest: "policy-digest",
 			},
 			Fence: opsv1alpha1.ExecutionFence{
-				Generation: 7,
+				Generation: 4,
 				ExpiresAt:  expires,
 			},
 		},

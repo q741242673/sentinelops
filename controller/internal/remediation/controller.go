@@ -148,6 +148,12 @@ func (r *Reconciler) validateStatic(
 	if !spec.Fence.ExpiresAt.Time.After(now) {
 		return stale("FenceExpired", "execution fence has expired")
 	}
+	if spec.Fence.Generation != spec.Precondition.Generation {
+		return rejected(
+			"FenceGenerationMismatch",
+			"execution fence must bind the captured Deployment generation",
+		)
+	}
 	expectedCatalogDigest, ok := CatalogDigest(spec.Action.Plugin)
 	if !ok {
 		return rejected("ActionNotRegistered", "action is not in the controller catalog")
