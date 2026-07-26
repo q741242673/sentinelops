@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sentinelops.agent.execution import (
@@ -14,6 +15,7 @@ from sentinelops.domain import RemediationAction, ToolResult
 from sentinelops.remediation_controller import RemediationGateway
 from sentinelops.storage.base import (
     ActionIntentConflictError,
+    ActionReconciliationClaim,
     IncidentStore,
     LeaseToken,
 )
@@ -134,6 +136,7 @@ class ExecutorWorker:
         remediation_gateway: RemediationGateway | None = None,
         claim_ttl_seconds: float = 60,
         poll_interval_seconds: float = 0.5,
+        missing_contract_grace_seconds: float = 30,
         health_callback: Callable[[], None] | None = None,
         health_interval_seconds: float = 5,
     ) -> None:
@@ -145,10 +148,16 @@ class ExecutorWorker:
         self.owner_id = owner_id
         self.claim_ttl_seconds = claim_ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
+        self.missing_contract_grace_seconds = missing_contract_grace_seconds
         self.health_callback = health_callback
         self.health_interval_seconds = health_interval_seconds
 
     async def run_once(self) -> bool:
+        reconciled = await self._reconcile_once()
+        executed = await self._execute_once()
+        return reconciled or executed
+
+    async def _execute_once(self) -> bool:
         claim = await self.store.claim_action_execution(
             owner_id=self.owner_id,
             attempt_id=str(uuid4()),
@@ -191,6 +200,89 @@ class ExecutorWorker:
         await self.store.complete_action(claim=claim, result=result)
         return True
 
+    async def _reconcile_once(self) -> bool:
+        if self.remediation_gateway is None:
+            return False
+        claim = await self.store.claim_action_reconciliation(
+            owner_id=self.owner_id,
+            ttl_seconds=self.claim_ttl_seconds,
+        )
+        if claim is None:
+            return False
+        retry_after = min(
+            30.0,
+            max(1.0, float(2 ** min(claim.attempt_count - 1, 5))),
+        )
+        try:
+            observation = await self.remediation_gateway.observe(claim.intent)
+            if observation.state == "terminal" and observation.result is not None:
+                await self.store.complete_action_reconciliation(
+                    claim,
+                    result=observation.result,
+                )
+                return True
+            error = (
+                observation.reason
+                or f"Controller observation state={observation.state}"
+            )
+            if (
+                not observation.retryable
+                or (
+                    observation.state == "not_found"
+                    and self._reconciliation_deadline_elapsed(claim)
+                )
+            ):
+                await self.store.dead_letter_action_reconciliation(
+                    claim,
+                    error=error,
+                )
+                return True
+            await self.store.retry_action_reconciliation(
+                claim,
+                error=error,
+                retry_after_seconds=retry_after,
+            )
+        except asyncio.CancelledError:
+            raise
+        except ValueError as exc:
+            with suppress(Exception):
+                error = f"Controller 结果对账失败：{exc}"
+                await self.store.dead_letter_action_reconciliation(
+                    claim,
+                    error=error,
+                )
+        except Exception as exc:
+            with suppress(Exception):
+                await self.store.retry_action_reconciliation(
+                    claim,
+                    error=f"Controller 结果对账失败：{exc}",
+                    retry_after_seconds=retry_after,
+                )
+        return True
+
+    def _reconciliation_deadline_elapsed(
+        self,
+        claim: ActionReconciliationClaim,
+    ) -> bool:
+        value = claim.intent.precondition.get("expires_at")
+        if not isinstance(value, str):
+            return True
+        try:
+            expires_at = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except ValueError:
+            return True
+        if expires_at.tzinfo is None:
+            return True
+        deadline = expires_at.astimezone(UTC) + timedelta(
+            seconds=max(0, self.missing_contract_grace_seconds)
+        )
+        database_now = claim.expires_at - timedelta(
+            seconds=max(0.1, self.claim_ttl_seconds)
+        )
+        return database_now >= deadline
+
     async def run_forever(self) -> None:
         await run_with_health_pulse(
             self._run_work_loop(),
@@ -199,9 +291,26 @@ class ExecutorWorker:
         )
 
     async def _run_work_loop(self) -> None:
+        await asyncio.gather(
+            self._run_execution_loop(),
+            self._run_reconciliation_loop(),
+        )
+
+    async def _run_execution_loop(self) -> None:
         while True:
             try:
-                worked = await self.run_once()
+                worked = await self._execute_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                worked = False
+            if not worked:
+                await asyncio.sleep(self.poll_interval_seconds)
+
+    async def _run_reconciliation_loop(self) -> None:
+        while True:
+            try:
+                worked = await self._reconcile_once()
             except asyncio.CancelledError:
                 raise
             except Exception:

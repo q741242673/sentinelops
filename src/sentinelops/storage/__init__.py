@@ -10,6 +10,7 @@ from sentinelops.storage.anchor import (
 from sentinelops.storage.audit import AuditEvent, AuditVerification
 from sentinelops.storage.base import (
     ActionIntentConflictError,
+    ActionReconciliationClaim,
     AlertFiringClaim,
     AlertResolution,
     ApprovalConflictError,
@@ -30,6 +31,7 @@ from sentinelops.storage.journal import DurableActionJournal
 from sentinelops.storage.sqlalchemy import SqlIncidentStore
 
 __all__ = [
+    "ActionReconciliationClaim",
     "ActionIntentConflictError",
     "AlertFiringClaim",
     "AlertResolution",

@@ -8,7 +8,7 @@ import sys
 
 import pytest
 from alembic.script import ScriptDirectory
-from sqlalchemy import insert, inspect
+from sqlalchemy import insert, inspect, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import sentinelops.api as api_module
@@ -21,7 +21,7 @@ from sentinelops.migration import (
     upgrade_database,
 )
 from sentinelops.storage import SqlIncidentStore
-from sentinelops.storage.sqlalchemy import incidents
+from sentinelops.storage.sqlalchemy import action_intents, incidents
 
 
 def _database_url(tmp_path, name: str = "sentinelops.db") -> str:
@@ -126,9 +126,19 @@ async def test_empty_database_upgrades_to_single_head_and_is_idempotent(tmp_path
         "status",
         "created_at",
     )
+    assert (
+        await _indexes(
+            database_url,
+            "sentinelops_action_reconciliation_outbox",
+        )
+    )["ix_sentinelops_action_reconciliation_status_next_attempt"] == (
+        "status",
+        "next_attempt_at",
+    )
     assert await _table_names(database_url) == {
         "alembic_version",
         "sentinelops_action_intents",
+        "sentinelops_action_reconciliation_outbox",
         "sentinelops_alert_bindings",
         "sentinelops_approvals",
         "sentinelops_audit_events",
@@ -178,6 +188,96 @@ async def test_versioned_durable_store_upgrades_to_executor_queue_without_data_l
     assert audit_events[0].payload["historical_transitions_verified"] is False
     assert (await current_store.verify_audit_chain(created.id)).valid is True
     await current_store.close()
+
+
+@pytest.mark.asyncio
+async def test_action_reconciliation_migration_backfills_unknown_intents(
+    tmp_path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    await _upgrade(database_url, "0009_gitops_proposal_outbox")
+    engine = create_async_engine(database_url)
+    timestamp = "2026-07-26T08:00:00+00:00"
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(action_intents).values(
+                idempotency_key="a" * 64,
+                incident_id="migration-reconciliation",
+                lease_generation=1,
+                approval_id=None,
+                approval_version=None,
+                action={
+                    "tool_name": "restart_deployment",
+                    "arguments": {"name": "order-service"},
+                    "rationale": "migration fixture",
+                    "expected_outcome": "healthy",
+                    "risk": "medium",
+                },
+                precondition={"resource_version": "17"},
+                status="unknown",
+                executor_id="executor-before-upgrade",
+                executor_generation=1,
+                executor_lease_until=timestamp,
+                attempt_id="migration-attempt",
+                result=None,
+                error="result lost before upgrade",
+                created_at=timestamp,
+                updated_at=timestamp,
+                queued_at=timestamp,
+                claimed_at=timestamp,
+                dispatched_at=timestamp,
+                finished_at=timestamp,
+            )
+        )
+    await engine.dispose()
+
+    await _upgrade(database_url)
+
+    migrated = create_async_engine(database_url)
+    try:
+        async with migrated.connect() as connection:
+            row = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT action_id, status, next_attempt_at
+                        FROM sentinelops_action_reconciliation_outbox
+                        """
+                    )
+                )
+            ).mappings().one()
+        assert row["action_id"] == "a" * 64
+        assert row["status"] == "pending"
+        assert row["next_attempt_at"] == timestamp
+    finally:
+        await migrated.dispose()
+
+
+@pytest.mark.asyncio
+async def test_action_reconciliation_migration_rejects_drifted_existing_table(
+    tmp_path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    database_path = tmp_path / "sentinelops.db"
+    await _upgrade(database_url, "0009_gitops_proposal_outbox")
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE sentinelops_action_reconciliation_outbox (
+                action_id VARCHAR(64) PRIMARY KEY,
+                status VARCHAR(24) NOT NULL
+            )
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="Controller 对账表"):
+        await _upgrade(database_url)
+
+    store = SqlIncidentStore(database_url)
+    assert await store.schema_revisions() == (
+        "0009_gitops_proposal_outbox",
+    )
+    await store.close()
 
 
 @pytest.mark.asyncio

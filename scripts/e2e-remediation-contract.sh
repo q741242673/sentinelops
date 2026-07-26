@@ -2,8 +2,25 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NAMESPACE="${SENTINELOPS_KUBERNETES_NAMESPACE:-sentinelops-demo}"
+NAMESPACE="${SENTINELOPS_CONTRACT_TEST_NAMESPACE:-sentinelops-contract-e2e}"
 ACTION_ID="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+CREATED_NAMESPACE=false
+
+if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+  kubectl create namespace "${NAMESPACE}"
+  CREATED_NAMESPACE=true
+fi
+
+cleanup() {
+  kubectl delete sentinelremediation "${ACTION_ID}" \
+    --namespace "${NAMESPACE}" \
+    --ignore-not-found \
+    --wait=true >/dev/null
+  if [[ "${CREATED_NAMESPACE}" == "true" ]]; then
+    kubectl delete namespace "${NAMESPACE}" --wait=true >/dev/null
+  fi
+}
+trap cleanup EXIT
 
 kubectl apply \
   -f "${ROOT_DIR}/deploy/production/crds/sentinelremediations.yaml"
@@ -69,6 +86,14 @@ if kubectl patch sentinelremediation "${ACTION_ID}" \
   exit 1
 fi
 
-kubectl delete sentinelremediation "${ACTION_ID}" \
+if kubectl patch sentinelremediation "${ACTION_ID}" \
   --namespace "${NAMESPACE}" \
-  --wait=true
+  --subresource status \
+  --type merge \
+  --patch '{"status":{"phase":"Succeeded","observedGeneration":1,"reason":"mutated"}}'; then
+  echo "Expected the API server to freeze the complete terminal status" >&2
+  exit 1
+fi
+
+cleanup
+trap - EXIT

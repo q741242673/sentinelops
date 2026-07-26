@@ -154,7 +154,7 @@ def test_status_preserves_terminal_results_and_never_rewinds_generation() -> Non
         status["properties"]["phase"]["enum"]
     )
     assert "oldSelf.phase" in rules
-    assert "self.phase == oldSelf.phase" in rules
+    assert "self == oldSelf" in rules
     assert "self.observedGeneration >= oldSelf.observedGeneration" in rules
     assert (
         status["properties"]["conditions"]["x-kubernetes-list-map-keys"]

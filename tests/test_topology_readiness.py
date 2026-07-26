@@ -59,7 +59,7 @@ def _trial(**overrides: Any) -> object:
             "strict_recovery_evidence_present": True,
         },
         "database_snapshot": {
-            "schema_revision": "0009_gitops_proposal_outbox",
+            "schema_revision": "0010_action_reconciliation_outbox",
         },
     }
     values.update(overrides)

@@ -71,6 +71,16 @@ class ExecutorClaim:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class ActionReconciliationClaim:
+    intent: StoredActionIntent
+    owner_id: str
+    generation: int
+    attempt_id: str
+    attempt_count: int
+    expires_at: datetime
+
+
 ActionIntentStatus = Literal[
     "prepared",
     "queued",
@@ -446,6 +456,35 @@ class IncidentStore(Protocol):
         *,
         claim: ExecutorClaim,
         result: ToolResult,
+    ) -> StoredActionIntent: ...
+
+    async def claim_action_reconciliation(
+        self,
+        *,
+        owner_id: str,
+        ttl_seconds: float,
+    ) -> ActionReconciliationClaim | None: ...
+
+    async def complete_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        result: ToolResult,
+    ) -> StoredActionIntent: ...
+
+    async def retry_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        error: str,
+        retry_after_seconds: float,
+    ) -> StoredActionIntent: ...
+
+    async def dead_letter_action_reconciliation(
+        self,
+        claim: ActionReconciliationClaim,
+        *,
+        error: str,
     ) -> StoredActionIntent: ...
 
     async def cancel_action(
