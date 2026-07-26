@@ -18,6 +18,7 @@ from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from sentinelops.actions import ApprovalMode
 from sentinelops.agent.execution import (
     ActionExecutionRejected,
     ActionExecutor,
@@ -888,9 +889,9 @@ class IncidentAgent:
                 "你是一名以证据为依据的 Kubernetes 事故调查专家。没有观测证据时不得断言根因。"
                 "必须综合分析 Pod、事件、日志、发布历史以及已配置的全部可观测性数据源。"
                 "如果发布历史包含因果变更，必须将该发布记录作为独立证据明确引用。"
-                "每条 evidence 必须引用 observations.evidence_catalog 中真实存在且 success=true "
-                "的 evidence_id，并原样复制该目录项的 source 和 tool 到 source、query；"
-                "不得引用失败、缺失或不存在的证据。"
+                "每条 evidence 必须引用 observations.evidence_catalog 中真实存在且 "
+                "success=true 的 evidence_id，并原样复制该目录项的 source 和 tool 到 "
+                "source、query；不得引用失败、缺失或不存在的证据。"
                 "Evidence.query 是历史兼容字段，虽然字段名是 query，也只能填写目录项的 tool "
                 "（例如 query_prometheus、search_loki 或 get_trace），绝不能填写 PromQL、"
                 "LogQL、URL、命令或其他实际查询文本。"
@@ -2031,13 +2032,12 @@ class IncidentAgent:
             "observations": planning_observations,
             "diagnosis": self._compact_diagnosis(state["diagnosis"]),
             "available_tools": [
-                spec.model_dump(mode="json")
-                for spec in specs.values()
-                if spec.risk != RiskLevel.READ_ONLY
+                plugin.model_dump(mode="json") for plugin in self.tools.list_action_plugins()
             ],
         }
         system = (
-            "你是一名保守的 Kubernetes 修复规划专家。只能选择白名单工具，优先选择可逆操作，"
+            "你是一名保守的 Kubernetes 修复规划专家。只能选择服务器注册的 Action Plugin，"
+            "优先选择 reversible=true 且 destructive=false 的操作，"
             "并给出明确的验证标准。工具声明的风险等级是最低风险等级，不得降低。"
             "如果发布历史证明当前 revision 引入故障且存在更早的健康 revision，必须精确回滚到"
             "该健康 revision；不能用重启替代，因为重启会保留故障镜像或配置。"
@@ -2218,6 +2218,13 @@ class IncidentAgent:
                     f"{action.tool_name} 风险等级被低报："
                     f"declared={action.risk.value}, minimum={spec.risk.value}"
                 )
+            if spec.risk != RiskLevel.READ_ONLY:
+                catalog_error = self.tools.action_catalog.validate_action(
+                    action,
+                    allowed_targets=allowed_targets,
+                )
+                if catalog_error:
+                    return catalog_error
         feedback = self._plan_feedback(
             state,
             plan,
@@ -2481,9 +2488,8 @@ class IncidentAgent:
             return None
         return max(active, key=lambda revision: int(revision.get("revision", 0)))
 
-    @classmethod
     def _build_preflight_snapshot(
-        cls,
+        self,
         action: RemediationAction,
         rollout: dict[str, Any],
     ) -> dict[str, Any]:
@@ -2500,7 +2506,8 @@ class IncidentAgent:
             raise ValueError(f"rollout 缺少 {', '.join(missing)}")
         if int(rollout.get("observed_generation") or 0) != int(rollout["generation"]):
             raise ValueError("Deployment controller 尚未观察到当前 generation")
-        current = cls._active_revision(rollout)
+        plugin = self.tools.action_catalog.require(action.tool_name)
+        current = self._active_revision(rollout)
         if current is None:
             raise ValueError("rollout 无法确定当前 revision")
         if not current.get("uid") or not current.get("template_hash"):
@@ -2509,9 +2516,9 @@ class IncidentAgent:
             raise ValueError("当前 revision 缺少副本健康状态")
         captured_at = datetime.now(UTC)
         snapshot: dict[str, Any] = {
-            "action_fingerprint": cls._action_fingerprint(action),
+            "action_fingerprint": self._action_fingerprint(action),
             "tool_name": action.tool_name,
-            "target": action.arguments.get("name"),
+            "target": action.arguments.get(plugin.target_argument),
             "namespace": str(rollout["namespace"]),
             "deployment_uid": str(rollout["deployment_uid"]),
             "generation": int(rollout["generation"]),
@@ -2536,7 +2543,7 @@ class IncidentAgent:
                 ),
                 None,
             )
-            if target is None or not cls._revision_is_known_healthy(target):
+            if target is None or not self._revision_is_known_healthy(target):
                 raise ValueError("rollback 目标不存在或健康证明无效")
             proof = target["health_proof"]
             target_uid = target.get("uid")
@@ -2637,7 +2644,10 @@ class IncidentAgent:
             snapshot = self._build_preflight_snapshot(action, rollout.content)
         except (TypeError, ValueError) as exc:
             return self._preflight_rejected(f"进入审批前无法建立可信快照：{exc}")
-        if not self.policy.requires_approval(action):
+        plugin = self.tools.action_catalog.require(action.tool_name)
+        if plugin.approval_mode != ApprovalMode.ALWAYS and not self.policy.requires_approval(
+            action
+        ):
             risk_label = {
                 RiskLevel.READ_ONLY: "只读",
                 RiskLevel.LOW: "低",
@@ -2851,6 +2861,18 @@ class IncidentAgent:
             )
         action = RemediationAction.model_validate(state["plan"]["actions"][0])
         self.policy.validate(action)
+        catalog_error = self.tools.action_catalog.validate_action(action)
+        if catalog_error:
+            return self._preflight_rejected(f"写入前 Action Plugin 校验失败：{catalog_error}")
+        precondition_error = self.tools.action_catalog.validate_precondition(
+            action.tool_name,
+            action.arguments,
+            state.get("execution_precondition") or {},
+        )
+        if precondition_error:
+            return self._preflight_rejected(
+                f"写入前 Action Plugin 前置条件失败：{precondition_error}"
+            )
         intent_key: str | None = None
         if self.action_journal is not None:
             try:

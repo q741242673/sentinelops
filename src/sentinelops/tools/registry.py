@@ -3,6 +3,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from sentinelops.actions import (
+    KUBERNETES_NAME_SCHEMA,
+    STANDARD_ACTION_CATALOG,
+    ActionCatalog,
+    ActionPlugin,
+)
 from sentinelops.config import Settings
 from sentinelops.domain import RiskLevel, ToolResult
 from sentinelops.tools.base import (
@@ -16,17 +22,7 @@ from sentinelops.tools.kubernetes import KubernetesBackend
 from sentinelops.tools.observability import ObservabilityBackend
 from sentinelops.tools.simulator import SimulatedKubernetesBackend
 
-KUBERNETES_NAME_SCHEMA = {
-    "type": "string",
-    "minLength": 1,
-    "maxLength": 253,
-    "pattern": (
-        r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?"
-        r"(?:\.[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?)*$"
-    ),
-}
-
-KUBERNETES_TOOL_SPECS = [
+KUBERNETES_READ_TOOL_SPECS = [
     ToolSpec(
         name="list_pods",
         description="List pod health and restart counts",
@@ -58,45 +54,10 @@ KUBERNETES_TOOL_SPECS = [
         description="Read service or workload health metrics",
         risk=RiskLevel.READ_ONLY,
     ),
-    ToolSpec(
-        name="restart_deployment",
-        description="Trigger a rolling restart of a deployment",
-        risk=RiskLevel.MEDIUM,
-        input_schema={
-            "type": "object",
-            "properties": {"name": KUBERNETES_NAME_SCHEMA},
-            "required": ["name"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolSpec(
-        name="rollback_deployment",
-        description="Rollback a deployment to a known revision",
-        risk=RiskLevel.HIGH,
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": KUBERNETES_NAME_SCHEMA,
-                "revision": {"type": "integer", "minimum": 1},
-            },
-            "required": ["name", "revision"],
-            "additionalProperties": False,
-        },
-    ),
-    ToolSpec(
-        name="scale_deployment",
-        description="Change desired deployment replicas",
-        risk=RiskLevel.HIGH,
-        input_schema={
-            "type": "object",
-            "properties": {
-                "name": KUBERNETES_NAME_SCHEMA,
-                "replicas": {"type": "integer", "minimum": 0, "maximum": 100},
-            },
-            "required": ["name", "replicas"],
-            "additionalProperties": False,
-        },
-    ),
+]
+KUBERNETES_TOOL_SPECS = [
+    *KUBERNETES_READ_TOOL_SPECS,
+    *STANDARD_ACTION_CATALOG.tool_specs(),
 ]
 
 OBSERVABILITY_TOOL_SPECS = [
@@ -137,16 +98,31 @@ class ToolRegistry:
         specs: list[ToolSpec] | None = None,
         *,
         allow_guarded_writes: bool = True,
+        action_catalog: ActionCatalog = STANDARD_ACTION_CATALOG,
     ) -> None:
         self.backend = backend
         self.specs = {spec.name: spec for spec in (specs or KUBERNETES_TOOL_SPECS)}
         self.allow_guarded_writes = allow_guarded_writes
+        self.action_catalog = action_catalog
+        for spec in self.specs.values():
+            if spec.risk == RiskLevel.READ_ONLY:
+                continue
+            plugin = self.action_catalog.get(spec.name)
+            if plugin is None:
+                raise ValueError(f"Write tool {spec.name} has no enabled Action Plugin contract")
+            if spec.risk != plugin.risk or spec.input_schema != plugin.input_schema:
+                raise ValueError(
+                    f"Write tool {spec.name} does not match its Action Plugin contract"
+                )
 
     def list_specs(self) -> list[ToolSpec]:
         return list(self.specs.values())
 
     def has_tool(self, name: str) -> bool:
         return name in self.specs
+
+    def list_action_plugins(self) -> list[ActionPlugin]:
+        return [plugin for plugin in self.action_catalog.list() if plugin.name in self.specs]
 
     def validation_error(self, name: str, arguments: dict[str, Any]) -> str | None:
         spec = self.specs.get(name)
@@ -186,9 +162,27 @@ class ToolRegistry:
                 success=False,
                 error="This process does not hold the cluster-write capability",
             )
+        plugin = self.action_catalog.get(name)
+        if plugin is None:
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                error="Write action is not registered or enabled in the Action Catalog",
+            )
         validation_error = self.validation_error(name, arguments)
         if validation_error:
             return ToolResult(tool_name=name, success=False, error=validation_error)
+        precondition_error = self.action_catalog.validate_precondition(
+            name,
+            arguments,
+            precondition,
+        )
+        if precondition_error:
+            return ToolResult(
+                tool_name=name,
+                success=False,
+                error=precondition_error,
+            )
         execution_guard = {
             **precondition,
             "guarded_tool_name": name,
@@ -280,4 +274,5 @@ def build_tool_registry(
         CompositeBackend(routes),
         specs,
         allow_guarded_writes=allow_guarded_writes,
+        action_catalog=STANDARD_ACTION_CATALOG,
     )

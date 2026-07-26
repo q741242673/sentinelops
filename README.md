@@ -66,7 +66,8 @@ flowchart TB
     READ --> GIT["Git 变更记录"]
     AGENT --> POLICY["风险检查和人工审批"]
     POLICY --> PREFLIGHT["执行前重新读取集群"]
-    PREFLIGHT --> QUEUE["PostgreSQL Action Intent 队列"]
+    PREFLIGHT --> CATALOG["Action Plugin 合同"]
+    CATALOG --> QUEUE["PostgreSQL Action Intent 队列"]
     QUEUE --> EXECUTOR["独立 Executor"]
     EXECUTOR --> WRITE["带版本条件的集群操作"]
     WRITE --> K8S
@@ -121,6 +122,7 @@ SentinelOps 给大模型加了几条硬限制：
 10. **写操作有持久身份**：配置数据库后，每个集群写操作会先保存不可变的 Action Intent。独立 Executor 只能领取一次；已经跨过写入分界但没有可信结果的操作会标记为未知并停止，不能在重启后自动重放。
 11. **重复告警只能创建一个事故**：多 API 副本通过 PostgreSQL 原子认领 `Alertmanager 来源 + fingerprint + startsAt`。resolved 后保留记录，迟到的旧 firing 不会重新开事故，上一轮 resolved 也不能关闭下一轮告警。
 12. **外部请求不能伪造告警**：生产环境拒绝匿名 Webhook。原生 Alertmanager 可以使用 Bearer Token；经过签名网关时也可以使用覆盖时间戳和原始请求体的 HMAC-SHA256。重复认证头、过期签名、压缩体和超大请求都会在解析告警前被拒绝。
+13. **Executor 只执行注册动作**：写工具还必须有对应的 Action Plugin。插件由服务端声明参数、最低风险、目标字段、审批方式、恢复验证方式和执行快照要求；只在提示词里出现、临时加入工具白名单或缺少完整快照的动作都不能进入 Kubernetes 后端。
 
 ## 快速运行：不需要 Kubernetes 和模型 Key
 
@@ -249,6 +251,21 @@ sentinelops-mcp
 ```
 
 MCP 不直接公开滚动重启、回滚或扩缩容。修复动作必须进入 SentinelOps 的事故流程，由服务端完成证据检查、风险审批和 fresh preflight 后才能调用 Kubernetes。
+
+## Action Plugin：如何安全增加一种修复能力
+
+Executor 并不负责解决所有 Kubernetes 故障。它只执行服务端 Action Catalog 中已经注册的动作。目前注册了滚动重启、精确版本回滚和限定范围扩缩容。
+
+一个新动作不能只加一段提示词或一个 Kubernetes 调用。它必须同时声明：
+
+- 模型允许填写哪些参数，以及哪个参数是事故目标；
+- 不能低报的最低风险；
+- 是否必须人工审批；
+- 是否可逆、是否具有破坏性；
+- 执行前必须绑定哪些 Deployment 和 revision 快照；
+- 执行后使用哪套恢复验证规则。
+
+Agent 规划、审批前检查、写入前检查和独立 Executor 会读取同一份合同。动作没有注册、被禁用、目标不属于当前事故、参数被替换或快照字段不完整时，都会在调用 Kubernetes 之前停止。这样可以逐步增加修复覆盖面，但不会因为给模型开放任意 Shell 而失去安全边界。
 
 ## Kubernetes 生产部署基线
 
@@ -987,6 +1004,7 @@ OIDC，把 Anchor 放到独立权限域，并使用 HTTPS 和正式 Secret。这
 
 ```text
 src/sentinelops/
+├── actions.py      # 可执行修复动作的 Action Plugin 合同与注册表
 ├── agent/          # Agent 执行流程、质量检查和风险策略
 ├── llm/            # 大模型接口和不同服务的适配代码
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图

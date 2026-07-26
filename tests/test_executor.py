@@ -34,6 +34,36 @@ class BlockingExecutorStore:
         await asyncio.Event().wait()
 
 
+def _execution_precondition(
+    action,
+) -> dict[str, object]:
+    precondition: dict[str, object] = {
+        "action_fingerprint": "approved-action",
+        "tool_name": action.tool_name,
+        "target": action.arguments["name"],
+        "namespace": "sentinelops-demo",
+        "deployment_uid": "deployment-uid",
+        "generation": 2,
+        "resource_version": "17",
+        "desired_replicas": 1,
+        "paused": False,
+        "current_revision": 2,
+        "current_replica_set_uid": "replica-set-uid",
+        "current_template_hash": "template-hash",
+        "current_replicas": 1,
+        "current_ready_replicas": 0,
+        "captured_at": "2099-07-26T00:00:00+00:00",
+        "expires_at": "2099-07-26T00:15:00+00:00",
+    }
+    if action.tool_name == "rollback_deployment":
+        precondition["rollback_target"] = {
+            "revision": action.arguments["revision"],
+            "replica_set_uid": "healthy-replica-set",
+            "health_proof": {"subject": "healthy-revision"},
+        }
+    return precondition
+
+
 async def _queued_intent(tmp_path, *, suffix: str = "a"):
     agent = build_agent(
         Settings(tool_backend="simulator", model_provider="rule_based")
@@ -73,7 +103,7 @@ async def _queued_intent(tmp_path, *, suffix: str = "a"):
         lease,
         idempotency_key=suffix * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition=_execution_precondition(record.approval.action),
     )
     await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
     return store, record, lease, intent
