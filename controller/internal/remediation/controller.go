@@ -10,6 +10,7 @@ import (
 	"time"
 
 	opsv1alpha1 "github.com/q741242673/sentinelops/controller/api/v1alpha1"
+	"github.com/q741242673/sentinelops/controller/internal/admissionintegrity"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -36,10 +37,13 @@ const (
 
 type Reconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	ControllerID string
-	Clock        func() time.Time
-	AfterWrite   func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
+	Scheme             *runtime.Scheme
+	ControllerID       string
+	Clock              func() time.Time
+	AfterWrite         func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
+	AdmissionIntegrity interface {
+		Check(context.Context) admissionintegrity.Result
+	}
 }
 
 type validationFailure struct {
@@ -103,6 +107,26 @@ func (r *Reconciler) Reconcile(
 	}
 	if failure != nil {
 		return ctrl.Result{}, r.finishFailure(ctx, remediation, failure)
+	}
+
+	if r.AdmissionIntegrity != nil {
+		integrity := r.AdmissionIntegrity.Check(ctx)
+		if !integrity.Healthy {
+			reason := "AdmissionIntegrityDrift"
+			if integrity.Unknown {
+				reason = "AdmissionIntegrityUnknown"
+			} else if integrity.Mode != admissionintegrity.ModeEnforced {
+				reason = "AdmissionFenceNotEnforced"
+			}
+			return ctrl.Result{}, r.finishFailure(
+				ctx,
+				remediation,
+				rejected(
+					reason,
+					"cluster admission integrity does not authorize automatic writes",
+				),
+			)
+		}
 	}
 
 	if err := r.markExecuting(ctx, remediation); err != nil {

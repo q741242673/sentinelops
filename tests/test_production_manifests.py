@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +59,21 @@ def test_production_yaml_resources_are_unique_and_do_not_commit_secrets() -> Non
 
     assert len(identities) == len(set(identities))
     assert all(item["kind"] != "Secret" for item in resources)
-    assert all(item["kind"] not in {"ClusterRole", "ClusterRoleBinding"} for item in resources)
+    cluster_resources = {
+        (item["kind"], item["metadata"]["name"])
+        for item in resources
+        if item["kind"] in {"ClusterRole", "ClusterRoleBinding"}
+    }
+    assert cluster_resources == {
+        (
+            "ClusterRole",
+            "sentinelops-remediation-controller-admission-integrity",
+        ),
+        (
+            "ClusterRoleBinding",
+            "sentinelops-remediation-controller-admission-integrity",
+        ),
+    }
 
 
 def test_runtime_configuration_fails_closed_for_production() -> None:
@@ -317,6 +332,7 @@ def test_rbac_keeps_api_readonly_and_controller_as_only_workload_writer() -> Non
         "sentinelremediations/status",
         "deployments",
         "replicasets",
+        "sentineladmissionguards",
     }
     assert any(
         set(rule["verbs"]) == {"get", "list", "watch", "update"}
@@ -435,6 +451,21 @@ def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None
         "allowedRemediationStatusWriters": [controller],
         "allowedRemediationDeleters": [],
     }
+    runtime = _resource(
+        "ConfigMap",
+        "sentinelops-runtime",
+        "sentinelops-system",
+    )["data"]
+    assert runtime["SENTINELOPS_ADMISSION_INTEGRITY_REQUIRED"] == "true"
+    assert runtime["SENTINELOPS_ADMISSION_POLICY_NAME"] == (
+        "sentinelops-workload-write-fence"
+    )
+    assert runtime["SENTINELOPS_ADMISSION_GOVERNANCE_POLICY_NAME"] == (
+        "sentinelops-admission-governance"
+    )
+    assert json.loads(
+        runtime["SENTINELOPS_ADMISSION_EXPECTED_GUARD_SPEC"]
+    ) == guard
 
     policy = _resource(
         "ValidatingAdmissionPolicy",
@@ -536,18 +567,102 @@ def test_admission_fence_denies_unlisted_workload_and_contract_writers() -> None
         "sentinelops-system",
     )
     assert manager_account["automountServiceAccountToken"] is False
+    integrity_role = _resource(
+        "ClusterRole",
+        "sentinelops-remediation-controller-admission-integrity",
+        None,
+    )
+    assert all(rule["verbs"] == ["get"] for rule in integrity_role["rules"])
+    assert all(rule["resourceNames"] for rule in integrity_role["rules"])
+    assert {
+        resource
+        for rule in integrity_role["rules"]
+        for resource in rule["resources"]
+    } == {
+        "customresourcedefinitions",
+        "namespaces",
+        "validatingadmissionpolicies",
+        "validatingadmissionpolicybindings",
+    }
+    integrity_binding = _resource(
+        "ClusterRoleBinding",
+        "sentinelops-remediation-controller-admission-integrity",
+        None,
+    )
+    assert integrity_binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "sentinelops-remediation-controller",
+            "namespace": "sentinelops-system",
+        }
+    ]
+    workload_role = _resource(
+        "Role",
+        "sentinelops-remediation-controller",
+        "sentinelops-workloads",
+    )
+    guard_rules = [
+        rule
+        for rule in workload_role["rules"]
+        if "sentineladmissionguards" in rule["resources"]
+    ]
+    assert guard_rules == [
+        {
+            "apiGroups": ["ops.sentinelops.io"],
+            "resources": ["sentineladmissionguards"],
+            "resourceNames": ["sentinelops-workload-write-fence"],
+            "verbs": ["get"],
+        }
+    ]
     assert all(
         "sentineladmissionguards" not in rule.get("resources", [])
         for resource in _resources()
         if resource["kind"] == "Role"
+        and resource["metadata"]["name"]
+        != "sentinelops-remediation-controller"
         for rule in resource["rules"]
     )
     assert all(
         "namespaces" not in rule.get("resources", [])
         for resource in _resources()
         if resource["kind"] in {"Role", "ClusterRole"}
+        and resource["metadata"]["name"]
+        != "sentinelops-remediation-controller-admission-integrity"
         for rule in resource["rules"]
     )
+
+    service = _resource(
+        "Service",
+        "sentinelops-remediation-controller",
+        "sentinelops-system",
+    )
+    assert service["spec"]["ports"][0]["name"] == "metrics"
+    service_monitor = _resource(
+        "ServiceMonitor",
+        "sentinelops-admission-integrity",
+        "sentinelops-system",
+    )
+    assert service_monitor["spec"]["endpoints"][0]["path"] == "/metrics"
+    prometheus_rule = _resource(
+        "PrometheusRule",
+        "sentinelops-admission-integrity",
+        "sentinelops-system",
+    )
+    expressions = [
+        rule["expr"]
+        for group in prometheus_rule["spec"]["groups"]
+        for rule in group["rules"]
+    ]
+    assert any(
+        "min(sentinelops_admission_integrity_healthy)" in item
+        for item in expressions
+    )
+    assert any(
+        "min(sentinelops_admission_integrity_last_check_timestamp_seconds)"
+        in item
+        for item in expressions
+    )
+    assert any("absent(" in item for item in expressions)
 
 
 def test_pdb_service_and_ingress_policy_match_deployments() -> None:

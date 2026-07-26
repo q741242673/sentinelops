@@ -91,6 +91,14 @@ async def wait_for_rollout(
 
 
 async def main() -> None:
+    expected_rejection = os.environ.get(
+        "SENTINELOPS_E2E_EXPECT_CONTROLLER_REJECTION",
+        "",
+    )
+    single_action = (
+        os.environ.get("SENTINELOPS_E2E_SINGLE_CONTROLLER_ACTION", "false")
+        == "true"
+    )
     backend = KubernetesBackend(NAMESPACE)
     rollout_result = await backend.call(
         "get_rollout_history",
@@ -161,6 +169,33 @@ async def main() -> None:
         result_timeout_seconds=30,
     )
     result = await gateway.execute(intent)
+    if expected_rejection:
+        if result.success or not str(result.error or "").startswith(
+            f"{expected_rejection}:"
+        ):
+            raise RuntimeError(
+                "Controller did not return the expected admission rejection: "
+                f"{result.model_dump(mode='json')}"
+            )
+        unchanged = backend.apps.read_namespaced_deployment(
+            DEPLOYMENT,
+            NAMESPACE,
+            _request_timeout=5,
+        )
+        if str(unchanged.metadata.resource_version) != str(
+            rollout["resource_version"]
+        ):
+            raise RuntimeError(
+                "admission rejection changed the Deployment resourceVersion"
+            )
+        print(
+            json.dumps(
+                result.model_dump(mode="json"),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     if not result.success:
         raise RuntimeError(result.error or "Controller rejected the E2E action")
     deployment = backend.apps.read_namespaced_deployment(
@@ -178,6 +213,15 @@ async def main() -> None:
         raise RuntimeError("restart template marker is missing")
 
     await wait_for_rollout(backend)
+    if single_action:
+        print(
+            json.dumps(
+                result.model_dump(mode="json"),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
     recovery_rollout_result = await backend.call(
         "get_rollout_history",
         {"name": DEPLOYMENT},

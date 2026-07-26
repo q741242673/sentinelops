@@ -12,6 +12,52 @@ rules:
     verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sentinelops-remediation-controller-admission-integrity
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+rules:
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicies"]
+    resourceNames:
+      - sentinelops-workload-write-fence
+      - sentinelops-admission-governance
+    verbs: ["get"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["validatingadmissionpolicybindings"]
+    resourceNames:
+      - sentinelops-workload-write-fence
+      - sentinelops-workload-write-fence-audit
+      - sentinelops-admission-governance
+    verbs: ["get"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    resourceNames:
+      - sentineladmissionguards.ops.sentinelops.io
+      - sentinelremediations.ops.sentinelops.io
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames: ["sentinelops-workloads"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sentinelops-remediation-controller-admission-integrity
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-remediation-controller
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sentinelops-remediation-controller-admission-integrity
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sentinelops-remediation-controller-leader-election
