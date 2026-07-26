@@ -413,6 +413,15 @@ func validateCRD(resource *unstructured.Unstructured, kind string) string {
 		actualKind != kind || plural != expectedPlural {
 		return "identity_changed"
 	}
+	conversion, ok, err := unstructured.NestedMap(
+		resource.Object,
+		"spec",
+		"conversion",
+	)
+	if err != nil || !ok || len(conversion) != 1 ||
+		conversion["strategy"] != "None" {
+		return "conversion_changed"
+	}
 	conditions, ok, err := unstructured.NestedSlice(
 		resource.Object,
 		"status",
@@ -444,7 +453,7 @@ func validateCRD(resource *unstructured.Unstructured, kind string) string {
 		return "stored_version_changed"
 	}
 	versions, ok, err := unstructured.NestedSlice(resource.Object, "spec", "versions")
-	if err != nil || !ok {
+	if err != nil || !ok || len(versions) != 1 {
 		return "version_missing"
 	}
 	for _, item := range versions {
@@ -492,21 +501,180 @@ func validateCRD(resource *unstructured.Unstructured, kind string) string {
 			return "schema_weakened"
 		}
 		if kind == "SentinelAdmissionGuard" {
-			specProperties, ok := spec["properties"].(map[string]any)
-			if !ok {
-				return "schema_weakened"
+			if reason := validateGuardSchema(spec, expected); reason != "" {
+				return reason
 			}
-			for field := range expected {
-				property, ok := specProperties[field].(map[string]any)
-				if !ok || property["type"] != "array" ||
-					property["x-kubernetes-list-type"] != "set" {
-					return "schema_weakened"
-				}
-			}
+		} else if reason := validateRemediationSchema(openAPI, spec); reason != "" {
+			return reason
 		}
 		return ""
 	}
 	return "version_missing"
+}
+
+func validateGuardSchema(
+	spec map[string]any,
+	expected map[string]struct{},
+) string {
+	specProperties, ok := spec["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	maxItems := map[string]int64{
+		"allowedDeploymentWriters":        32,
+		"allowedPolicyManagers":           16,
+		"allowedRemediationCreators":      16,
+		"allowedRemediationDeleters":      16,
+		"allowedRemediationStatusWriters": 16,
+	}
+	for field := range expected {
+		property, ok := specProperties[field].(map[string]any)
+		if !ok || property["type"] != "array" ||
+			property["x-kubernetes-list-type"] != "set" ||
+			property["maxItems"] != maxItems[field] {
+			return "schema_weakened"
+		}
+		if field == "allowedRemediationDeleters" {
+			if _, present := property["minItems"]; present {
+				return "schema_weakened"
+			}
+		} else if property["minItems"] != int64(1) {
+			return "schema_weakened"
+		}
+		items, ok := property["items"].(map[string]any)
+		if !ok || items["type"] != "string" ||
+			items["minLength"] != int64(3) ||
+			items["maxLength"] != int64(253) {
+			return "schema_weakened"
+		}
+	}
+	return ""
+}
+
+func validateRemediationSchema(
+	openAPI map[string]any,
+	spec map[string]any,
+) string {
+	if spec["type"] != "object" ||
+		spec["x-kubernetes-map-type"] != "atomic" {
+		return "schema_weakened"
+	}
+	if !sameValidationRules(
+		openAPI["x-kubernetes-validations"],
+		[]string{
+			"self.metadata.name == self.spec.actionId",
+		},
+	) || !sameValidationRules(
+		spec["x-kubernetes-validations"],
+		[]string{
+			"self == oldSelf",
+			"self.action.parameters.name == self.target.name",
+			"(self.action.plugin == 'rollback_deployment' && has(self.precondition.rollbackTarget) && self.precondition.rollbackTarget.revision == self.action.parameters.revision) || (self.action.plugin != 'rollback_deployment' && !has(self.precondition.rollbackTarget))",
+		},
+	) {
+		return "schema_weakened"
+	}
+	specProperties, ok := spec["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	action, ok := specProperties["action"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	actionProperties, ok := action["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	plugin, ok := actionProperties["plugin"].(map[string]any)
+	if !ok || !sameStringSlice(
+		plugin["enum"],
+		[]string{
+			"restart_deployment",
+			"rollback_deployment",
+			"scale_deployment",
+		},
+	) {
+		return "schema_weakened"
+	}
+	authorization, ok := specProperties["authorization"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	authorizationProperties, ok := authorization["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	decision, ok := authorizationProperties["decision"].(map[string]any)
+	if !ok || !sameStringSlice(
+		decision["enum"],
+		[]string{"human_approval", "risk_policy"},
+	) {
+		return "schema_weakened"
+	}
+	openAPIProperties, ok := openAPI["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	status, ok := openAPIProperties["status"].(map[string]any)
+	if !ok || status["type"] != "object" ||
+		!sameValidationRules(
+			status["x-kubernetes-validations"],
+			[]string{
+				"!has(oldSelf.phase) || !(oldSelf.phase in ['Succeeded', 'Failed', 'Rejected', 'Stale', 'Cancelled']) || self == oldSelf",
+				"!has(oldSelf.observedGeneration) || !has(self.observedGeneration) || self.observedGeneration >= oldSelf.observedGeneration",
+			},
+		) {
+		return "schema_weakened"
+	}
+	statusProperties, ok := status["properties"].(map[string]any)
+	if !ok {
+		return "schema_weakened"
+	}
+	phase, ok := statusProperties["phase"].(map[string]any)
+	if !ok || !sameStringSlice(
+		phase["enum"],
+		[]string{
+			"Cancelled",
+			"Claimed",
+			"Executing",
+			"Failed",
+			"Pending",
+			"Rejected",
+			"Stale",
+			"Succeeded",
+			"Unknown",
+		},
+	) {
+		return "schema_weakened"
+	}
+	return ""
+}
+
+func sameValidationRules(raw any, expected []string) bool {
+	items, ok := raw.([]any)
+	if !ok || len(items) != len(expected) {
+		return false
+	}
+	actual := make([]string, 0, len(items))
+	for _, item := range items {
+		validation, ok := item.(map[string]any)
+		if !ok {
+			return false
+		}
+		rule, ok := validation["rule"].(string)
+		if !ok {
+			return false
+		}
+		actual = append(actual, compact(rule))
+	}
+	wanted := make([]string, 0, len(expected))
+	for _, rule := range expected {
+		wanted = append(wanted, compact(rule))
+	}
+	sort.Strings(actual)
+	sort.Strings(wanted)
+	return strings.Join(actual, "\x00") == strings.Join(wanted, "\x00")
 }
 
 func validateWorkloadPolicy(resource *unstructured.Unstructured) string {
@@ -519,6 +687,9 @@ func validateWorkloadPolicy(resource *unstructured.Unstructured) string {
 	}
 	if spec["failurePolicy"] != "Fail" || !validParamKind(spec) {
 		return "fail_closed_contract_changed"
+	}
+	if !validPolicyMatchFilters(spec) {
+		return "match_filters_changed"
 	}
 	expectedVariables := map[string]string{
 		"isDeployment":  "request.resource.group == 'apps' && request.resource.resource == 'deployments'",
@@ -556,6 +727,9 @@ func validateGovernancePolicy(resource *unstructured.Unstructured) string {
 	if spec["failurePolicy"] != "Fail" || !validParamKind(spec) {
 		return "fail_closed_contract_changed"
 	}
+	if !validPolicyMatchFilters(spec) {
+		return "match_filters_changed"
+	}
 	expectedVariables := map[string]string{
 		"isGuard":       "request.resource.group == 'ops.sentinelops.io' && request.resource.resource == 'sentineladmissionguards'",
 		"isNamespace":   "request.resource.group == '' && request.resource.resource == 'namespaces'",
@@ -590,6 +764,14 @@ func validatePolicyStatus(resource *unstructured.Unstructured) string {
 	if err != nil || !ok || observed != generation {
 		return "generation_not_observed"
 	}
+	typeChecking, ok, err := unstructured.NestedMap(
+		resource.Object,
+		"status",
+		"typeChecking",
+	)
+	if err != nil || !ok {
+		return "type_checking_not_complete"
+	}
 	warnings, ok, err := unstructured.NestedSlice(
 		resource.Object,
 		"status",
@@ -599,7 +781,37 @@ func validatePolicyStatus(resource *unstructured.Unstructured) string {
 	if err != nil || (ok && len(warnings) > 0) {
 		return "expression_warning"
 	}
+	_ = typeChecking
+	conditions, ok, err := unstructured.NestedSlice(
+		resource.Object,
+		"status",
+		"conditions",
+	)
+	if err != nil {
+		return "condition_not_accepted"
+	}
+	if ok {
+		for _, item := range conditions {
+			condition, valid := item.(map[string]any)
+			if !valid || condition["status"] != "True" {
+				return "condition_not_accepted"
+			}
+		}
+	}
 	return ""
+}
+
+func validPolicyMatchFilters(spec map[string]any) bool {
+	if !emptyList(spec["matchConditions"]) {
+		return false
+	}
+	constraints, ok := spec["matchConstraints"].(map[string]any)
+	if !ok {
+		return false
+	}
+	return emptyList(constraints["excludeResourceRules"]) &&
+		emptyLabelSelector(constraints["namespaceSelector"]) &&
+		emptyLabelSelector(constraints["objectSelector"])
 }
 
 func validParamKind(spec map[string]any) bool {
@@ -631,23 +843,80 @@ func validateBinding(
 		paramRef["parameterNotFoundAction"] != "Deny" {
 		return "parameter_reference_changed"
 	}
-	matchResources, _ := spec["matchResources"].(map[string]any)
-	namespaceSelector, _ := matchResources["namespaceSelector"].(map[string]any)
-	matchLabels, _ := namespaceSelector["matchLabels"].(map[string]any)
-	if selector == nil {
-		if len(matchLabels) != 0 {
-			return "namespace_selector_changed"
-		}
-		return ""
-	}
-	expected := map[string]any{}
-	for key, value := range selector {
-		expected[key] = value
-	}
-	if !equalJSON(matchLabels, expected) {
-		return "namespace_selector_changed"
+	if !validBindingMatchResources(spec["matchResources"], selector) {
+		return "match_resources_changed"
 	}
 	return ""
+}
+
+func validBindingMatchResources(
+	raw any,
+	selector map[string]string,
+) bool {
+	if selector == nil {
+		matchResources, ok := raw.(map[string]any)
+		return raw == nil || (ok && len(matchResources) == 0)
+	}
+	matchResources, ok := raw.(map[string]any)
+	if !ok || matchResources["matchPolicy"] != "Equivalent" ||
+		!emptyList(matchResources["resourceRules"]) ||
+		!emptyList(matchResources["excludeResourceRules"]) ||
+		!emptyLabelSelector(matchResources["objectSelector"]) {
+		return false
+	}
+	expectedLabels := make(map[string]any, len(selector))
+	for key, value := range selector {
+		expectedLabels[key] = value
+	}
+	return exactLabelSelector(
+		matchResources["namespaceSelector"],
+		expectedLabels,
+	)
+}
+
+func exactLabelSelector(raw any, expectedLabels map[string]any) bool {
+	selector, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	for key := range selector {
+		if key != "matchLabels" && key != "matchExpressions" {
+			return false
+		}
+	}
+	matchLabels, ok := selector["matchLabels"].(map[string]any)
+	if !ok || !equalJSON(matchLabels, expectedLabels) {
+		return false
+	}
+	return emptyList(selector["matchExpressions"])
+}
+
+func emptyLabelSelector(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	selector, ok := raw.(map[string]any)
+	if !ok {
+		return false
+	}
+	for key := range selector {
+		if key != "matchLabels" && key != "matchExpressions" {
+			return false
+		}
+	}
+	matchLabels, labelsOK := selector["matchLabels"].(map[string]any)
+	if selector["matchLabels"] != nil && !labelsOK {
+		return false
+	}
+	return len(matchLabels) == 0 && emptyList(selector["matchExpressions"])
+}
+
+func emptyList(raw any) bool {
+	if raw == nil {
+		return true
+	}
+	items, ok := raw.([]any)
+	return ok && len(items) == 0
 }
 
 type ruleContract struct {

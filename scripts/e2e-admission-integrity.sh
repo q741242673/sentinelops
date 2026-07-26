@@ -15,9 +15,36 @@ restore_policy() {
     -e "s/namespace: sentinelops-workloads/namespace: ${NAMESPACE}/g" \
     "${ROOT_DIR}/deploy/production/admission/workload-write-fence.yaml" \
     | kubectl apply -f - >/dev/null 2>&1 || true
+  kubectl patch validatingadmissionpolicy "${POLICY_NAME}" \
+    --type merge \
+    --patch '{"spec":{"matchConditions":null}}' \
+    >/dev/null 2>&1 || true
+}
+wait_policy_observed() {
+  local policy="$1"
+  local generation
+  generation="$(
+    kubectl get validatingadmissionpolicy "${policy}" \
+      -o jsonpath='{.metadata.generation}'
+  )"
+  kubectl wait \
+    --for=jsonpath='{.status.observedGeneration}'="${generation}" \
+    "validatingadmissionpolicy/${policy}" \
+    --timeout=60s
 }
 cleanup() {
   restore_policy
+  kubectl set env \
+    --namespace sentinelops-system \
+    "deployment/${CONTROLLER_DEPLOYMENT}" \
+    SENTINELOPS_ADMISSION_INTEGRITY_REQUIRED- \
+    SENTINELOPS_ADMISSION_POLICY_NAME- \
+    SENTINELOPS_ADMISSION_GOVERNANCE_POLICY_NAME- \
+    SENTINELOPS_ADMISSION_GUARD_NAME- \
+    SENTINELOPS_ADMISSION_REQUEST_TIMEOUT- \
+    SENTINELOPS_ADMISSION_RECONCILE_INTERVAL- \
+    SENTINELOPS_ADMISSION_EXPECTED_GUARD_SPEC- \
+    >/dev/null 2>&1 || true
   kubectl label namespace "${NAMESPACE}" \
     sentinelops.io/admission-audit- \
     sentinelops.io/admission-protected- \
@@ -51,22 +78,17 @@ kubectl rollout status \
   "deployment/${TARGET_DEPLOYMENT}" \
   --namespace "${NAMESPACE}" \
   --timeout=120s
-kubectl label namespace "${NAMESPACE}" \
-  sentinelops.io/admission-audit- \
-  sentinelops.io/admission-protected=true \
-  --overwrite
-restore_policy
-kubectl wait \
-  --for=jsonpath='{.status.observedGeneration}'=1 \
-  "validatingadmissionpolicy/${POLICY_NAME}" \
-  --timeout=60s
 kubectl create clusterrolebinding "${E2E_ADMIN_BINDING}" \
   --clusterrole=cluster-admin \
   --serviceaccount=sentinelops-system:sentinelops-admission-admin
-kubectl wait \
-  --for=jsonpath='{.status.observedGeneration}'=1 \
-  validatingadmissionpolicy/sentinelops-admission-governance \
-  --timeout=60s
+kubectl label namespace "${NAMESPACE}" \
+  sentinelops.io/admission-audit- \
+  sentinelops.io/admission-protected=true \
+  --overwrite \
+  --as "${POLICY_MANAGER}"
+restore_policy
+wait_policy_observed "${POLICY_NAME}"
+wait_policy_observed sentinelops-admission-governance
 
 sed \
   -e "s/namespace: sentinelops-workloads/namespace: ${NAMESPACE}/g" \
@@ -106,6 +128,17 @@ SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
 SENTINELOPS_E2E_SINGLE_CONTROLLER_ACTION=true \
 SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
   "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
+
+kubectl patch validatingadmissionpolicy "${POLICY_NAME}" \
+  --type merge \
+  --patch '{"spec":{"matchConditions":[{"name":"skip-all","expression":"false"}]}}'
+wait_policy_observed "${POLICY_NAME}"
+SENTINELOPS_E2E_EXECUTOR_TOKEN="${executor_token}" \
+SENTINELOPS_E2E_EXPECT_CONTROLLER_REJECTION=AdmissionIntegrityDrift \
+SENTINELOPS_E2E_DEPLOYMENT="${TARGET_DEPLOYMENT}" \
+  "${PYTHON}" "${ROOT_DIR}/scripts/e2e-remediation-controller.py"
+restore_policy
+wait_policy_observed "${POLICY_NAME}"
 
 kubectl label namespace "${NAMESPACE}" \
   sentinelops.io/admission-protected- \

@@ -109,7 +109,9 @@ func (r *Reconciler) Reconcile(
 
 	if r.AdmissionIntegrity != nil {
 		integrity := r.AdmissionIntegrity(ctx)
-		if !integrity.Healthy {
+		if !integrity.Healthy ||
+			integrity.Unknown ||
+			integrity.Mode != admissionintegrity.ModeEnforced {
 			reason := "AdmissionIntegrityDrift"
 			if integrity.Unknown {
 				reason = "AdmissionIntegrityUnknown"
@@ -125,6 +127,13 @@ func (r *Reconciler) Reconcile(
 				),
 			)
 		}
+	}
+
+	// The live admission preflight can take long enough for the execution
+	// fence to expire. Re-read the clock at the final write boundary instead
+	// of relying on the earlier static validation.
+	if failure := r.validateFenceFresh(remediation); failure != nil {
+		return ctrl.Result{}, r.finishFailure(ctx, remediation, failure)
 	}
 
 	if err := r.markExecuting(ctx, remediation); err != nil {
@@ -155,10 +164,6 @@ func (r *Reconciler) Reconcile(
 func (r *Reconciler) validateStatic(
 	remediation *opsv1alpha1.SentinelRemediation,
 ) *validationFailure {
-	now := time.Now().UTC()
-	if r.Clock != nil {
-		now = r.Clock().UTC()
-	}
 	spec := remediation.Spec
 	if remediation.Name != spec.ActionID {
 		return rejected("ActionIdentityMismatch", "metadata.name does not match actionId")
@@ -169,8 +174,8 @@ func (r *Reconciler) validateStatic(
 	if spec.Target.APIVersion != "apps/v1" || spec.Target.Kind != "Deployment" {
 		return rejected("UnsupportedTarget", "only apps/v1 Deployment targets are supported")
 	}
-	if !spec.Fence.ExpiresAt.Time.After(now) {
-		return stale("FenceExpired", "execution fence has expired")
+	if failure := r.validateFenceFresh(remediation); failure != nil {
+		return failure
 	}
 	if spec.Fence.Generation != spec.Precondition.Generation {
 		return rejected(
@@ -196,6 +201,15 @@ func (r *Reconciler) validateStatic(
 	}
 	if failure := validateAuthorization(spec); failure != nil {
 		return failure
+	}
+	return nil
+}
+
+func (r *Reconciler) validateFenceFresh(
+	remediation *opsv1alpha1.SentinelRemediation,
+) *validationFailure {
+	if !remediation.Spec.Fence.ExpiresAt.Time.After(r.now()) {
+		return stale("FenceExpired", "execution fence has expired")
 	}
 	return nil
 }

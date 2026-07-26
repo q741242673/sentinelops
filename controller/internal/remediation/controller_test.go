@@ -180,6 +180,81 @@ func TestHealthyAdmissionIntegrityAllowsRegisteredWrite(t *testing.T) {
 	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
 }
 
+func TestAdmissionIntegrityPermitIsExplicitlyFailClosed(t *testing.T) {
+	tests := []struct {
+		name       string
+		result     admissionintegrity.Result
+		wantReason string
+	}{
+		{
+			name: "healthy audit mode",
+			result: admissionintegrity.Result{
+				Healthy: true,
+				Mode:    admissionintegrity.ModeAudit,
+			},
+			wantReason: "AdmissionFenceNotEnforced",
+		},
+		{
+			name: "healthy unknown result",
+			result: admissionintegrity.Result{
+				Healthy: true,
+				Unknown: true,
+				Mode:    admissionintegrity.ModeEnforced,
+			},
+			wantReason: "AdmissionIntegrityUnknown",
+		},
+		{
+			name:       "zero value result",
+			result:     admissionintegrity.Result{},
+			wantReason: "AdmissionFenceNotEnforced",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reconciler, kubeClient, remediation := newTestReconciler(
+				t,
+				ActionRestart,
+				nil,
+			)
+			checker := &fixedIntegrityChecker{result: test.result}
+			reconciler.AdmissionIntegrity = checker.Check
+
+			reconcileOnce(t, reconciler, remediation)
+
+			assertPhase(
+				t,
+				kubeClient,
+				remediation,
+				PhaseRejected,
+				test.wantReason,
+			)
+			assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+		})
+	}
+}
+
+func TestFenceExpiringDuringAdmissionPreflightCannotWrite(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	now := mustTime(t)
+	reconciler.Clock = func() time.Time { return now }
+	reconciler.AdmissionIntegrity = func(context.Context) admissionintegrity.Result {
+		now = remediation.Spec.Fence.ExpiresAt.Time.Add(time.Second)
+		return admissionintegrity.Result{
+			Healthy: true,
+			Mode:    admissionintegrity.ModeEnforced,
+		}
+	}
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseStale, "FenceExpired")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
 func TestDisabledAdmissionIntegrityLeavesRegisteredWriteEnabled(t *testing.T) {
 	reconciler, kubeClient, remediation := newTestReconciler(
 		t,
