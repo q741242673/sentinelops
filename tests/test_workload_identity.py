@@ -4,8 +4,10 @@ import base64
 import gzip
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import jwt
 import pytest
@@ -13,7 +15,10 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from sentinelops.workload_identity import WorkloadIdentityAuthenticator
+from sentinelops.workload_identity import (
+    MAX_JWKS_BYTES,
+    WorkloadIdentityAuthenticator,
+)
 
 ISSUER_A = "https://cluster-a.example.test"
 ISSUER_B = "https://cluster-b.example.test"
@@ -25,6 +30,9 @@ SA_UID_A = "11111111-1111-1111-1111-111111111111"
 SA_UID_B = "22222222-2222-2222-2222-222222222222"
 POD_UID_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 POD_UID_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+REVIEWER_TOKEN = "token-reviewer-test-token"
+REVIEWER_TOKEN_FILE = Path("/tmp/sentinelops-workload-reviewer-token")
+TOKEN_REVIEW_CA_FILE = Path("/tmp/sentinelops-workload-token-review-ca.pem")
 
 
 def _base64url(value: int) -> str:
@@ -59,6 +67,11 @@ def _bundle() -> bytes:
                     "namespace": NAMESPACE,
                     "service_account": SERVICE_ACCOUNT,
                     "service_account_uid": SA_UID_A,
+                    "token_review_url": (
+                        f"{ISSUER_A}/apis/authentication.k8s.io/v1/tokenreviews"
+                    ),
+                    "reviewer_token_file": str(REVIEWER_TOKEN_FILE),
+                    "token_review_ca_file": str(TOKEN_REVIEW_CA_FILE),
                     "allowed_capabilities": [
                         "action.execute",
                         "action.reconcile",
@@ -74,6 +87,11 @@ def _bundle() -> bytes:
                     "namespace": NAMESPACE,
                     "service_account": SERVICE_ACCOUNT,
                     "service_account_uid": SA_UID_B,
+                    "token_review_url": (
+                        f"{ISSUER_B}/apis/authentication.k8s.io/v1/tokenreviews"
+                    ),
+                    "reviewer_token_file": str(REVIEWER_TOKEN_FILE),
+                    "token_review_ca_file": str(TOKEN_REVIEW_CA_FILE),
                     "allowed_capabilities": ["action.execute"],
                 },
             ]
@@ -152,8 +170,39 @@ def _client(
     keys_by_host: dict[str, list[dict[str, object]]],
     *,
     headers: dict[str, str] | None = None,
+    token_review_handler: Any | None = None,
 ) -> httpx.AsyncClient:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tokenreviews"):
+            if token_review_handler is not None:
+                return token_review_handler(request)
+            assert request.headers["authorization"] == f"Bearer {REVIEWER_TOKEN}"
+            review = json.loads(request.content)
+            assert review["spec"]["audiences"] == [AUDIENCE]
+            service_account_uid = (
+                SA_UID_B
+                if request.url.host == "cluster-b.example.test"
+                else SA_UID_A
+            )
+            return httpx.Response(
+                201,
+                json={
+                    "apiVersion": "authentication.k8s.io/v1",
+                    "kind": "TokenReview",
+                    "status": {
+                        "authenticated": True,
+                        "audiences": [AUDIENCE],
+                        "user": {
+                            "username": (
+                                f"system:serviceaccount:{NAMESPACE}:"
+                                f"{SERVICE_ACCOUNT}"
+                            ),
+                            "uid": service_account_uid,
+                        },
+                    },
+                },
+                headers={"Content-Type": "application/json"},
+            )
         keys = keys_by_host.get(request.url.host or "", [])
         return httpx.Response(
             200,
@@ -170,6 +219,10 @@ async def _authenticator(
     client: httpx.AsyncClient | None = None,
     **kwargs: Any,
 ) -> tuple[WorkloadIdentityAuthenticator, httpx.AsyncClient]:
+    await anyio.Path(REVIEWER_TOKEN_FILE).write_text(
+        REVIEWER_TOKEN,
+        encoding="ascii",
+    )
     client = client or _client(
         {
             "cluster-a.example.test": [_rsa_jwk(private_key)],
@@ -444,6 +497,24 @@ async def test_unknown_kid_triggers_safe_jwks_rotation_refresh() -> None:
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal requests
+        if _request.url.path.endswith("/tokenreviews"):
+            return httpx.Response(
+                200,
+                json={
+                    "status": {
+                        "authenticated": True,
+                        "audiences": [AUDIENCE],
+                        "user": {
+                            "username": (
+                                f"system:serviceaccount:{NAMESPACE}:"
+                                f"{SERVICE_ACCOUNT}"
+                            ),
+                            "uid": SA_UID_A,
+                        },
+                    }
+                },
+                headers={"Content-Type": "application/json"},
+            )
         requests += 1
         keys = [_rsa_jwk(old_key)] if requests == 1 else [
             _rsa_jwk(old_key),
@@ -473,6 +544,228 @@ async def test_unknown_kid_triggers_safe_jwks_rotation_refresh() -> None:
     assert requests == 2
 
 
+@pytest.mark.asyncio
+async def test_token_review_is_not_cached_and_revoked_pod_token_fails_closed() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    reviews = 0
+
+    def review(request: httpx.Request) -> httpx.Response:
+        nonlocal reviews
+        reviews += 1
+        authenticated = reviews == 1
+        return httpx.Response(
+            200,
+            json={
+                "status": {
+                    "authenticated": authenticated,
+                    **(
+                        {
+                            "audiences": [AUDIENCE],
+                            "user": {
+                                "username": (
+                                    f"system:serviceaccount:{NAMESPACE}:"
+                                    f"{SERVICE_ACCOUNT}"
+                                ),
+                                "uid": SA_UID_A,
+                            },
+                        }
+                        if authenticated
+                        else {}
+                    ),
+                }
+            },
+            headers={"Content-Type": "application/json"},
+        )
+
+    client = _client(
+        {
+            "cluster-a.example.test": [_rsa_jwk(private_key)],
+            "cluster-b.example.test": [_rsa_jwk(private_key)],
+        },
+        token_review_handler=review,
+    )
+    authenticator, _ = await _authenticator(private_key, client=client)
+    token = _token(private_key)
+    try:
+        await authenticator.authenticate(_request(token))
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(token))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 401
+    assert reviews == 2
+
+
+@pytest.mark.asyncio
+async def test_token_review_maps_kubernetes_invalidated_token_error_to_unauthorized() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client = _client(
+        {
+            "cluster-a.example.test": [_rsa_jwk(private_key)],
+            "cluster-b.example.test": [_rsa_jwk(private_key)],
+        },
+        token_review_handler=lambda _request: httpx.Response(
+            201,
+            json={
+                "status": {
+                    "user": {},
+                    "error": (
+                        "invalid bearer token, service account token "
+                        "has been invalidated"
+                    ),
+                }
+            },
+            headers={"Content-Type": "application/json"},
+        ),
+    )
+    authenticator, _ = await _authenticator(private_key, client=client)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(_token(private_key)))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_token_review_unavailable_fails_closed() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client = _client(
+        {
+            "cluster-a.example.test": [_rsa_jwk(private_key)],
+            "cluster-b.example.test": [_rsa_jwk(private_key)],
+        },
+        token_review_handler=lambda _request: httpx.Response(
+            503,
+            headers={"Content-Type": "application/json"},
+        ),
+    )
+    authenticator, _ = await _authenticator(private_key, client=client)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(_token(private_key)))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_token_review_timeout_fails_closed() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("token review timed out", request=request)
+
+    client = _client(
+        {
+            "cluster-a.example.test": [_rsa_jwk(private_key)],
+            "cluster-b.example.test": [_rsa_jwk(private_key)],
+        },
+        token_review_handler=timeout,
+    )
+    authenticator, _ = await _authenticator(private_key, client=client)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(_token(private_key)))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [
+        {
+            "authenticated": True,
+            "audiences": ["another-audience"],
+            "user": {
+                "username": (
+                    f"system:serviceaccount:{NAMESPACE}:{SERVICE_ACCOUNT}"
+                ),
+                "uid": SA_UID_A,
+            },
+        },
+        {
+            "authenticated": True,
+            "audiences": [AUDIENCE],
+            "user": {
+                "username": (
+                    f"system:serviceaccount:{NAMESPACE}:another-account"
+                ),
+                "uid": SA_UID_A,
+            },
+        },
+    ],
+)
+async def test_token_review_rejects_wrong_audience_or_username(
+    status: dict[str, object],
+) -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    client = _client(
+        {
+            "cluster-a.example.test": [_rsa_jwk(private_key)],
+            "cluster-b.example.test": [_rsa_jwk(private_key)],
+        },
+        token_review_handler=lambda _request: httpx.Response(
+            200,
+            json={"status": status},
+            headers={"Content-Type": "application/json"},
+        ),
+    )
+    authenticator, _ = await _authenticator(private_key, client=client)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(_token(private_key)))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_oversized_jwks_stream_is_stopped_before_full_buffering() -> None:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    class OversizedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.chunks_yielded = 0
+
+        async def __aiter__(self):
+            for chunk in (
+                b"x" * MAX_JWKS_BYTES,
+                b"x",
+                b"must-not-be-read",
+            ):
+                self.chunks_yielded += 1
+                yield chunk
+
+    stream = OversizedStream()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert not request.url.path.endswith("/tokenreviews")
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=stream,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    authenticator, _ = await _authenticator(private_key, client=client)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await authenticator.authenticate(_request(_token(private_key)))
+    finally:
+        await client.aclose()
+
+    assert exc_info.value.status_code == 503
+    assert stream.chunks_yielded == 2
+
+
 def test_trust_bundle_is_strict_and_production_requires_https(tmp_path) -> None:
     insecure = json.loads(_bundle())
     insecure["clusters"][0]["issuer"] = "http://cluster-a.example.test"
@@ -482,6 +775,22 @@ def test_trust_bundle_is_strict_and_production_requires_https(tmp_path) -> None:
     with pytest.raises(ValueError, match="安全"):
         WorkloadIdentityAuthenticator.from_file(
             bundle_path,
+            production=True,
+        )
+
+
+def test_production_trust_requires_token_review_file_paths() -> None:
+    payload = json.loads(_bundle())
+    for key in (
+        "token_review_url",
+        "reviewer_token_file",
+        "token_review_ca_file",
+    ):
+        payload["clusters"][0].pop(key)
+
+    with pytest.raises(ValueError, match="字段不完整"):
+        WorkloadIdentityAuthenticator.from_json(
+            json.dumps(payload),
             production=True,
         )
 

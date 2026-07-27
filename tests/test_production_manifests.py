@@ -67,6 +67,14 @@ def test_production_yaml_resources_are_unique_and_do_not_commit_secrets() -> Non
     assert cluster_resources == {
         (
             "ClusterRole",
+            "sentinelops-api-token-review",
+        ),
+        (
+            "ClusterRoleBinding",
+            "sentinelops-api-token-review",
+        ),
+        (
+            "ClusterRole",
             "sentinelops-remediation-controller-admission-integrity",
         ),
         (
@@ -74,6 +82,30 @@ def test_production_yaml_resources_are_unique_and_do_not_commit_secrets() -> Non
             "sentinelops-remediation-controller-admission-integrity",
         ),
     }
+    token_review_role = _resource(
+        "ClusterRole",
+        "sentinelops-api-token-review",
+        None,
+    )
+    assert token_review_role["rules"] == [
+        {
+            "apiGroups": ["authentication.k8s.io"],
+            "resources": ["tokenreviews"],
+            "verbs": ["create"],
+        }
+    ]
+    token_review_binding = _resource(
+        "ClusterRoleBinding",
+        "sentinelops-api-token-review",
+        None,
+    )
+    assert token_review_binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "sentinelops-api",
+            "namespace": "sentinelops-system",
+        }
+    ]
 
 
 def test_runtime_configuration_fails_closed_for_production() -> None:
@@ -163,6 +195,16 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     assert trusted_cluster["audience"] == "sentinelops-control-gateway"
     assert trusted_cluster["issuer"].startswith("https://")
     assert trusted_cluster["jwks_url"].startswith("https://")
+    assert trusted_cluster["token_review_url"] == (
+        "https://kubernetes.default.svc/"
+        "apis/authentication.k8s.io/v1/tokenreviews"
+    )
+    assert trusted_cluster["reviewer_token_file"] == (
+        "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    )
+    assert trusted_cluster["token_review_ca_file"] == (
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    )
     assert "action.execute" in trusted_cluster["allowed_capabilities"]
     assert anchor["SENTINELOPS_AUDIT_ANCHOR_URL"].startswith("https://")
     assert anchor["SENTINELOPS_AUDIT_ANCHOR_INVENTORY_URL"].startswith(

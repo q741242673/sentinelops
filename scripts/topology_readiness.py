@@ -768,6 +768,47 @@ async def _executor_identity_boundary(context: str) -> tuple[bool, bool]:
     return no_control_plane_secrets, projected_identity
 
 
+async def _workload_token_revocation_checks(
+    client: httpx.AsyncClient,
+    api_url: str,
+    *,
+    revoked_token: str,
+    current_token: str,
+) -> tuple[bool, bool]:
+    endpoint = (
+        f"{api_url}/internal/v1/executor/clusters/kind-topology-e2e"
+    )
+    body = {
+        "cluster_id": "kind-topology-e2e",
+        "display_name": "Kind 拓扑验收集群",
+        "default_namespace": "sentinelops-demo",
+    }
+    common_headers = {"X-SentinelOps-Cluster-ID": "kind-topology-e2e"}
+    revoked_status = 0
+    for _ in range(60):
+        revoked = await client.put(
+            endpoint,
+            headers={
+                **common_headers,
+                "Authorization": f"Bearer {revoked_token}",
+            },
+            json=body,
+        )
+        revoked_status = revoked.status_code
+        if revoked_status == 401:
+            break
+        await asyncio.sleep(1)
+    current = await client.put(
+        endpoint,
+        headers={
+            **common_headers,
+            "Authorization": f"Bearer {current_token}",
+        },
+        json=body,
+    )
+    return revoked_status == 401, current.status_code == 200
+
+
 def _evidence_sources(record: dict[str, Any]) -> list[str]:
     diagnosis = record.get("diagnosis") or {}
     return sorted(
@@ -937,6 +978,8 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
     viewer_token: str | None = None
     approver_token: str | None = None
     invalid_token: str | None = None
+    revoked_workload_token: str | None = None
+    current_workload_token: str | None = None
     anchor_inventory_token: str | None = None
     anchor_public_keys = None
     stop = asyncio.Event()
@@ -958,6 +1001,14 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
             invalid_token = _read_required_secret(
                 args.invalid_token_file,
                 "invalid token",
+            )
+            revoked_workload_token = _read_required_secret(
+                args.revoked_workload_token_file,
+                "revoked workload token",
+            )
+            current_workload_token = _read_required_secret(
+                args.current_workload_token_file,
+                "current workload token",
             )
             anchor_inventory_token = _read_required_secret(
                 args.anchor_inventory_token_file,
@@ -1004,6 +1055,17 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                 checks["executor_uses_projected_workload_identity"],
             ) = await _executor_identity_boundary(args.context)
             if args.security_e2e:
+                assert revoked_workload_token is not None
+                assert current_workload_token is not None
+                (
+                    checks["deleted_pod_workload_token_rejected"],
+                    checks["replacement_pod_workload_token_accepted"],
+                ) = await _workload_token_revocation_checks(
+                    client,
+                    args.api_url[0],
+                    revoked_token=revoked_workload_token,
+                    current_token=current_workload_token,
+                )
                 publisher_pods = await _ready_pod_names(
                     args.context,
                     "sentinelops-system",
@@ -1783,6 +1845,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--viewer-token-file", type=Path)
     parser.add_argument("--approver-token-file", type=Path)
     parser.add_argument("--invalid-token-file", type=Path)
+    parser.add_argument("--revoked-workload-token-file", type=Path)
+    parser.add_argument("--current-workload-token-file", type=Path)
     parser.add_argument(
         "--anchor-url",
         default="http://127.0.0.1:18200",

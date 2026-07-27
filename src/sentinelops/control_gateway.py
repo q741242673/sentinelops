@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sentinelops.domain import ToolResult
 from sentinelops.executor_control import EXECUTOR_CONTROL_PREFIX
@@ -31,6 +32,139 @@ _TOOL_RESULT = TypeAdapter(ToolResult)
 
 StoreProvider = Callable[[], IncidentStore | None]
 AuthenticatorProvider = Callable[[], WorkloadIdentityAuthenticator | None]
+
+EXECUTOR_CONTROL_MAX_BODY_BYTES = 1_048_576
+
+
+class ExecutorControlBodyLimitMiddleware:
+    """Bound Executor control request bodies before parsing or authentication."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int = EXECUTOR_CONTROL_MAX_BODY_BYTES,
+    ) -> None:
+        if max_body_bytes <= 0:
+            raise ValueError("Executor control request body limit must be positive")
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or not self._is_executor_control_path(scope):
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            content_length = self._content_length(scope)
+        except ValueError:
+            await self._respond(
+                scope,
+                receive,
+                send,
+                status_code=400,
+                detail="Invalid Content-Length header",
+            )
+            return
+        if (
+            content_length is not None
+            and content_length > self.max_body_bytes
+        ):
+            await self._respond(
+                scope,
+                receive,
+                send,
+                status_code=413,
+                detail="Executor control request body is too large",
+            )
+            return
+
+        buffered: list[Message] = []
+        received_bytes = 0
+        while True:
+            message = await receive()
+            buffered.append(message)
+            if message["type"] == "http.disconnect":
+                break
+            if message["type"] != "http.request":
+                continue
+            received_bytes += len(message.get("body", b""))
+            if received_bytes > self.max_body_bytes:
+                await self._respond(
+                    scope,
+                    receive,
+                    send,
+                    status_code=413,
+                    detail="Executor control request body is too large",
+                )
+                return
+            if not message.get("more_body", False):
+                break
+
+        buffered_index = 0
+
+        async def replay_receive() -> Message:
+            nonlocal buffered_index
+            if buffered_index < len(buffered):
+                message = buffered[buffered_index]
+                buffered_index += 1
+                return message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    @staticmethod
+    def _is_executor_control_path(scope: Scope) -> bool:
+        path = str(scope.get("path", ""))
+        return path == EXECUTOR_CONTROL_PREFIX or path.startswith(
+            f"{EXECUTOR_CONTROL_PREFIX}/"
+        )
+
+    @staticmethod
+    def _content_length(scope: Scope) -> int | None:
+        raw_values = [
+            value
+            for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        if not raw_values:
+            return None
+        values: list[str] = []
+        try:
+            for raw_value in raw_values:
+                values.extend(
+                    part.strip() for part in raw_value.decode("ascii").split(",")
+                )
+        except UnicodeDecodeError as exc:
+            raise ValueError("Content-Length is not ASCII") from exc
+        if not values or any(not value or not value.isdecimal() for value in values):
+            raise ValueError("Content-Length is invalid")
+        try:
+            lengths = {int(value, 10) for value in values}
+        except ValueError as exc:
+            raise ValueError("Content-Length is invalid") from exc
+        if len(lengths) != 1:
+            raise ValueError("Conflicting Content-Length headers")
+        return lengths.pop()
+
+    @staticmethod
+    async def _respond(
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        *,
+        status_code: int,
+        detail: str,
+    ) -> None:
+        await JSONResponse(
+            status_code=status_code,
+            content={"detail": detail},
+        )(scope, receive, send)
 
 
 class _StrictRequest(BaseModel):

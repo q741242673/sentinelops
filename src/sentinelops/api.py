@@ -28,7 +28,10 @@ from sentinelops.change_proposals import (
     build_change_proposal,
 )
 from sentinelops.config import Settings, get_settings
-from sentinelops.control_gateway import build_executor_control_router
+from sentinelops.control_gateway import (
+    ExecutorControlBodyLimitMiddleware,
+    build_executor_control_router,
+)
 from sentinelops.demo import (
     build_demo_alert,
     enrich_alert_with_failed_trace,
@@ -159,6 +162,9 @@ async def _operator_auth_middleware(
             headers=exc.headers,
         )
     return await call_next(request)
+
+
+app.add_middleware(ExecutorControlBodyLimitMiddleware)
 
 
 incident_agents: dict[str, IncidentAgent] = {}

@@ -7,7 +7,11 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from sentinelops.control_gateway import build_executor_control_router
+from sentinelops.control_gateway import (
+    EXECUTOR_CONTROL_MAX_BODY_BYTES,
+    ExecutorControlBodyLimitMiddleware,
+    build_executor_control_router,
+)
 from sentinelops.domain import RemediationAction, RiskLevel, ToolResult
 from sentinelops.executor_control import (
     ExecutorControlAuthenticationError,
@@ -28,6 +32,7 @@ SESSION_ID = "session-a"
 
 class _Authenticator:
     def __init__(self) -> None:
+        self.calls = 0
         self.trusts = {
             CLUSTER_ID: WorkloadTrust(
                 cluster_id=CLUSTER_ID,
@@ -56,6 +61,7 @@ class _Authenticator:
         required_capability: str,
         expected_pod_uid: str | None = None,
     ) -> WorkloadIdentity:
+        self.calls += 1
         identity = WorkloadIdentity(
             cluster_id=CLUSTER_ID,
             subject_hash="a" * 64,
@@ -188,6 +194,7 @@ class _Store:
 
 def _app(store: _Store, authenticator: _Authenticator) -> FastAPI:
     app = FastAPI()
+    app.add_middleware(ExecutorControlBodyLimitMiddleware)
     app.include_router(
         build_executor_control_router(
             store_provider=lambda: store,
@@ -195,6 +202,21 @@ def _app(store: _Store, authenticator: _Authenticator) -> FastAPI:
         )
     )
     return app
+
+
+class _ChunkedBody(httpx.AsyncByteStream):
+    def __init__(self, chunks: tuple[bytes, ...]) -> None:
+        self.chunks = chunks
+        self._iterator = iter(chunks)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        try:
+            return next(self._iterator)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
 
 
 @pytest.mark.asyncio
@@ -314,3 +336,99 @@ async def test_gateway_rejects_executor_cluster_metadata_poisoning() -> None:
 
     assert response.status_code == 403
     assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_anonymous_declared_oversize_before_authentication() -> None:
+    store = _Store()
+    authenticator = _Authenticator()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(store, authenticator)),
+        base_url="http://control.test",
+    ) as client:
+        response = await client.post(
+            "/internal/v1/executor/sessions",
+            content=b"x" * (EXECUTOR_CONTROL_MAX_BODY_BYTES + 1),
+        )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == (
+        "Executor control request body is too large"
+    )
+    assert authenticator.calls == 0
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_chunked_oversize_before_authentication() -> None:
+    store = _Store()
+    authenticator = _Authenticator()
+    chunk_size = EXECUTOR_CONTROL_MAX_BODY_BYTES // 2
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(store, authenticator)),
+        base_url="http://control.test",
+    ) as client:
+        response = await client.post(
+            "/internal/v1/executor/sessions",
+            content=_ChunkedBody(
+                (
+                    b"x" * chunk_size,
+                    b"y" * chunk_size,
+                    b"z",
+                )
+            ),
+        )
+
+    assert response.status_code == 413
+    assert authenticator.calls == 0
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_invalid_content_length_before_authentication() -> None:
+    store = _Store()
+    authenticator = _Authenticator()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(store, authenticator)),
+        base_url="http://control.test",
+    ) as client:
+        response = await client.post(
+            "/internal/v1/executor/sessions",
+            headers={"Content-Length": "not-a-number"},
+            content=b"{}",
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Invalid Content-Length header"
+    assert authenticator.calls == 0
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_normal_request_within_body_limit() -> None:
+    store = _Store()
+    authenticator = _Authenticator()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app(store, authenticator)),
+        base_url="http://control.test",
+    ) as client:
+        response = await client.post(
+            "/internal/v1/executor/sessions",
+            headers={
+                "Authorization": "Bearer projected-token",
+                "X-SentinelOps-Cluster-ID": CLUSTER_ID,
+            },
+            json={
+                "cluster_id": CLUSTER_ID,
+                "instance_id": POD_UID,
+                "session_id": SESSION_ID,
+                "capabilities": ["action.execute"],
+                "version": "test",
+                "ttl_seconds": 60,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["instance_id"] == POD_UID
+    assert authenticator.calls == 1
+    assert store.calls == ["register"]

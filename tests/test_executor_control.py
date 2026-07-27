@@ -11,6 +11,7 @@ from pydantic import TypeAdapter
 from sentinelops.domain import RemediationAction, RiskLevel, ToolResult
 from sentinelops.executor_control import (
     EXECUTOR_CONTROL_PREFIX,
+    MAX_EXECUTOR_RESPONSE_BYTES,
     ExecutorControlAuthenticationError,
     ExecutorControlProtocolError,
     ExecutorControlUnavailableError,
@@ -25,6 +26,21 @@ from sentinelops.storage.base import (
     LeaseConflictError,
     StoredActionIntent,
 )
+
+
+class _ObservedAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            self.yielded += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def _registration(cluster_id: str = "cluster-a") -> ClusterRegistration:
@@ -454,6 +470,74 @@ async def test_rejects_unbounded_or_ambiguous_gateway_responses(
             )
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_rejects_chunked_oversized_response_while_streaming(tmp_path) -> None:
+    stream = _ObservedAsyncStream(
+        [
+            b"x" * (MAX_EXECUTOR_RESPONSE_BYTES // 2),
+            b"x" * (MAX_EXECUTOR_RESPONSE_BYTES // 2 + 1),
+            b"must-not-be-read",
+        ]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/json",
+                "Transfer-Encoding": "chunked",
+            },
+            stream=stream,
+        )
+
+    client, _ = _client(tmp_path, handler)
+    try:
+        with pytest.raises(ExecutorControlProtocolError, match="size limit"):
+            await client.ensure_cluster_registration(
+                cluster_id="cluster-a",
+                display_name="生产集群 A",
+                default_namespace="sentinelops-system",
+            )
+    finally:
+        await client.aclose()
+
+    assert stream.yielded == 2
+    assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_accepts_normal_chunked_response_without_content_length(tmp_path) -> None:
+    expected_registration = _registration()
+    payload = TypeAdapter(ClusterRegistration).dump_json(expected_registration)
+    stream = _ObservedAsyncStream(
+        [payload[:17], payload[17:53], payload[53:]]
+    )
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "Content-Type": "application/json",
+                "Transfer-Encoding": "chunked",
+            },
+            stream=stream,
+        )
+
+    client, _ = _client(tmp_path, handler)
+    try:
+        registration = await client.ensure_cluster_registration(
+            cluster_id="cluster-a",
+            display_name="生产集群 A",
+            default_namespace="sentinelops-system",
+        )
+    finally:
+        await client.aclose()
+
+    assert registration == expected_registration
+    assert stream.yielded == 3
+    assert stream.closed is True
 
 
 @pytest.mark.asyncio

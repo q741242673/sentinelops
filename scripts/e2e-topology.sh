@@ -170,7 +170,7 @@ WORKLOAD_ISSUER="${WORKLOAD_ISSUER}" \
 WORKLOAD_AUDIENCE="${WORKLOAD_AUDIENCE}" \
 WORKLOAD_SA_UID="${WORKLOAD_SA_UID}" \
 "${PYTHON}" -c \
-  'import json,os; print(json.dumps({"clusters":[{"cluster_id":os.environ["WORKLOAD_CLUSTER_ID"],"display_name":"Kind 拓扑验收集群","default_namespace":"sentinelops-demo","issuer":os.environ["WORKLOAD_ISSUER"],"audience":os.environ["WORKLOAD_AUDIENCE"],"jwks_url":"http://sentinelops-workload-jwks.sentinelops-system.svc.cluster.local:8080/jwks.json","namespace":"sentinelops-system","service_account":"sentinelops-executor","service_account_uid":os.environ["WORKLOAD_SA_UID"],"allowed_capabilities":["agent.register","agent.heartbeat","action.execute","action.reconcile","backend.controller","backend.direct"]}]},ensure_ascii=False,separators=(",",":")))' \
+  'import json,os; print(json.dumps({"clusters":[{"cluster_id":os.environ["WORKLOAD_CLUSTER_ID"],"display_name":"Kind 拓扑验收集群","default_namespace":"sentinelops-demo","issuer":os.environ["WORKLOAD_ISSUER"],"audience":os.environ["WORKLOAD_AUDIENCE"],"jwks_url":"http://sentinelops-workload-jwks.sentinelops-system.svc.cluster.local:8080/jwks.json","token_review_url":"https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews","reviewer_token_file":"/var/run/secrets/kubernetes.io/serviceaccount/token","token_review_ca_file":"/var/run/secrets/kubernetes.io/serviceaccount/ca.crt","namespace":"sentinelops-system","service_account":"sentinelops-executor","service_account_uid":os.environ["WORKLOAD_SA_UID"],"allowed_capabilities":["agent.register","agent.heartbeat","action.execute","action.reconcile","backend.controller","backend.direct"]}]},ensure_ascii=False,separators=(",",":")))' \
   > "${TEMP_ROOT}/workload-trust.json"
 kubectl --context "${CONTEXT}" --namespace sentinelops-system \
   create configmap sentinelops-topology-workload-jwks \
@@ -380,6 +380,46 @@ for deployment in sentinelops-api sentinelops-executor; do
   kubectl --context "${CONTEXT}" --namespace sentinelops-system \
     rollout status "deployment/${deployment}" --timeout=5m
 done
+
+if [[ "${SECURITY_E2E}" == "true" ]]; then
+  CURRENT_PHASE="workload-token-revocation"
+  OLD_EXECUTOR_POD="$(
+    kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+      get pods \
+      --selector app.kubernetes.io/name=sentinelops-executor \
+      --field-selector status.phase=Running \
+      --output jsonpath='{.items[0].metadata.name}'
+  )"
+  if [[ -z "${OLD_EXECUTOR_POD}" ]]; then
+    echo "No running Executor pod is available for token revocation E2E" >&2
+    exit 1
+  fi
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    exec "${OLD_EXECUTOR_POD}" -- \
+    sh -ec 'tr -d "\n" < /var/run/secrets/sentinelops-control-gateway/gateway-token' \
+    > "${TEMP_ROOT}/revoked-workload-token"
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    delete "pod/${OLD_EXECUTOR_POD}" --wait=true --timeout=2m
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    rollout status deployment/sentinelops-executor --timeout=5m
+  NEW_EXECUTOR_POD="$(
+    kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+      get pods \
+      --selector app.kubernetes.io/name=sentinelops-executor \
+      --field-selector status.phase=Running \
+      --sort-by=.metadata.creationTimestamp \
+      --output jsonpath='{.items[-1:].metadata.name}'
+  )"
+  if [[ -z "${NEW_EXECUTOR_POD}" || "${NEW_EXECUTOR_POD}" == "${OLD_EXECUTOR_POD}" ]]; then
+    echo "Executor replacement pod is not available for token revocation E2E" >&2
+    exit 1
+  fi
+  kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+    exec "${NEW_EXECUTOR_POD}" -- \
+    sh -ec 'tr -d "\n" < /var/run/secrets/sentinelops-control-gateway/gateway-token' \
+    > "${TEMP_ROOT}/current-workload-token"
+fi
+
 kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
   rollout status deployment/alertmanager --timeout=3m
 
@@ -418,6 +458,8 @@ if [[ "${SECURITY_E2E}" == "true" ]]; then
     --anchor-url http://127.0.0.1:18200
     --anchor-inventory-token-file "${TEMP_ROOT}/material/anchor-inventory.token"
     --anchor-public-keys-file "${TEMP_ROOT}/material/anchor-public-keys.json"
+    --revoked-workload-token-file "${TEMP_ROOT}/revoked-workload-token"
+    --current-workload-token-file "${TEMP_ROOT}/current-workload-token"
   )
 fi
 

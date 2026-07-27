@@ -521,21 +521,47 @@ class HttpExecutorControlPlane:
             "Authorization": f"Bearer {token}",
             "X-SentinelOps-Cluster-ID": self.cluster_id,
             "Accept": "application/json",
+            "Accept-Encoding": "identity",
         }
         try:
             async with asyncio.timeout(self.deadline_seconds):
-                response = await self._client.request(
+                async with self._client.stream(
                     method,
                     f"{EXECUTOR_CONTROL_PREFIX}{path}",
                     headers=headers,
                     json=json_body,
-                )
+                ) as streamed_response:
+                    self._validate_response_headers(streamed_response)
+                    content = bytearray()
+                    if streamed_response.is_stream_consumed:
+                        buffered_content = streamed_response.content
+                        if len(buffered_content) > MAX_EXECUTOR_RESPONSE_BYTES:
+                            raise ExecutorControlProtocolError(
+                                "Executor control response exceeds the size limit"
+                            )
+                        content.extend(buffered_content)
+                    else:
+                        async for chunk in streamed_response.aiter_raw():
+                            if (
+                                len(content) + len(chunk)
+                                > MAX_EXECUTOR_RESPONSE_BYTES
+                            ):
+                                raise ExecutorControlProtocolError(
+                                    "Executor control response exceeds the size limit"
+                                )
+                            content.extend(chunk)
+                    response = httpx.Response(
+                        status_code=streamed_response.status_code,
+                        headers=streamed_response.headers,
+                        content=bytes(content),
+                        request=streamed_response.request,
+                        extensions=streamed_response.extensions,
+                    )
         except (TimeoutError, httpx.HTTPError, OSError) as exc:
             raise ExecutorControlUnavailableError(
                 "Executor control gateway is unavailable"
             ) from exc
 
-        self._validate_response_bounds(response)
         if response.status_code in {401, 403}:
             raise ExecutorControlAuthenticationError(
                 self._error_message(response, "Executor service identity was rejected")
@@ -597,7 +623,7 @@ class HttpExecutorControlPlane:
         return token
 
     @staticmethod
-    def _validate_response_bounds(response: httpx.Response) -> None:
+    def _validate_response_headers(response: httpx.Response) -> None:
         content_encoding = response.headers.get("content-encoding", "identity")
         if content_encoding.strip().casefold() not in {"", "identity"}:
             raise ExecutorControlProtocolError(
@@ -615,10 +641,6 @@ class HttpExecutorControlPlane:
                 raise ExecutorControlProtocolError(
                     "Executor control response exceeds the size limit"
                 )
-        if len(response.content) > MAX_EXECUTOR_RESPONSE_BYTES:
-            raise ExecutorControlProtocolError(
-                "Executor control response exceeds the size limit"
-            )
 
     def _decode(
         self,

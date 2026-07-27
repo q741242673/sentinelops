@@ -268,8 +268,15 @@ Gateway 与数据库都会重新确认它仍属于目标集群、Pod 和 Session
 Remediation Controller，两者必须使用同一个 `SENTINELOPS_CLUSTER_ID`；Kubernetes
 ServiceAccount 凭据始终留在目标集群。生产 Executor 不挂载数据库地址和审计 HMAC，
 只持有由 Kubernetes 自动轮换的短期 Token。Control Gateway 固定校验 issuer、audience、
-JWKS、namespace、ServiceAccount 名称与 UID、Pod UID 和服务端能力清单；请求中的
+JWKS、namespace、ServiceAccount 名称与 UID、Pod UID 和服务端能力清单；生产请求还会
+实时调用该集群的 Kubernetes TokenReview，因此 Pod 或 Token 被撤销后，不会继续等到
+JWT 自然过期。请求中的
 `cluster_id`、owner、Session 和返回数据还会再次做跨集群约束。
+
+参考清单给 Gateway 的 ServiceAccount 只授予 `create tokenreviews`。同集群部署可以直接
+使用 Pod 内的 reviewer Token 和 CA；跨集群部署则要为每个集群挂载一份只允许
+TokenReview 的窄权限凭据，并在管理员信任清单中配置固定 HTTPS API 地址。Gateway 不保存
+远端 kubeconfig，也不会把 reviewer 凭据交给 Executor。
 
 生产 Executor 还需要稳定的实例身份。仓库清单通过 Downward API 把 Pod UID 注入
 `SENTINELOPS_EXECUTOR_INSTANCE_ID`；每次进程启动都会生成新的 Session。默认租约为
@@ -647,7 +654,11 @@ Prometheus 指标代替。准入异常不会让 API 或 Controller readiness 失
 
 `/ready` 证明 API 已经启动且可以访问事故数据库，不代表模型、监控系统和 Kubernetes 里的目标服务都健康。Executor 探针只有在集群注册租约成功续期后才刷新；锚定 Publisher 的探针证明领取循环仍在前进。如果进程卡住或数据库租约无法续期，心跳文件过期后 Pod 会退出 Ready 并由 Kubernetes 重启。外部审计服务临时不可用只会让 Outbox 保留待重试记录，不会回滚已经提交的事故处理。
 
-示例 NetworkPolicy 只提交了可以跨环境成立的入站限制。Kubernetes API、PostgreSQL、监控系统、模型网关和外部审计服务的地址在不同公司并不一样，因此没有硬编码一套可能切断生产流量的通用 egress 规则。上线前应根据实际 Service、egress gateway 或 CIDR 再补出口白名单，并在策略启用后分别验证数据库、集群 API、监控、模型和锚定调用。
+示例 NetworkPolicy 会默认拒绝 Executor 的其他出口，只允许 DNS、Kubernetes API 和 Control
+Gateway。清单里的 Kubernetes API 与 Gateway 使用 TEST-NET 占位 CIDR，不能原样上线；应用策略前必须
+替换为本集群 API Server 和公司 Gateway 的真实 CIDR。API、PostgreSQL、监控、模型网关和外部审计
+服务的出口仍需按公司的 Service、egress gateway 或 CIDR 单独收口。策略启用后要分别验证 Executor
+到 API Server/Gateway，以及 API 到数据库、监控、模型和审计服务的连接，避免把正常流量一并切断。
 
 ## 可校验的审计证据链
 
@@ -661,7 +672,9 @@ Prometheus 指标代替。准入异常不会让 API 或 Controller readiness 失
 - Executor 的 succeeded、failed、unknown、cancelled 和过期回收；
 - Executor owner、generation、attempt ID，以及结果和人工备注的摘要哈希。
 
-每条记录包含连续序号、前一条记录的哈希、规范化 JSON 的 SHA-256，以及使用独立 Audit Key 计算的 HMAC-SHA256。生产 API 和 Executor 没有配置至少 32 字节的 Audit Key 与稳定 Key ID 时会拒绝运行：
+每条记录包含连续序号、前一条记录的哈希、规范化 JSON 的 SHA-256，以及使用独立 Audit Key 计算的
+HMAC-SHA256。生产 API、迁移和审计相关后台进程没有配置至少 32 字节的 Audit Key 与稳定 Key ID
+时会拒绝运行。Executor 只通过 Control Gateway 提交状态，不持有数据库连接或 Audit Key：
 
 ```dotenv
 SENTINELOPS_AUDIT_HMAC_KEY_FILE=/var/run/secrets/sentinelops/audit-hmac-key
