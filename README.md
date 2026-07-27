@@ -566,13 +566,18 @@ Kubernetes 集群管理员的信任边界。namespace 退役前也要先按同�
 可能被写闸门拒绝。
 
 数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`。升级到包含
-`0012_cluster_registry_leases` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
-执行的 Action Intent。旧 Executor 不认识集群 Session 租约，若让它和迁移并发运行，可能绕过
-新版本的执行围栏。迁移会把旧的 `prepared/queued/claimed` 操作取消，把已经 `dispatched`
-但没有 Session 身份的操作标成结果未知，避免新 Executor 把旧授权当成自己的任务继续执行。
-PostgreSQL 迁移还会锁住事故和 Action Intent 表，但这不能代替停止旧进程：
+`0012_cluster_registry_leases` 的版本需要安排一个短维护窗口：先在 Ingress 或告警网关暂停
+SentinelOps 的 Alertmanager 入口，并确认这段时间的 firing 和 resolved 事件进入可以重放的缓冲区，
+不能直接丢弃。没有告警网关时，至少要确认 Alertmanager 会保留失败通知并持续重试。
+
+入口暂停后，把旧 API 和旧 Executor 都缩容到 0，并确认没有仍在执行的 Action Intent。旧
+Executor 不认识集群 Session 租约，继续运行可能绕过新围栏；旧 API 也不认识迁移新增的必填字段，
+迁移后继续接收事故会写入失败。PostgreSQL 的表锁只能保护迁移事务，不能代替停止旧进程。迁移会把
+旧的 `prepared/queued/claimed` 操作取消，把已经 `dispatched` 但没有 Session 身份的操作标成
+结果未知，避免新 Executor 把旧授权当成自己的任务继续执行：
 
 ```bash
+kubectl -n sentinelops-system scale deployment/sentinelops-api --replicas=0
 kubectl -n sentinelops-system scale deployment/sentinelops-executor --replicas=0
 kubectl -n sentinelops-system delete job sentinelops-db-migrate --ignore-not-found
 kubectl apply -f deploy/production/base/migration-job.yaml
@@ -581,7 +586,7 @@ kubectl -n sentinelops-system wait \
   --timeout=10m
 ```
 
-迁移完成后再发布新版本服务（新 Executor Deployment 会恢复清单中声明的副本数）：
+迁移完成后再发布新版本服务。应用清单会恢复 API 和 Executor 声明的副本数：
 
 ```bash
 kubectl apply \
@@ -593,7 +598,22 @@ kubectl apply \
   -f deploy/production/base/anchor-publisher.yaml \
   -f deploy/production/base/availability.yaml \
   -f deploy/production/base/network-policy.yaml
+
+kubectl -n sentinelops-system rollout status \
+  deployment/sentinelops-api --timeout=5m
+kubectl -n sentinelops-system rollout status \
+  deployment/sentinelops-executor --timeout=5m
 ```
+
+只有两个 Deployment 都 Ready 后，才可以把维护窗口内缓冲的 Alertmanager 事件按原始时间顺序
+重放。确认重放完成后再恢复实时入口，避免新事件跑到旧事件前面。重放时保留原来的来源、
+fingerprint、startsAt 和 endsAt，现有告警去重会处理重复通知。
+
+`0012` 的 downgrade 是有损操作，不是撤销维护窗口的按钮。升级时已经取消的旧任务、已经转成
+`unknown` 的写操作和已经递增的执行代次，不会因为删除新表和新字段而恢复原样。确实需要降级时，
+必须先备份数据库，再停止新版本 API、Executor 以及所有连接该数据库的新版本后台进程；随后使用
+受控的数据库变更流程降级 schema、部署与该 schema 匹配的旧镜像，并逐条人工核对
+`cancelled/unknown` Action Intent。不要让新旧进程与 downgrade 并发，也不要自动重放这些旧任务。
 
 Alertmanager 或 Ingress 所在 namespace 需要显式获得 API 入口权限：
 

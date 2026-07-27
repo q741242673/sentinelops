@@ -129,6 +129,7 @@ async def test_postgres_roundtrip_and_compare_and_swap() -> None:
         await first.mark_action_dispatched(claim, agent_lease=agent_lease)
         completed = await first.complete_action(
             claim=claim,
+            agent_lease=agent_lease,
             result=ToolResult(
                 tool_name=record.approval.action.tool_name,
                 success=True,

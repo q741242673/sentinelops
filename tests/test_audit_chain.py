@@ -107,6 +107,7 @@ async def test_hmac_audit_chain_covers_approval_and_action_boundary(tmp_path) ->
     await store.mark_action_dispatched(claim, agent_lease=agent_lease)
     await store.complete_action(
         claim=claim,
+        agent_lease=agent_lease,
         result=ToolResult(
             tool_name=record.approval.action.tool_name,
             success=True,

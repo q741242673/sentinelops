@@ -11,7 +11,11 @@ from sentinelops.domain import Alert, ToolResult
 from sentinelops.executor import ExecutorWorker
 from sentinelops.remediation_controller import RemediationObservation
 from sentinelops.runtime import build_agent
-from sentinelops.storage import ActionIntentConflictError, SqlIncidentStore
+from sentinelops.storage import (
+    ActionIntentConflictError,
+    ClusterAgentLeaseConflictError,
+    SqlIncidentStore,
+)
 from sentinelops.storage.base import ClusterAgentLeaseToken
 from sentinelops.storage.sqlalchemy import (
     action_intents,
@@ -190,6 +194,7 @@ async def _cluster_agent(
     *,
     instance_id: str,
     cluster_id: str = "local",
+    session_id: str | None = None,
 ):
     await store.ensure_cluster_registration(
         cluster_id=cluster_id,
@@ -199,7 +204,7 @@ async def _cluster_agent(
     return await store.register_cluster_agent(
         cluster_id=cluster_id,
         instance_id=instance_id,
-        session_id=f"session-{instance_id}",
+        session_id=session_id or f"session-{instance_id}",
         capabilities=(
             "action.execute",
             "action.reconcile",
@@ -598,10 +603,21 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
         success=True,
         content={"late": "trusted"},
     )
-    completed = await store.complete_action(claim=claim, result=late_result)
+    completed = await store.complete_action(
+        claim=claim,
+        agent_lease=agent,
+        result=late_result,
+    )
     assert completed.status == "succeeded"
     assert completed.result == late_result
-    assert await store.complete_action(claim=claim, result=late_result) == completed
+    assert (
+        await store.complete_action(
+            claim=claim,
+            agent_lease=agent,
+            result=late_result,
+        )
+        == completed
+    )
 
     conflicting = ToolResult(
         tool_name=unknown.action.tool_name,
@@ -609,7 +625,11 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
         error="conflicting late result",
     )
     with pytest.raises(ActionIntentConflictError):
-        await store.complete_action(claim=claim, result=conflicting)
+        await store.complete_action(
+            claim=claim,
+            agent_lease=agent,
+            result=conflicting,
+        )
     await store.close()
 
 
@@ -635,6 +655,7 @@ async def test_replacement_executor_recovers_controller_result_without_replay(
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="Executor disappeared after submitting the CR",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
@@ -709,6 +730,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="controller response was lost",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
@@ -731,6 +753,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
     )
     await store.retry_action_reconciliation(
         first,
+        agent_lease=first_agent,
         error="Controller is still executing",
         retry_after_seconds=0.1,
     )
@@ -754,6 +777,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
     with pytest.raises(ActionIntentConflictError):
         await store.complete_action_reconciliation(
             first,
+            agent_lease=first_agent,
             result=ToolResult(
                 tool_name=first.intent.action.tool_name,
                 success=True,
@@ -762,9 +786,165 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
         )
     await store.retry_action_reconciliation(
         second,
+        agent_lease=second_agent,
         error="leave the unknown result for manual review",
         retry_after_seconds=60,
     )
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transition", "suffix"),
+    [("complete", "x"), ("retry", "y"), ("dead_letter", "z")],
+)
+async def test_reconciliation_terminal_transition_rejects_replaced_agent_session(
+    tmp_path,
+    transition: str,
+    suffix: str,
+) -> None:
+    store, record, _, intent = await _queued_intent(
+        tmp_path,
+        suffix=suffix,
+    )
+    execution_agent = await _cluster_agent(
+        store,
+        instance_id=f"executor-before-{transition}",
+    )
+    execution = await store.claim_action_execution(
+        agent_lease=execution_agent,
+        owner_id=f"executor-before-{transition}",
+        attempt_id=f"execution-{transition}",
+        ttl_seconds=60,
+    )
+    assert execution is not None
+    await store.mark_action_dispatched(
+        execution,
+        agent_lease=execution_agent,
+    )
+    await store.mark_action_unknown(
+        claim=execution,
+        agent_lease=execution_agent,
+        reason="Controller result requires read-only reconciliation",
+    )
+    await _expire_action_for_reconciliation(store, intent.idempotency_key)
+
+    stale_agent = await _cluster_agent(
+        store,
+        instance_id="reconciler-aba",
+        session_id=f"session-stale-{transition}",
+    )
+    reconciliation = await store.claim_action_reconciliation(
+        agent_lease=stale_agent,
+        owner_id="reconciler-aba",
+        ttl_seconds=60,
+    )
+    assert reconciliation is not None
+    await store.close_cluster_agent(stale_agent)
+    current_agent = await _cluster_agent(
+        store,
+        instance_id="reconciler-aba",
+        session_id=f"session-current-{transition}",
+    )
+    assert current_agent.generation == stale_agent.generation + 1
+
+    async def transition_with(agent_lease: ClusterAgentLeaseToken) -> None:
+        if transition == "complete":
+            await store.complete_action_reconciliation(
+                reconciliation,
+                agent_lease=agent_lease,
+                result=ToolResult(
+                    tool_name=intent.action.tool_name,
+                    success=True,
+                    content={"stale_session": True},
+                ),
+            )
+        elif transition == "retry":
+            await store.retry_action_reconciliation(
+                reconciliation,
+                agent_lease=agent_lease,
+                error="stale session must not retry",
+                retry_after_seconds=1,
+            )
+        else:
+            await store.dead_letter_action_reconciliation(
+                reconciliation,
+                agent_lease=agent_lease,
+                error="stale session must not dead-letter",
+            )
+
+    with pytest.raises(ClusterAgentLeaseConflictError):
+        await transition_with(stale_agent)
+    with pytest.raises(ClusterAgentLeaseConflictError):
+        await transition_with(current_agent)
+
+    preserved = await store.latest_action_intent(record.id)
+    assert preserved is not None
+    assert preserved.status == "unknown"
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transition", "suffix"),
+    [("complete", "u"), ("unknown", "v")],
+)
+async def test_execution_terminal_transition_rejects_replaced_agent_session(
+    tmp_path,
+    transition: str,
+    suffix: str,
+) -> None:
+    store, record, _, intent = await _queued_intent(
+        tmp_path,
+        suffix=suffix,
+    )
+    stale_agent = await _cluster_agent(
+        store,
+        instance_id="executor-aba",
+        session_id=f"execution-stale-{transition}",
+    )
+    claim = await store.claim_action_execution(
+        agent_lease=stale_agent,
+        owner_id="executor-aba",
+        attempt_id=f"attempt-{transition}",
+        ttl_seconds=60,
+    )
+    assert claim is not None
+    await store.mark_action_dispatched(claim, agent_lease=stale_agent)
+    await store.close_cluster_agent(stale_agent)
+    current_agent = await _cluster_agent(
+        store,
+        instance_id="executor-aba",
+        session_id=f"execution-current-{transition}",
+    )
+    assert current_agent.generation == stale_agent.generation + 1
+
+    async def transition_with(agent_lease: ClusterAgentLeaseToken) -> None:
+        if transition == "complete":
+            await store.complete_action(
+                claim=claim,
+                agent_lease=agent_lease,
+                result=ToolResult(
+                    tool_name=intent.action.tool_name,
+                    success=True,
+                    content={"stale_session": True},
+                ),
+            )
+        else:
+            await store.mark_action_unknown(
+                claim=claim,
+                agent_lease=agent_lease,
+                reason="stale session must not update the action",
+            )
+
+    with pytest.raises(ClusterAgentLeaseConflictError):
+        await transition_with(stale_agent)
+    with pytest.raises(ClusterAgentLeaseConflictError):
+        await transition_with(current_agent)
+
+    preserved = await store.latest_action_intent(record.id)
+    assert preserved is not None
+    assert preserved.status == "dispatched"
     await store.close()
 
 
@@ -790,6 +970,7 @@ async def test_missing_controller_contract_dead_letters_only_after_fence_grace(
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="Executor disappeared before the Controller result was stored",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
@@ -850,6 +1031,7 @@ async def test_in_progress_controller_contract_retries_after_fence_expiry(
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="Controller is still applying the action",
     )
     await _set_action_fence_expiry(
@@ -908,6 +1090,7 @@ async def test_temporary_controller_error_retries_after_fence_expiry(
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="Kubernetes API response was lost",
     )
     await _set_action_fence_expiry(
@@ -1011,6 +1194,7 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
     )
     completed = await store.complete_action(
         claim=original,
+        agent_lease=original_agent,
         result=late_result,
     )
     assert completed.status == "succeeded"
@@ -1049,6 +1233,7 @@ async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates
     )
     await store.mark_action_unknown(
         claim=original,
+        agent_lease=original_agent,
         reason="original Executor response was delayed",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
@@ -1074,9 +1259,14 @@ async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates
     )
 
     outcomes = await asyncio.gather(
-        store.complete_action(claim=original, result=result),
+        store.complete_action(
+            claim=original,
+            agent_lease=original_agent,
+            result=result,
+        ),
         store.complete_action_reconciliation(
             reconciliation,
+            agent_lease=reconciliation_agent,
             result=result,
         ),
         return_exceptions=True,

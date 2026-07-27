@@ -131,7 +131,7 @@ async def _enqueue_claim_dispatch(
         claim,
         agent_lease=agent_lease,
     )
-    return claim
+    return claim, agent_lease
 
 
 @pytest.mark.asyncio
@@ -550,6 +550,7 @@ async def test_action_intent_records_dispatch_and_result_before_incident_termina
     )
     completed = await store.complete_action(
         claim=claim,
+        agent_lease=agent_lease,
         result=result,
     )
 
@@ -610,7 +611,7 @@ async def test_prepared_intent_can_be_fenced_and_reassigned_before_dispatch(
     assert reassigned.lease_generation == second.generation
     with pytest.raises(LeaseConflictError):
         await store.enqueue_action(first, idempotency_key=prepared.idempotency_key)
-    claim = await _enqueue_claim_dispatch(
+    claim, _ = await _enqueue_claim_dispatch(
         store,
         second,
         prepared.idempotency_key,
@@ -664,7 +665,7 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
         action=record.approval.action,
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
-    claim = await _enqueue_claim_dispatch(
+    claim, agent_lease = await _enqueue_claim_dispatch(
         before_crash,
         lease,
         intent.idempotency_key,
@@ -674,6 +675,7 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
     if complete_before_crash:
         await before_crash.complete_action(
             claim=claim,
+            agent_lease=agent_lease,
             result=ToolResult(
                 tool_name=record.approval.action.tool_name,
                 success=True,
@@ -952,7 +954,7 @@ async def test_resolved_after_dispatch_preserves_late_durable_result(tmp_path) -
         action=record.approval.action,
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
-    claim = await _enqueue_claim_dispatch(
+    claim, agent_lease = await _enqueue_claim_dispatch(
         store,
         lease,
         intent.idempotency_key,
@@ -975,6 +977,7 @@ async def test_resolved_after_dispatch_preserves_late_durable_result(tmp_path) -
     )
     await store.complete_action(
         claim=claim,
+        agent_lease=agent_lease,
         result=result,
     )
     await store.release_lease(lease)
@@ -1138,8 +1141,16 @@ async def test_reconciliation_claim_only_selects_its_cluster(tmp_path) -> None:
     assert claim_a is not None and claim_b is not None
     await store.mark_action_dispatched(claim_a, agent_lease=agent_a)
     await store.mark_action_dispatched(claim_b, agent_lease=agent_b)
-    await store.mark_action_unknown(claim=claim_a, reason="test reconciliation")
-    await store.mark_action_unknown(claim=claim_b, reason="test reconciliation")
+    await store.mark_action_unknown(
+        claim=claim_a,
+        agent_lease=agent_a,
+        reason="test reconciliation",
+    )
+    await store.mark_action_unknown(
+        claim=claim_b,
+        agent_lease=agent_b,
+        reason="test reconciliation",
+    )
     # SQLite CURRENT_TIMESTAMP has one-second precision, so cross a full
     # database clock tick before the reconciliation lease becomes eligible.
     await asyncio.sleep(2.1)

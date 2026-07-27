@@ -390,6 +390,7 @@ async def _executor_single_claim(
                 )
                 await winner_store.complete_action(
                     claim=winners[0],
+                    agent_lease=winner_agent,
                     result=ToolResult(
                         tool_name="restart_deployment",
                         success=True,
@@ -485,6 +486,7 @@ async def _executor_crash_recovery(
                 )
                 await second.complete_action(
                     claim=successor,
+                    agent_lease=successor_agent,
                     result=ToolResult(
                         tool_name="restart_deployment",
                         success=True,

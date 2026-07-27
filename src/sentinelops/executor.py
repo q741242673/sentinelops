@@ -273,6 +273,7 @@ class ExecutorWorker:
             with suppress(Exception):
                 await self.store.mark_action_unknown(
                     claim=claim,
+                    agent_lease=agent_lease,
                     reason=f"Executor 调用没有返回可信结果：{exc}",
                 )
             raise
@@ -280,7 +281,11 @@ class ExecutorWorker:
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
-        await self.store.complete_action(claim=claim, result=result)
+        await self.store.complete_action(
+            claim=claim,
+            agent_lease=agent_lease,
+            result=result,
+        )
         return True
 
     async def _reconcile_once(
@@ -313,6 +318,7 @@ class ExecutorWorker:
             if observation.state == "terminal" and observation.result is not None:
                 await self.store.complete_action_reconciliation(
                     claim,
+                    agent_lease=agent_lease,
                     result=observation.result,
                 )
                 return True
@@ -329,11 +335,13 @@ class ExecutorWorker:
             ):
                 await self.store.dead_letter_action_reconciliation(
                     claim,
+                    agent_lease=agent_lease,
                     error=error,
                 )
                 return True
             await self.store.retry_action_reconciliation(
                 claim,
+                agent_lease=agent_lease,
                 error=error,
                 retry_after_seconds=retry_after,
             )
@@ -344,12 +352,14 @@ class ExecutorWorker:
                 error = f"Controller 结果对账失败：{exc}"
                 await self.store.dead_letter_action_reconciliation(
                     claim,
+                    agent_lease=agent_lease,
                     error=error,
                 )
         except Exception as exc:
             with suppress(Exception):
                 await self.store.retry_action_reconciliation(
                     claim,
+                    agent_lease=agent_lease,
                     error=f"Controller 结果对账失败：{exc}",
                     retry_after_seconds=retry_after,
                 )

@@ -4552,10 +4552,21 @@ class SqlIncidentStore:
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         result: Any,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             updated = await connection.execute(
                 update(action_intents)
                 .where(
@@ -4760,6 +4771,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         result: Any,
     ) -> StoredActionIntent:
         result_payload = result.model_dump(mode="json")
@@ -4768,6 +4780,7 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             intent = claim.intent
@@ -4889,6 +4902,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
         retry_after_seconds: float,
     ) -> StoredActionIntent:
@@ -4897,6 +4911,7 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             retried = await connection.execute(
@@ -4945,6 +4960,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
@@ -4952,6 +4968,7 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             abandoned = await connection.execute(
@@ -5064,9 +5081,20 @@ class SqlIncidentStore:
     async def _fence_action_reconciliation_claim(
         connection: Any,
         claim: ActionReconciliationClaim,
+        agent_lease: ClusterAgentLeaseToken,
         *,
         now: datetime,
     ) -> None:
+        await SqlIncidentStore._assert_cluster_agent_lease(
+            connection,
+            agent_lease,
+            now=now,
+            required_capability="action.reconcile",
+        )
+        SqlIncidentStore._assert_action_reconciliation_claim_agent_binding(
+            claim,
+            agent_lease,
+        )
         current = (
             await connection.execute(
                 select(action_reconciliation_outbox.c.action_id)
@@ -5108,10 +5136,21 @@ class SqlIncidentStore:
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         reason: str,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             result = await connection.execute(
                 update(action_intents)
                 .where(
@@ -5545,6 +5584,21 @@ class SqlIncidentStore:
             or claim.session_generation != agent_lease.generation
         ):
             raise ClusterAgentLeaseConflictError("Executor claim 与集群 Agent Session 不一致")
+
+    @staticmethod
+    def _assert_action_reconciliation_claim_agent_binding(
+        claim: ActionReconciliationClaim,
+        agent_lease: ClusterAgentLeaseToken,
+    ) -> None:
+        if (
+            claim.cluster_id != agent_lease.cluster_id
+            or claim.cluster_generation != agent_lease.routing_generation
+            or claim.session_id != agent_lease.session_id
+            or claim.session_generation != agent_lease.generation
+        ):
+            raise ClusterAgentLeaseConflictError(
+                "Controller 结果对账 claim 与集群 Agent Session 不一致"
+            )
 
     @staticmethod
     def _stored_cluster_registration(row: Any) -> ClusterRegistration:

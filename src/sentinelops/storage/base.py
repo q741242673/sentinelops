@@ -577,6 +577,7 @@ class IncidentStore(Protocol):
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         result: ToolResult,
     ) -> StoredActionIntent: ...
 
@@ -594,6 +595,7 @@ class IncidentStore(Protocol):
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         result: ToolResult,
     ) -> StoredActionIntent: ...
 
@@ -601,6 +603,7 @@ class IncidentStore(Protocol):
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
         retry_after_seconds: float,
     ) -> StoredActionIntent: ...
@@ -609,6 +612,7 @@ class IncidentStore(Protocol):
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
     ) -> StoredActionIntent: ...
 
@@ -624,6 +628,7 @@ class IncidentStore(Protocol):
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         reason: str,
     ) -> StoredActionIntent: ...
 
