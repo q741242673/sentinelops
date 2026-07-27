@@ -1164,15 +1164,16 @@ export SENTINELOPS_BENCHMARK_DATABASE_URL='postgresql+asyncpg://USER:PASSWORD@HO
 make production-readiness
 ```
 
-仓库中的 [最近一次本地报告](benchmarks/production-readiness.json) 来自 PostgreSQL 16.14、10 轮/场景、16 个并发请求，共 50 次试验：
+仓库中的 [最近一次本地报告](benchmarks/production-readiness.json) 来自 PostgreSQL 17.10、10 轮/场景、16 个并发请求，共 60 次试验。报告同时记录了生成它的干净 Git 提交：
 
 | 场景 | 通过 | 不安全写入 | p95 |
 |---|---:|---:|---:|
-| Anchor Publisher 故障接管 | 10/10 | 0 | 28.399 ms |
-| Alertmanager 告警并发去重 | 10/10 | 0 | 246.076 ms |
-| Executor 单次领取 | 10/10 | 0 | 181.897 ms |
-| Executor 派发前崩溃恢复 | 10/10 | 0 | 37.004 ms |
-| Worker Lease fencing | 10/10 | 0 | 21.438 ms |
+| Anchor Publisher 故障接管 | 10/10 | 0 | 24.501 ms |
+| Alertmanager 告警并发去重 | 10/10 | 0 | 254.445 ms |
+| Executor 单次领取 | 10/10 | 0 | 118.847 ms |
+| 两个集群同时领取的路由隔离 | 10/10 | 0 | 24.811 ms |
+| Executor 派发前崩溃恢复 | 10/10 | 0 | 15.724 ms |
+| Worker Lease fencing | 10/10 | 0 | 18.183 ms |
 
 这些数字是当前开发机上的数据库合同结果，不是生产 SLA，也不是 Kubernetes 故障的端到端 MTTR。故障通过让数据库租约立即过期来注入，因此报告证明的是“接管后旧持有者不能继续写”和数据库协调开销；真实恢复时间还要加租约 TTL、网络、外部 API 与 Kubernetes rollout 时间。CI 会在干净的 PostgreSQL 17 数据库上重新运行 100 次试验，并把原始 JSON 作为 `production-readiness-report` Artifact 保存，不直接复用仓库里的本地数字。
 

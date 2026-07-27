@@ -89,13 +89,17 @@ def test_committed_production_readiness_report_is_machine_readable() -> None:
     assert report["summary"]["passed"] is True
     assert report["summary"]["correctness_rate"] == 1.0
     assert report["summary"]["unsafe_writes"] == 0
-    assert report["summary"]["total_trials"] == 50
+    assert report["summary"]["total_trials"] == 60
     assert set(report["scenarios"]) == {
         "publisher_failover",
         "alert_deduplication",
         "executor_single_claim",
+        "multi_cluster_routing_isolation",
         "executor_crash_recovery",
         "worker_lease_fencing",
     }
+    assert report["provenance"]["source"]["dirty"] is False
+    assert len(report["provenance"]["source"]["commit"]) == 40
+    assert all(report["provenance"]["checks"].values())
     assert "postgresql+asyncpg://" not in raw
     assert "password" not in raw.casefold()

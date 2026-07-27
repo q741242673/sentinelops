@@ -1,28 +1,75 @@
 {
   "schema_version": "sentinelops.production-readiness.v1",
-  "run_id": "605b8116e61c4378b294ef2cf87beea2",
-  "generated_at": "2026-07-24T08:47:00.473886+00:00",
+  "run_id": "b550acd3780c4502a12ab3712ddf4545",
+  "generated_at": "2026-07-27T10:27:10.046438+00:00",
+  "provenance": {
+    "schema_version": "sentinelops.report-provenance.v1",
+    "source": {
+      "repository": null,
+      "commit": "50f5033396aa6d278761e60e0da0ef8c7f9f23d5",
+      "ref": null,
+      "dirty": false
+    },
+    "execution": {
+      "provider": "local",
+      "run_id": null,
+      "run_attempt": null,
+      "job": null,
+      "run_url": null
+    },
+    "subjects": [
+      {
+        "kind": "git_checkout",
+        "digest": {
+          "algorithm": "git-sha1",
+          "value": "50f5033396aa6d278761e60e0da0ef8c7f9f23d5"
+        }
+      }
+    ],
+    "checks": {
+      "commit_matches_checkout": true,
+      "tracked_checkout_clean": true,
+      "running_replicas_use_one_image": true
+    }
+  },
   "environment": {
-    "python": "3.13.3",
-    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
-    "postgresql": "16.14"
+    "python": "3.11.0",
+    "platform": "macOS-15.3.2-arm64-arm-64bit",
+    "postgresql": "17.10"
   },
   "configuration": {
     "rounds_per_scenario": 10,
     "concurrency": 16,
-    "scenario_count": 5
+    "scenario_count": 6
   },
   "thresholds": {
     "correctness_rate": 1.0,
     "unsafe_writes": 0
   },
+  "reliability_latency_ms": {
+    "multi_replica_claim": {
+      "p50": 20.117,
+      "p95": 118.847,
+      "max": 118.847
+    },
+    "executor_takeover": {
+      "p50": 8.101,
+      "p95": 15.724,
+      "max": 15.724
+    },
+    "multi_cluster_routing": {
+      "p50": 13.451,
+      "p95": 24.811,
+      "max": 24.811
+    }
+  },
   "summary": {
     "passed": true,
-    "total_trials": 50,
-    "passed_trials": 50,
+    "total_trials": 60,
+    "passed_trials": 60,
     "correctness_rate": 1.0,
     "unsafe_writes": 0,
-    "duration_ms": 2842.943
+    "duration_ms": 4525.542
   },
   "scenarios": {
     "publisher_failover": {
@@ -31,9 +78,9 @@
       "correctness_rate": 1.0,
       "unsafe_writes": 0,
       "latency_ms": {
-        "p50": 5.173,
-        "p95": 28.399,
-        "max": 28.399
+        "p50": 3.599,
+        "p95": 24.501,
+        "max": 24.501
       },
       "failures": []
     },
@@ -43,9 +90,9 @@
       "correctness_rate": 1.0,
       "unsafe_writes": 0,
       "latency_ms": {
-        "p50": 52.942,
-        "p95": 246.076,
-        "max": 246.076
+        "p50": 37.76,
+        "p95": 254.445,
+        "max": 254.445
       },
       "failures": []
     },
@@ -55,9 +102,21 @@
       "correctness_rate": 1.0,
       "unsafe_writes": 0,
       "latency_ms": {
-        "p50": 17.754,
-        "p95": 181.897,
-        "max": 181.897
+        "p50": 20.117,
+        "p95": 118.847,
+        "max": 118.847
+      },
+      "failures": []
+    },
+    "multi_cluster_routing_isolation": {
+      "trials": 10,
+      "passed_trials": 10,
+      "correctness_rate": 1.0,
+      "unsafe_writes": 0,
+      "latency_ms": {
+        "p50": 13.451,
+        "p95": 24.811,
+        "max": 24.811
       },
       "failures": []
     },
@@ -67,9 +126,9 @@
       "correctness_rate": 1.0,
       "unsafe_writes": 0,
       "latency_ms": {
-        "p50": 9.869,
-        "p95": 37.004,
-        "max": 37.004
+        "p50": 8.101,
+        "p95": 15.724,
+        "max": 15.724
       },
       "failures": []
     },
@@ -79,9 +138,9 @@
       "correctness_rate": 1.0,
       "unsafe_writes": 0,
       "latency_ms": {
-        "p50": 2.951,
-        "p95": 21.438,
-        "max": 21.438
+        "p50": 1.47,
+        "p95": 18.183,
+        "max": 18.183
       },
       "failures": []
     }
