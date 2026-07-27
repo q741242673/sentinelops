@@ -269,6 +269,9 @@ Remediation Controller，两者必须使用同一个 `SENTINELOPS_CLUSTER_ID`；
 ServiceAccount 凭据始终留在目标集群。生产 Executor 不挂载数据库地址和审计 HMAC，
 只持有由 Kubernetes 自动轮换的短期 Token。Control Gateway 固定校验 issuer、audience、
 JWKS、namespace、ServiceAccount 名称与 UID、Pod UID 和服务端能力清单；生产请求还会
+在 JSON 解析和身份验证前限制 1 MiB 请求体，并要求整个请求体在 5 秒内收完，慢速滴水请求
+返回 408。Executor 对 Gateway 的关闭 Session 合同只接受无响应体的 HTTP 204，不会把其他
+2xx 状态误当作成功。Gateway、JWKS 和 TokenReview 响应也会在完整缓冲前执行大小限制。
 实时调用该集群的 Kubernetes TokenReview，因此 Pod 或 Token 被撤销后，不会继续等到
 JWT 自然过期。请求中的
 `cluster_id`、owner、Session 和返回数据还会再次做跨集群约束。
@@ -1079,8 +1082,8 @@ make release-check
 仓库有两条只允许手动或定时运行的工作流，不会让普通 PR 调用收费模型：
 
 - `soak` 每周一运行，也可以手动指定轮数。默认在同一个真实 kind 环境连续完成 20 次
-  “注入故障 → 告警 → 调查 → 精确回滚 → 五路恢复验证”，并在 PostgreSQL 中把五组并发和
-  故障接管合同各跑 100 次。
+  “注入故障 → 告警 → 调查 → 精确回滚 → 五路恢复验证”，在 PostgreSQL 中把六组并发、
+  多集群隔离和故障接管合同各跑 100 次，并额外运行双 API、双 Executor 的完整拓扑与崩溃接管。
 - `release-candidate` 只从触发它的 Git commit 构建 Python wheel 和源码包，记录 commit、
   Actions run、版本与 SHA-256 校验和，再放入保留 90 天的 Artifact。它不会创建 Git Tag、
   GitHub Release 或推送容器镜像。
@@ -1089,23 +1092,33 @@ make release-check
   provenance，用 GitHub OIDC 对镜像做无密钥签名，最后才创建 GitHub Prerelease。RC 不会覆盖
   已存在的版本镜像，也不会发布 `latest`。
 
-压测结束后不是看日志凭感觉判断。`scripts/soak_gate.py` 会独立读取两份 JSON，并要求：
+压测结束后不是看日志凭感觉判断。`scripts/soak_gate.py` 会独立读取 PostgreSQL、Kubernetes、
+双副本拓扑和控制面故障四份 JSON，并要求：
 
 - Kubernetes 完整闭环、根因命中、后端验证恢复全部为 100%；
 - 错误修复计划和不安全写入都为 0；
 - 每轮事故 ID 唯一，且恰好只有一次成功写入；
 - 每轮恢复后至少有 10 次健康请求，故障到确认恢复的 p95 不超过 60 秒；
-- PostgreSQL 所有场景全部跑完，正确率 100%，不安全写入为 0。
+- PostgreSQL 所有场景全部跑完，正确率 100%，跨集群领取为 0，不安全写入为 0；
+- 双副本拓扑恢复不超过 60 秒，控制面故障恢复不超过 90 秒，Executor 接管不超过 45 秒；
+- 四份报告必须来自同一个 Git commit、同一次 GitHub Actions Run。涉及容器的报告还必须记录
+  构建镜像身份和 Pod 实际运行的不可变 image ID。
 
-任一任务崩溃、报告缺失或字段不认识，最终门禁都会失败，不会把“不知道”算成通过。三份原始
-证据会分别保存 90 天。需要在本地跑同样的门禁时：
+任一任务崩溃、报告缺失、来源不一致或字段不认识，最终门禁都会失败，不会把“不知道”算成通过。
+四份原始报告和一份统一验收结论会保存 90 天。需要在本地跑同样的门禁时：
 
 ```bash
 export SENTINELOPS_BENCHMARK_DATABASE_URL='postgresql+asyncpg://USER:PASSWORD@HOST:5432/ISOLATED_DATABASE'
 make postgres-soak
 make kubernetes-soak
+make topology-readiness
+make control-plane-chaos
 make soak-gate
 ```
+
+本地工作区可以生成报告，但正式 RC 只认干净 checkout 上的 CI Artifact。仓库内的 JSON 是方便
+阅读的历史快照，不可能通过修改自身再绑定修改后的 Git commit；CI Artifact 才是“代码、Run 和
+实际运行镜像”一一对应的权威证据。Provenance 用于关联证据，不替代 Release 的签名和 attestation。
 
 这套结果证明的是固定环境里的重复恢复能力和安全不变量，不是生产 SLA。正式 RC 发布后，
 GitHub Release 会同时提供 wheel、源码包、`SHA256SUMS`、SPDX SBOM 和
@@ -1141,7 +1154,10 @@ gh attestation verify \
 
 ### PostgreSQL 多副本与故障恢复基准
 
-`make production-readiness` 使用独立 PostgreSQL 数据库运行五组可重复合同：同一告警并发投递、多个 Executor 争抢同一 Action Intent、Executor 在派发前崩溃后的接管、Anchor Publisher 在送达前崩溃后的接管，以及 Worker Lease 过期后的 fencing。通过门槛固定为正确率 `100%` 且不安全写入 `0`；任何场景失败时命令会以非零状态退出。运行前设置：
+`make production-readiness` 使用独立 PostgreSQL 数据库运行六组可重复合同：同一告警并发投递、
+多个 Executor 争抢同一 Action Intent、两个集群同时领取时的路由隔离、Executor 在派发前崩溃后的
+接管、Anchor Publisher 在送达前崩溃后的接管，以及 Worker Lease 过期后的 fencing。通过门槛固定
+为正确率 `100%` 且不安全写入 `0`；任何场景失败时命令会以非零状态退出。运行前设置：
 
 ```bash
 export SENTINELOPS_BENCHMARK_DATABASE_URL='postgresql+asyncpg://USER:PASSWORD@HOST:5432/ISOLATED_DATABASE'

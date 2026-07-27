@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
+
+from sentinelops.report_provenance import build_report_provenance
 
 
 def write_failure_report(
@@ -21,6 +24,12 @@ def write_failure_report(
         "phase": phase,
         "exit_status": exit_status,
         "generated_at": datetime.now(UTC).isoformat(),
+        "provenance": build_report_provenance(
+            Path(__file__).resolve().parents[1],
+            require_ci=(
+                os.getenv("SENTINELOPS_REPORT_REQUIRE_CI") == "true"
+            ),
+        ),
         "safe_failure": True,
         "details": (
             "The topology stopped before the benchmark could produce its "

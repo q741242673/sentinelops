@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
@@ -192,9 +193,17 @@ class _Store:
         return self.intent
 
 
-def _app(store: _Store, authenticator: _Authenticator) -> FastAPI:
+def _app(
+    store: _Store,
+    authenticator: _Authenticator,
+    *,
+    body_read_timeout_seconds: float = 5.0,
+) -> FastAPI:
     app = FastAPI()
-    app.add_middleware(ExecutorControlBodyLimitMiddleware)
+    app.add_middleware(
+        ExecutorControlBodyLimitMiddleware,
+        body_read_timeout_seconds=body_read_timeout_seconds,
+    )
     app.include_router(
         build_executor_control_router(
             store_provider=lambda: store,
@@ -217,6 +226,13 @@ class _ChunkedBody(httpx.AsyncByteStream):
             return next(self._iterator)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
+
+
+class _SlowChunkedBody(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b"{"
+        await asyncio.sleep(0.05)
+        yield b"}"
 
 
 @pytest.mark.asyncio
@@ -400,6 +416,33 @@ async def test_gateway_rejects_invalid_content_length_before_authentication() ->
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Invalid Content-Length header"
+    assert authenticator.calls == 0
+    assert store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_applies_one_deadline_to_the_complete_request_body() -> None:
+    store = _Store()
+    authenticator = _Authenticator()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(
+            app=_app(
+                store,
+                authenticator,
+                body_read_timeout_seconds=0.01,
+            )
+        ),
+        base_url="http://control.test",
+    ) as client:
+        response = await client.post(
+            "/internal/v1/executor/sessions",
+            content=_SlowChunkedBody(),
+        )
+
+    assert response.status_code == 408
+    assert response.json()["detail"] == (
+        "Executor control request body timed out"
+    )
     assert authenticator.calls == 0
     assert store.calls == []
 

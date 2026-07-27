@@ -44,6 +44,8 @@ soak-gate:
 	python scripts/soak_gate.py \
 		--kubernetes-report artifacts/kubernetes-soak.json \
 		--postgres-report artifacts/postgres-soak.json \
+		--topology-report artifacts/topology-readiness.json \
+		--chaos-report artifacts/control-plane-chaos.json \
 		--expected-kubernetes-rounds 20 \
 		--expected-postgres-rounds 100 \
 		--output artifacts/soak-acceptance.json
