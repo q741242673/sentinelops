@@ -230,6 +230,29 @@ def test_controller_e2e_intent_carries_registry_fence_identity() -> None:
     } <= keywords
 
 
+def test_controller_e2e_replacement_uses_authoritative_cluster_identity() -> None:
+    script = (SCRIPTS / "e2e-remediation-controller.py").read_text(encoding="utf-8")
+    tree = ast.parse(script)
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ExecutorWorker"
+    ]
+    assert len(constructors) == 1
+    keywords = {
+        keyword.arg for keyword in constructors[0].keywords if keyword.arg is not None
+    }
+    assert {
+        "cluster_id",
+        "cluster_display_name",
+        "default_namespace",
+        "instance_id",
+        "session_id",
+    } <= keywords
+
+
 def test_topology_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:
     api_role = _resource(
         "Role",

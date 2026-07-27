@@ -355,6 +355,10 @@ async def main() -> None:
             None,
             owner_id="kind-executor-replacement",
             cluster_id=CLUSTER_ID,
+            cluster_display_name=f"{CLUSTER_ID} E2E cluster",
+            default_namespace=NAMESPACE,
+            instance_id="kind-executor-replacement",
+            session_id="kind-controller-recovery-session",
             remediation_gateway=KubernetesRemediationGateway(
                 NAMESPACE,
                 cluster_id=CLUSTER_ID,
