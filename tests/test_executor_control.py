@@ -620,3 +620,62 @@ async def test_close_session_and_http_client(tmp_path) -> None:
     assert requests[0].url.path == (f"{EXECUTOR_CONTROL_PREFIX}/sessions/session-a")
     assert json.loads(requests[0].content)["token"]["generation"] == 2
     assert client._client.is_closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [200, 202, 205])
+async def test_close_session_requires_exact_http_204(
+    tmp_path,
+    status_code: int,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"status": "accepted"})
+
+    client, _ = _client(tmp_path, handler)
+    try:
+        with pytest.raises(
+            ExecutorControlProtocolError,
+            match="must return HTTP 204",
+        ):
+            await client.close_cluster_agent(_lease())
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_gateway_request_timeout_is_reported_as_unavailable(tmp_path) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            408,
+            json={"detail": "Executor control request body timed out"},
+        )
+
+    client, _ = _client(tmp_path, handler)
+    try:
+        with pytest.raises(
+            ExecutorControlUnavailableError,
+            match="timed out",
+        ):
+            await client.ensure_cluster_registration(
+                cluster_id="cluster-a",
+                display_name="生产集群 A",
+                default_namespace="sentinelops-system",
+            )
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_close_session_rejects_body_with_http_204(tmp_path) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(204, content=b"unexpected")
+
+    client, _ = _client(tmp_path, handler)
+    try:
+        with pytest.raises(
+            ExecutorControlProtocolError,
+            match="body with HTTP 204",
+        ):
+            await client.close_cluster_agent(_lease())
+    finally:
+        await client.aclose()

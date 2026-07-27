@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,6 +35,7 @@ StoreProvider = Callable[[], IncidentStore | None]
 AuthenticatorProvider = Callable[[], WorkloadIdentityAuthenticator | None]
 
 EXECUTOR_CONTROL_MAX_BODY_BYTES = 1_048_576
+EXECUTOR_CONTROL_BODY_READ_TIMEOUT_SECONDS = 5.0
 
 
 class ExecutorControlBodyLimitMiddleware:
@@ -44,11 +46,19 @@ class ExecutorControlBodyLimitMiddleware:
         app: ASGIApp,
         *,
         max_body_bytes: int = EXECUTOR_CONTROL_MAX_BODY_BYTES,
+        body_read_timeout_seconds: float = (
+            EXECUTOR_CONTROL_BODY_READ_TIMEOUT_SECONDS
+        ),
     ) -> None:
         if max_body_bytes <= 0:
             raise ValueError("Executor control request body limit must be positive")
+        if body_read_timeout_seconds <= 0:
+            raise ValueError(
+                "Executor control body read timeout must be positive"
+            )
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.body_read_timeout_seconds = body_read_timeout_seconds
 
     async def __call__(
         self,
@@ -86,25 +96,39 @@ class ExecutorControlBodyLimitMiddleware:
 
         buffered: list[Message] = []
         received_bytes = 0
-        while True:
-            message = await receive()
-            buffered.append(message)
-            if message["type"] == "http.disconnect":
-                break
-            if message["type"] != "http.request":
-                continue
-            received_bytes += len(message.get("body", b""))
-            if received_bytes > self.max_body_bytes:
-                await self._respond(
-                    scope,
-                    receive,
-                    send,
-                    status_code=413,
-                    detail="Executor control request body is too large",
-                )
-                return
-            if not message.get("more_body", False):
-                break
+        rejection: tuple[int, str] | None = None
+        try:
+            async with asyncio.timeout(self.body_read_timeout_seconds):
+                while True:
+                    message = await receive()
+                    buffered.append(message)
+                    if message["type"] == "http.disconnect":
+                        break
+                    if message["type"] != "http.request":
+                        continue
+                    received_bytes += len(message.get("body", b""))
+                    if received_bytes > self.max_body_bytes:
+                        rejection = (
+                            413,
+                            "Executor control request body is too large",
+                        )
+                        break
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            rejection = (
+                408,
+                "Executor control request body timed out",
+            )
+        if rejection is not None:
+            await self._respond(
+                scope,
+                receive,
+                send,
+                status_code=rejection[0],
+                detail=rejection[1],
+            )
+            return
 
         buffered_index = 0
 

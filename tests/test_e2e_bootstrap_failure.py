@@ -44,6 +44,17 @@ def test_bootstrap_failure_report_is_bounded_and_structured(tmp_path) -> None:
         "phase",
         "exit_status",
         "generated_at",
+        "provenance",
         "safe_failure",
         "details",
     }
+    assert report["provenance"]["source"]["commit"]
+    assert report["provenance"]["subjects"] == [
+        {
+            "kind": "git_checkout",
+            "digest": {
+                "algorithm": "git-sha1",
+                "value": report["provenance"]["source"]["commit"],
+            },
+        }
+    ]

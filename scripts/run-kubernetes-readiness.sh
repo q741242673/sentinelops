@@ -41,6 +41,31 @@ start_port_forward() {
 
 "${ROOT_DIR}/scripts/observability-up.sh"
 
+export SENTINELOPS_REPORT_IMAGE_REFERENCE="sentinelops-demo-services:local"
+export SENTINELOPS_REPORT_IMAGE_BUILD_DIGEST="$(
+  docker image inspect \
+    --format '{{.Id}}' \
+    "${SENTINELOPS_REPORT_IMAGE_REFERENCE}"
+)"
+RUNNING_IMAGE_REFERENCES="$(
+  for deployment in inventory-service order-service; do
+    kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+      get pods --selector "app=${deployment}" \
+      --output jsonpath='{range .items[*].spec.containers[*]}{.image}{"\n"}{end}'
+  done | sort --unique
+)"
+if [[ "${RUNNING_IMAGE_REFERENCES}" != "${SENTINELOPS_REPORT_IMAGE_REFERENCE}" ]]; then
+  echo "Readiness workloads are not running the expected image reference" >&2
+  exit 1
+fi
+export SENTINELOPS_REPORT_RUNNING_IMAGE_IDS="$(
+  for deployment in inventory-service order-service; do
+    kubectl --context "${CONTEXT}" --namespace sentinelops-demo \
+      get pods --selector "app=${deployment}" \
+      --output jsonpath='{range .items[*].status.containerStatuses[*]}{.imageID}{"\n"}{end}'
+  done | sort --unique | paste -sd, -
+)"
+
 start_port_forward service/order-service 18080:8000
 start_port_forward service/prometheus 19090:9090
 start_port_forward service/loki 13100:3100

@@ -24,6 +24,12 @@
 - 生产 Executor 改为使用 Kubernetes 投影的短期 ServiceAccount Token 访问受认证的 Control Gateway，不再挂载 PostgreSQL URL 或审计 HMAC；Gateway 固定校验集群、Issuer、ServiceAccount UID、Pod UID 和服务端能力清单；
 - 中文控制台显示集群连接目录、活跃 Executor 和最后心跳，并明确区分“执行端在线”和“业务健康”；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
+- 生产验收报告绑定实际测试的 Git commit、GitHub Actions Run、构建镜像身份和 Pod 运行
+  image ID；RC soak 会拒绝拼接不同提交或不同 Run 的证据。
+- RC soak 增加双 API/双 Executor 拓扑、Executor 崩溃接管和 PostgreSQL 双集群路由隔离，
+  统一输出恢复与接管延迟，并保持不安全写入必须为 0。
+- Control Gateway 为 Executor 请求体增加 5 秒总读取 deadline；Executor 关闭 Session 只接受
+  无响应体的 HTTP 204。
 
 升级与迁移：
 

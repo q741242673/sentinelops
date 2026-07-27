@@ -572,9 +572,20 @@ class HttpExecutorControlPlane:
             raise ExecutorControlUnavailableError(
                 self._error_message(response, "Executor control gateway failed")
             )
+        if response.status_code == 408:
+            raise ExecutorControlUnavailableError(
+                self._error_message(
+                    response,
+                    "Executor control request timed out at the gateway",
+                )
+            )
         if response.is_redirect:
             raise ExecutorControlProtocolError("Executor control gateway redirects are forbidden")
         if response.status_code == 204:
+            if response.content:
+                raise ExecutorControlProtocolError(
+                    "Executor control gateway returned a body with HTTP 204"
+                )
             if allow_no_content or expected_empty:
                 return None
             raise ExecutorControlProtocolError(
@@ -588,7 +599,9 @@ class HttpExecutorControlPlane:
                 )
             )
         if expected_empty:
-            return None
+            raise ExecutorControlProtocolError(
+                "Executor control gateway must return HTTP 204"
+            )
         content_type = response.headers.get("content-type", "")
         media_type = content_type.split(";", 1)[0].strip().casefold()
         if media_type != "application/json" and not media_type.endswith("+json"):

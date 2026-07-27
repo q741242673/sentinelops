@@ -19,6 +19,7 @@ import httpx
 
 from sentinelops.config import Settings
 from sentinelops.domain import Alert, IncidentStatus
+from sentinelops.report_provenance import build_report_provenance
 from sentinelops.runtime import build_agent
 
 WRITE_TOOLS = {
@@ -817,6 +818,7 @@ def _report(
     rounds: int,
     results: list[TrialResult],
     duration_ms: float,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     passed_trials = sum(item.passed for item in results)
     correct_root_causes = sum(
@@ -875,6 +877,7 @@ def _report(
         "schema_version": "sentinelops.kubernetes-readiness.v1",
         "run_id": run_id,
         "generated_at": datetime.now(UTC).isoformat(),
+        "provenance": provenance,
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -979,6 +982,13 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         rounds=args.rounds,
         results=results,
         duration_ms=(perf_counter() - started) * 1_000,
+        provenance=build_report_provenance(
+            args.root,
+            require_ci=(
+                os.getenv("SENTINELOPS_REPORT_REQUIRE_CI") == "true"
+            ),
+            require_container=True,
+        ),
     )
 
 

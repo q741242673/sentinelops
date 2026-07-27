@@ -693,11 +693,21 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
         agent_lease=agent,
         owner_id="executor-a",
         attempt_id="immutable-attempt",
-        ttl_seconds=1,
+        ttl_seconds=60,
     )
     assert claim is not None
     await store.mark_action_dispatched(claim, agent_lease=agent)
-    await asyncio.sleep(1.2)
+    async with store.engine.begin() as connection:
+        await connection.execute(
+            update(action_intents)
+            .where(
+                action_intents.c.idempotency_key
+                == claim.idempotency_key
+            )
+            .values(
+                executor_lease_until="2000-01-01T00:00:00+00:00"
+            )
+        )
 
     assert (
         await store.claim_action_execution(

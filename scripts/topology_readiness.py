@@ -36,6 +36,7 @@ from sentinelops.anchor_crypto import (
     verify_receipt_signature,
 )
 from sentinelops.migration import HEAD_REVISIONS
+from sentinelops.report_provenance import build_report_provenance
 
 INCIDENT_ID = re.compile(r"^[0-9a-f-]{36}$")
 
@@ -337,6 +338,7 @@ SELECT json_build_object(
   'action_claim_events', COALESCE((
     SELECT json_agg(json_build_object(
       'actor_id', actor_id,
+      'occurred_at', occurred_at,
       'payload', payload
     ) ORDER BY sequence)
     FROM sentinelops_audit_events
@@ -1428,6 +1430,18 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
             if args.control_plane_chaos:
                 claim_events = database_snapshot.get("action_claim_events") or []
                 requeue_events = database_snapshot.get("action_requeue_events") or []
+                if len(claim_events) == 2:
+                    first_claim_at = datetime.fromisoformat(
+                        str(claim_events[0]["occurred_at"])
+                    )
+                    final_claim_at = datetime.fromisoformat(
+                        str(claim_events[1]["occurred_at"])
+                    )
+                    timings["executor_takeover"] = max(
+                        0.0,
+                        (final_claim_at - first_claim_at).total_seconds()
+                        * 1_000,
+                    )
                 final_executor_generation = (
                     int(intents[0].get("executor_generation", 0)) if len(intents) == 1 else 0
                 )
@@ -1445,6 +1459,9 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                         "final_executor_generation": (final_executor_generation),
                         "claim_events": len(claim_events),
                         "requeue_events": len(requeue_events),
+                        "executor_takeover_ms": timings.get(
+                            "executor_takeover"
+                        ),
                     }
                 )
             checks["approval_persisted"] = database_snapshot.get("approval_status") == "approved"
@@ -1694,6 +1711,7 @@ def _report(
     trial: TopologyTrial,
     *,
     duration_ms: float,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     thresholds_passed = (
         trial.passed
@@ -1715,6 +1733,7 @@ def _report(
         ),
         "run_id": uuid4().hex,
         "generated_at": datetime.now(UTC).isoformat(),
+        "provenance": provenance,
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -1773,6 +1792,13 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
     return _report(
         trial,
         duration_ms=(perf_counter() - started) * 1000,
+        provenance=build_report_provenance(
+            args.root,
+            require_ci=(
+                os.getenv("SENTINELOPS_REPORT_REQUIRE_CI") == "true"
+            ),
+            require_container=True,
+        ),
     )
 
 

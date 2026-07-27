@@ -27,8 +27,16 @@ def test_soak_workflow_is_bounded_fail_closed_and_keeps_evidence() -> None:
     assert 'default: "100"' in workflow
     assert "cancel-in-progress: false" in workflow
     assert "python scripts/soak_gate.py" in workflow
+    assert "topology-stability:" in workflow
+    assert "--topology-report" in workflow
+    assert "--chaos-report" in workflow
+    assert "--max-p95-executor-takeover-ms 45000" in workflow
+    assert '--expected-git-commit "$GITHUB_SHA"' in workflow
+    assert '--expected-github-run-id "$GITHUB_RUN_ID"' in workflow
+    assert "SENTINELOPS_REPORT_GIT_COMMIT" in workflow
+    assert "SENTINELOPS_REPORT_GITHUB_RUN_ID" in workflow
     assert "continue-on-error: true" in workflow
-    assert workflow.count("retention-days: 90") == 3
+    assert workflow.count("retention-days: 90") == 4
     assert "--retry 5" in workflow
     assert "--retry-all-errors" in workflow
     assert "--max-time 180" in workflow
@@ -43,6 +51,22 @@ def test_soak_workflow_is_bounded_fail_closed_and_keeps_evidence() -> None:
     assert DOWNLOAD_ARTIFACT_SHA in workflow
     assert "API_KEY" not in workflow
     assert "MODEL_PROVIDER" not in workflow
+
+
+def test_kubernetes_report_entrypoints_bind_running_image_identity() -> None:
+    for path in (
+        "scripts/e2e-observability.sh",
+        "scripts/run-kubernetes-readiness.sh",
+    ):
+        script = _read(path)
+        report_call = script.index("scripts/kubernetes_readiness.py")
+        for variable in (
+            "SENTINELOPS_REPORT_IMAGE_REFERENCE",
+            "SENTINELOPS_REPORT_IMAGE_BUILD_DIGEST",
+            "SENTINELOPS_REPORT_RUNNING_IMAGE_IDS",
+        ):
+            assert script.index(f"export {variable}") < report_call
+        assert ".status.containerStatuses[*]}{.imageID}" in script
 
 
 def test_release_candidate_workflow_builds_without_publishing() -> None:

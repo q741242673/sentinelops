@@ -437,6 +437,33 @@ if [[ "${#API_PODS[@]}" -ne 2 ]]; then
   exit 1
 fi
 
+export SENTINELOPS_REPORT_IMAGE_REFERENCE="${IMAGE}"
+export SENTINELOPS_REPORT_IMAGE_BUILD_DIGEST="$(
+  docker image inspect --format '{{.Id}}' "${IMAGE}"
+)"
+RUNNING_IMAGE_REFERENCES="$(
+  for selector in \
+    "app.kubernetes.io/name=sentinelops-api" \
+    "app.kubernetes.io/name=sentinelops-executor"; do
+    kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+      get pods --selector "${selector}" \
+      --output jsonpath='{range .items[*].spec.containers[*]}{.image}{"\n"}{end}'
+  done | sort --unique
+)"
+if [[ "${RUNNING_IMAGE_REFERENCES}" != "${IMAGE}" ]]; then
+  echo "Control plane is not running the expected image reference" >&2
+  exit 1
+fi
+export SENTINELOPS_REPORT_RUNNING_IMAGE_IDS="$(
+  for selector in \
+    "app.kubernetes.io/name=sentinelops-api" \
+    "app.kubernetes.io/name=sentinelops-executor"; do
+    kubectl --context "${CONTEXT}" --namespace sentinelops-system \
+      get pods --selector "${selector}" \
+      --output jsonpath='{range .items[*].status.containerStatuses[*]}{.imageID}{"\n"}{end}'
+  done | sort --unique | paste -sd, -
+)"
+
 start_port_forward sentinelops-demo service/order-service 18080:8000
 start_port_forward sentinelops-demo service/prometheus 19090:9090
 start_port_forward sentinelops-system "pod/${API_PODS[0]}" 18100:8000

@@ -25,6 +25,7 @@ from sentinelops.domain import (
     ToolResult,
 )
 from sentinelops.migration import require_current_schema, upgrade_database
+from sentinelops.report_provenance import build_report_provenance
 from sentinelops.storage import (
     ActionIntentConflictError,
     AuditAnchorConflictError,
@@ -72,15 +73,16 @@ async def _executor_agent(
     store: SqlIncidentStore,
     *,
     identity: str,
+    cluster_id: str = CLUSTER_ID,
 ):
     await store.ensure_cluster_registration(
-        cluster_id=CLUSTER_ID,
+        cluster_id=cluster_id,
         display_name="Production readiness cluster",
         default_namespace="sentinelops-benchmark",
     )
     identity_hash = hashlib.sha256(identity.encode()).hexdigest()[:32]
     return await store.register_cluster_agent(
-        cluster_id=CLUSTER_ID,
+        cluster_id=cluster_id,
         instance_id=f"benchmark-executor-{identity_hash}",
         session_id=f"benchmark-{identity_hash}",
         capabilities=("action.execute", "action.reconcile"),
@@ -89,11 +91,17 @@ async def _executor_agent(
     )
 
 
-def _record(run_id: str, scenario: str, trial: int) -> IncidentRecord:
+def _record(
+    run_id: str,
+    scenario: str,
+    trial: int,
+    *,
+    cluster_id: str = CLUSTER_ID,
+) -> IncidentRecord:
     return IncidentRecord(
         alert=Alert(
             name=f"ProductionReadiness{scenario}",
-            cluster_id=CLUSTER_ID,
+            cluster_id=cluster_id,
             namespace="sentinelops-benchmark",
             service="order-service",
             severity="critical",
@@ -136,14 +144,19 @@ def _alert_placeholder(
     )
 
 
-def _action(run_id: str, trial: int) -> RemediationAction:
+def _action(
+    run_id: str,
+    trial: int,
+    *,
+    cluster_id: str = CLUSTER_ID,
+) -> RemediationAction:
     return RemediationAction(
         tool_name="restart_deployment",
         arguments={
             "namespace": "sentinelops-benchmark",
             "name": f"order-service-{trial}",
         },
-        rationale=f"production readiness {run_id}",
+        rationale=f"production readiness {run_id} {cluster_id}",
         expected_outcome="exactly one executor owns the write intent",
         risk=RiskLevel.MEDIUM,
     )
@@ -305,8 +318,15 @@ async def _prepare_intent(
     run_id: str,
     scenario: str,
     trial: int,
+    *,
+    cluster_id: str = CLUSTER_ID,
 ) -> tuple[IncidentRecord, str]:
-    record = _record(run_id, scenario, trial)
+    record = _record(
+        run_id,
+        scenario,
+        trial,
+        cluster_id=cluster_id,
+    )
     await store.save(record, expected_version=None, graph_state=None)
     lease = await store.acquire_lease(
         record.id,
@@ -314,14 +334,14 @@ async def _prepare_intent(
         ttl_seconds=60,
     )
     idempotency_key = hashlib.sha256(
-        f"{run_id}\0{scenario}\0{trial}".encode()
+        f"{run_id}\0{scenario}\0{trial}\0{cluster_id}".encode()
     ).hexdigest()
     await store.prepare_action(
         lease,
         idempotency_key=idempotency_key,
-        action=_action(run_id, trial),
+        action=_action(run_id, trial, cluster_id=cluster_id),
         precondition={
-            "cluster_id": CLUSTER_ID,
+            "cluster_id": cluster_id,
             "resource_version": f"{run_id}-{trial}",
         },
     )
@@ -415,6 +435,164 @@ async def _executor_single_claim(
         await asyncio.gather(
             *(store.close() for store in stores),
         )
+    return observations
+
+
+async def _multi_cluster_routing_isolation(
+    database_url: str,
+    run_id: str,
+    rounds: int,
+    concurrency: int,
+) -> list[Observation]:
+    cluster_ids = (
+        f"{CLUSTER_ID}-a",
+        f"{CLUSTER_ID}-b",
+    )
+    contenders_per_cluster = max(2, min(concurrency // 2, 4))
+    stores = [
+        _store(database_url)
+        for _ in range(contenders_per_cluster * len(cluster_ids))
+    ]
+    observations: list[Observation] = []
+    try:
+        for trial in range(rounds):
+            contenders: list[
+                tuple[SqlIncidentStore, object, str, int]
+            ] = []
+            for cluster_index, cluster_id in enumerate(cluster_ids):
+                for contender_index in range(contenders_per_cluster):
+                    index = (
+                        cluster_index * contenders_per_cluster
+                        + contender_index
+                    )
+                    store = stores[index]
+                    lease = await _executor_agent(
+                        store,
+                        identity=(
+                            f"{run_id}-{trial}-{cluster_id}-"
+                            f"{contender_index}"
+                        ),
+                        cluster_id=cluster_id,
+                    )
+                    contenders.append(
+                        (
+                            store,
+                            lease,
+                            cluster_id,
+                            contender_index,
+                        )
+                    )
+
+            expected_intents: dict[str, str] = {}
+            for cluster_index, cluster_id in enumerate(cluster_ids):
+                _record_value, idempotency_key = await _prepare_intent(
+                    stores[cluster_index * contenders_per_cluster],
+                    run_id,
+                    "MultiClusterRoutingIsolation",
+                    trial,
+                    cluster_id=cluster_id,
+                )
+                expected_intents[cluster_id] = idempotency_key
+
+            started = perf_counter()
+            claims = await asyncio.gather(
+                *[
+                    contender_store.claim_action_execution(
+                        agent_lease=agent_lease,
+                        owner_id=(
+                            f"executor-{cluster_id}-{run_id[:8]}-"
+                            f"{trial}-{contender_index}"
+                        ),
+                        attempt_id=(
+                            f"route-{run_id[:8]}-{trial}-"
+                            f"{cluster_id[-1]}-{contender_index}"
+                        ),
+                        ttl_seconds=60,
+                    )
+                    for (
+                        contender_store,
+                        agent_lease,
+                        cluster_id,
+                        contender_index,
+                    ) in contenders
+                ]
+            )
+            latency_ms = (perf_counter() - started) * 1_000
+            winners: dict[str, list[int]] = {
+                cluster_id: [] for cluster_id in cluster_ids
+            }
+            cross_cluster_claims = 0
+            for index, claim in enumerate(claims):
+                if claim is None:
+                    continue
+                contender_cluster = contenders[index][2]
+                if (
+                    claim.cluster_id != contender_cluster
+                    or claim.idempotency_key
+                    != expected_intents[contender_cluster]
+                ):
+                    cross_cluster_claims += 1
+                    continue
+                winners[contender_cluster].append(index)
+
+            for cluster_id, winner_indexes in winners.items():
+                if len(winner_indexes) != 1:
+                    continue
+                winner_index = winner_indexes[0]
+                winner_store, winner_agent, _cluster, _index = (
+                    contenders[winner_index]
+                )
+                winner_claim = claims[winner_index]
+                assert winner_claim is not None
+                await winner_store.mark_action_dispatched(
+                    winner_claim,
+                    agent_lease=winner_agent,
+                )
+                await winner_store.complete_action(
+                    claim=winner_claim,
+                    agent_lease=winner_agent,
+                    result=ToolResult(
+                        tool_name="restart_deployment",
+                        success=True,
+                        content={
+                            "cluster_routing_isolated": True,
+                            "cluster_id": cluster_id,
+                        },
+                    ),
+                )
+
+            duplicate_winners = sum(
+                max(0, len(indexes) - 1)
+                for indexes in winners.values()
+            )
+            unsafe_writes = cross_cluster_claims + duplicate_winners
+            passed = (
+                unsafe_writes == 0
+                and all(
+                    len(winners[cluster_id]) == 1
+                    for cluster_id in cluster_ids
+                )
+            )
+            observations.append(
+                Observation(
+                    scenario="multi_cluster_routing_isolation",
+                    trial=trial,
+                    passed=passed,
+                    latency_ms=latency_ms,
+                    unsafe_writes=unsafe_writes,
+                    details={
+                        "clusters": list(cluster_ids),
+                        "contenders_per_cluster": contenders_per_cluster,
+                        "winners_per_cluster": {
+                            cluster_id: len(indexes)
+                            for cluster_id, indexes in winners.items()
+                        },
+                        "cross_cluster_claims": cross_cluster_claims,
+                    },
+                )
+            )
+    finally:
+        await asyncio.gather(*(store.close() for store in stores))
     return observations
 
 
@@ -620,6 +798,7 @@ async def run(
     database_url: str,
     rounds: int,
     concurrency: int,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if not database_url.startswith(
         ("postgresql+asyncpg://", "postgres+asyncpg://")
@@ -674,6 +853,15 @@ async def run(
             ),
         ),
         (
+            "multi_cluster_routing_isolation",
+            lambda: _multi_cluster_routing_isolation(
+                database_url,
+                run_id,
+                rounds,
+                concurrency,
+            ),
+        ),
+        (
             "executor_crash_recovery",
             lambda: _executor_crash_recovery(
                 database_url,
@@ -721,6 +909,7 @@ async def run(
         "schema_version": "sentinelops.production-readiness.v1",
         "run_id": run_id,
         "generated_at": datetime.now(UTC).isoformat(),
+        "provenance": provenance,
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
@@ -734,6 +923,17 @@ async def run(
         "thresholds": {
             "correctness_rate": 1.0,
             "unsafe_writes": 0,
+        },
+        "reliability_latency_ms": {
+            "multi_replica_claim": results["executor_single_claim"][
+                "latency_ms"
+            ],
+            "executor_takeover": results["executor_crash_recovery"][
+                "latency_ms"
+            ],
+            "multi_cluster_routing": results[
+                "multi_cluster_routing_isolation"
+            ]["latency_ms"],
         },
         "summary": {
             "passed": passed,
@@ -787,6 +987,12 @@ def main() -> None:
             database_url=arguments.database_url,
             rounds=arguments.rounds,
             concurrency=arguments.concurrency,
+            provenance=build_report_provenance(
+                Path(__file__).resolve().parents[1],
+                require_ci=(
+                    os.getenv("SENTINELOPS_REPORT_REQUIRE_CI") == "true"
+                ),
+            ),
         )
     )
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
