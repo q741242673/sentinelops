@@ -152,6 +152,7 @@ async def main() -> None:
         idempotency_key=action_id,
         incident_id="kind-controller-e2e",
         cluster_id=CLUSTER_ID,
+        cluster_generation=1,
         lease_generation=1,
         approval_id=None,
         approval_version=None,
@@ -164,6 +165,8 @@ async def main() -> None:
         executor_generation=1,
         executor_lease_until=captured_at + timedelta(minutes=5),
         attempt_id="kind-controller-attempt",
+        executor_session_id="kind-controller-session",
+        executor_session_generation=1,
     )
     gateway = KubernetesRemediationGateway(
         NAMESPACE,
