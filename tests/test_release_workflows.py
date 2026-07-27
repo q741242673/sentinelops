@@ -53,6 +53,22 @@ def test_soak_workflow_is_bounded_fail_closed_and_keeps_evidence() -> None:
     assert "MODEL_PROVIDER" not in workflow
 
 
+def test_kubernetes_report_entrypoints_bind_running_image_identity() -> None:
+    for path in (
+        "scripts/e2e-observability.sh",
+        "scripts/run-kubernetes-readiness.sh",
+    ):
+        script = _read(path)
+        report_call = script.index("scripts/kubernetes_readiness.py")
+        for variable in (
+            "SENTINELOPS_REPORT_IMAGE_REFERENCE",
+            "SENTINELOPS_REPORT_IMAGE_BUILD_DIGEST",
+            "SENTINELOPS_REPORT_RUNNING_IMAGE_IDS",
+        ):
+            assert script.index(f"export {variable}") < report_call
+        assert ".status.containerStatuses[*]}{.imageID}" in script
+
+
 def test_release_candidate_workflow_builds_without_publishing() -> None:
     workflow = _read(".github/workflows/release-candidate.yml")
 
