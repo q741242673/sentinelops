@@ -4,11 +4,12 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from sentinelops.config import Settings
 from sentinelops.domain import Alert, ToolResult
 from sentinelops.executor import ExecutorWorker
+from sentinelops.executor_control import ExecutorControlUnavailableError
 from sentinelops.remediation_controller import RemediationObservation
 from sentinelops.runtime import build_agent
 from sentinelops.storage import (
@@ -97,6 +98,43 @@ class BlockingExecutorStore:
 
     async def claim_action_execution(self, **_kwargs):
         return None
+
+
+class ResponseLossStore:
+    def __init__(self, delegate: SqlIncidentStore) -> None:
+        self.delegate = delegate
+        self.lost = {"claim": False, "dispatch": False, "complete": False}
+
+    def __getattr__(self, name: str):
+        return getattr(self.delegate, name)
+
+    async def claim_action_execution(self, **kwargs):
+        result = await self.delegate.claim_action_execution(**kwargs)
+        if not self.lost["claim"]:
+            self.lost["claim"] = True
+            raise ExecutorControlUnavailableError("claim response lost")
+        return result
+
+    async def mark_action_dispatched(self, claim, *, agent_lease):
+        result = await self.delegate.mark_action_dispatched(
+            claim,
+            agent_lease=agent_lease,
+        )
+        if not self.lost["dispatch"]:
+            self.lost["dispatch"] = True
+            raise ExecutorControlUnavailableError("dispatch response lost")
+        return result
+
+    async def complete_action(self, *, claim, agent_lease, result):
+        stored = await self.delegate.complete_action(
+            claim=claim,
+            agent_lease=agent_lease,
+            result=result,
+        )
+        if not self.lost["complete"]:
+            self.lost["complete"] = True
+            raise ExecutorControlUnavailableError("complete response lost")
+        return stored
 
 
 class CloseAgentAfterClaimStore:
@@ -563,6 +601,85 @@ async def test_expired_claim_is_requeued_and_stale_attempt_is_fenced(tmp_path) -
     assert dispatched.status == "dispatched"
     assert dispatched.attempt_id == "current-attempt"
     assert dispatched.incident_id == record.id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_action_claim_and_dispatch_exact_replay_are_idempotent(tmp_path) -> None:
+    store, record, _, intent = await _queued_intent(tmp_path)
+    agent = await _cluster_agent(store, instance_id="executor-replay")
+    claim = await store.claim_action_execution(
+        agent_lease=agent,
+        owner_id="executor-replay",
+        attempt_id="stable-request-attempt",
+        ttl_seconds=60,
+    )
+    assert claim is not None
+
+    replayed_claim = await store.claim_action_execution(
+        agent_lease=agent,
+        owner_id="executor-replay",
+        attempt_id="stable-request-attempt",
+        ttl_seconds=60,
+    )
+    assert replayed_claim == claim
+
+    dispatched = await store.mark_action_dispatched(
+        claim,
+        agent_lease=agent,
+    )
+    replayed_dispatch = await store.mark_action_dispatched(
+        claim,
+        agent_lease=agent,
+    )
+    assert replayed_dispatch == dispatched
+    assert replayed_dispatch.idempotency_key == intent.idempotency_key
+
+    audit = await store.list_audit_events(record.id)
+    assert sum(event.event_type == "action.claimed" for event in audit) == 1
+    assert sum(event.event_type == "action.dispatched" for event in audit) == 1
+    async with store.engine.connect() as connection:
+        outbox_count = (
+            await connection.execute(
+                select(func.count())
+                .select_from(action_reconciliation_outbox)
+                .where(
+                    action_reconciliation_outbox.c.action_id
+                    == intent.idempotency_key
+                )
+            )
+        ).scalar_one()
+    assert outbox_count == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_executor_recovers_lost_gateway_responses_without_duplicate_write(
+    tmp_path,
+) -> None:
+    store, record, _, _ = await _queued_intent(tmp_path)
+    backend = RecordingWriteBackend()
+    wrapped = ResponseLossStore(store)
+    worker = ExecutorWorker(
+        wrapped,
+        ToolRegistry(backend),
+        owner_id="executor-response-loss",
+        cluster_id="local",
+        instance_id="executor-response-loss",
+        session_id="response-loss-session",
+    )
+
+    assert await worker.run_once() is True
+
+    completed = await store.latest_action_intent(record.id)
+    assert completed is not None
+    assert completed.status == "succeeded"
+    assert len(backend.calls) == 1
+    assert all(wrapped.lost.values())
+    audit = await store.list_audit_events(record.id)
+    assert sum(event.event_type == "action.claimed" for event in audit) == 1
+    assert sum(event.event_type == "action.dispatched" for event in audit) == 1
+    assert sum(event.event_type == "action.succeeded" for event in audit) == 1
     await store.close()
 
 

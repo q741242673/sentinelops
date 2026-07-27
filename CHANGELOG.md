@@ -21,6 +21,7 @@
 - Go Controller 持续核验准入 CRD、策略、绑定、白名单与 namespace 模式，并在每次 Deployment 写入前通过非缓存 API 读取 fail-closed；
 - 事故、审批快照、Action Intent、Executor 队列和 Controller 合同绑定服务端 `cluster_id`，共享数据库下不会跨集群领取或恢复写操作；
 - 持久化集群目录和 Executor 短租约心跳；任务领取、续租、写入分界和结果对账同时校验集群路由代次与 Executor Session 代次，过期实例不能继续写入；
+- 生产 Executor 改为使用 Kubernetes 投影的短期 ServiceAccount Token 访问受认证的 Control Gateway，不再挂载 PostgreSQL URL 或审计 HMAC；Gateway 固定校验集群、Issuer、ServiceAccount UID、Pod UID 和服务端能力清单；
 - 中文控制台显示集群连接目录、活跃 Executor 和最后心跳，并明确区分“执行端在线”和“业务健康”；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
 

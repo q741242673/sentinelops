@@ -33,6 +33,8 @@ metadata:
   namespace: sentinelops-system
 data:
   SENTINELOPS_ENVIRONMENT: staging
+  SENTINELOPS_CLUSTER_ID: kind-topology-e2e
+  SENTINELOPS_CLUSTER_DISPLAY_NAME: Kind 拓扑验收集群
   SENTINELOPS_TOOL_BACKEND: kubernetes
   SENTINELOPS_KUBERNETES_NAMESPACE: sentinelops-demo
   SENTINELOPS_DATABASE_AUTO_CREATE: "false"

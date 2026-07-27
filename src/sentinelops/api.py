@@ -28,6 +28,7 @@ from sentinelops.change_proposals import (
     build_change_proposal,
 )
 from sentinelops.config import Settings, get_settings
+from sentinelops.control_gateway import build_executor_control_router
 from sentinelops.demo import (
     build_demo_alert,
     enrich_alert_with_failed_trace,
@@ -77,6 +78,7 @@ from sentinelops.storage import (
     StoredIncident,
 )
 from sentinelops.tools import ToolRegistry, build_tool_registry
+from sentinelops.workload_identity import WorkloadIdentityAuthenticator
 
 
 @asynccontextmanager
@@ -165,6 +167,7 @@ incident_versions: dict[str, int] = {}
 incident_recovery_errors: dict[str, str] = {}
 incident_store: IncidentStore | None = None
 operator_authenticator: OIDCAuthenticator | None = None
+workload_identity_authenticator: WorkloadIdentityAuthenticator | None = None
 embedded_executor_task: asyncio.Task[None] | None = None
 embedded_executor_tools: ToolRegistry | None = None
 worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
@@ -175,6 +178,13 @@ demo_fault_tasks: set[asyncio.Task[None]] = set()
 lab_profiles = LabProfileCoordinator()
 incident_streams: dict[str, set[asyncio.Queue[str]]] = {}
 incident_feed_streams: set[asyncio.Queue[str]] = set()
+
+app.include_router(
+    build_executor_control_router(
+        store_provider=lambda: incident_store,
+        authenticator_provider=lambda: workload_identity_authenticator,
+    )
+)
 
 
 class ApprovalDecision(BaseModel):
@@ -639,7 +649,7 @@ async def initialize_persistence(
     """Connect the durable store and restore safe approval pause points."""
 
     global embedded_executor_task, embedded_executor_tools, incident_store
-    global operator_authenticator
+    global operator_authenticator, workload_identity_authenticator
 
     settings = get_settings()
     production = settings.environment.strip().casefold() in {"prod", "production"}
@@ -668,6 +678,13 @@ async def initialize_persistence(
     if production and settings.executor_backend != "controller":
         raise RuntimeError(
             "生产环境 Executor 必须通过 SentinelRemediation Controller 执行"
+        )
+    if production and (
+        settings.control_gateway_auth_mode != "workload_oidc"
+        or not settings.control_gateway_trust_bundle_file
+    ):
+        raise RuntimeError(
+            "生产环境必须配置 Workload OIDC Control Gateway 信任清单"
         )
     if production and settings.alertmanager_source_id == "default":
         raise RuntimeError(
@@ -808,6 +825,41 @@ async def initialize_persistence(
 
     if settings.operator_auth_mode == "oidc":
         operator_authenticator = OIDCAuthenticator(settings)
+    if settings.control_gateway_auth_mode == "workload_oidc":
+        if not settings.control_gateway_trust_bundle_file:
+            raise RuntimeError(
+                "Workload OIDC Control Gateway 缺少 trust bundle"
+            )
+        try:
+            workload_identity_authenticator = WorkloadIdentityAuthenticator.from_file(
+                settings.control_gateway_trust_bundle_file,
+                production=production,
+                timeout_seconds=(
+                    settings.control_gateway_jwks_timeout_seconds
+                ),
+                clock_skew_seconds=(
+                    settings.control_gateway_clock_skew_seconds
+                ),
+                max_token_lifetime_seconds=(
+                    settings.control_gateway_max_token_lifetime_seconds
+                ),
+                jwks_cache_seconds=(
+                    settings.control_gateway_jwks_cache_seconds
+                ),
+                jwks_hard_cache_seconds=(
+                    settings.control_gateway_jwks_hard_cache_seconds
+                ),
+                jwks_min_refresh_seconds=(
+                    settings.control_gateway_jwks_min_refresh_seconds
+                ),
+            )
+        except Exception:
+            if operator_authenticator is not None:
+                await operator_authenticator.close()
+                operator_authenticator = None
+            await store.close()
+            incident_store = None
+            raise
 
     if settings.executor_mode == "embedded":
         assert embedded_executor_tools is not None
@@ -1080,7 +1132,7 @@ async def _escalate_unrecoverable_incident(
 
 async def shutdown_persistence() -> None:
     global embedded_executor_task, embedded_executor_tools, incident_store
-    global operator_authenticator
+    global operator_authenticator, workload_identity_authenticator
 
     if embedded_executor_task is not None:
         embedded_executor_task.cancel()
@@ -1091,6 +1143,9 @@ async def shutdown_persistence() -> None:
     if operator_authenticator is not None:
         await operator_authenticator.close()
         operator_authenticator = None
+    if workload_identity_authenticator is not None:
+        await workload_identity_authenticator.close()
+        workload_identity_authenticator = None
     if incident_store is not None:
         await incident_store.close()
     incident_store = None

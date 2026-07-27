@@ -46,7 +46,7 @@ spec:
           args: ["executor"]
           envFrom:
             - configMapRef:
-                name: sentinelops-runtime
+                name: sentinelops-executor-runtime
           env:
             - name: SENTINELOPS_EXECUTOR_INSTANCE_ID
               valueFrom:
@@ -95,25 +95,22 @@ spec:
               drop: ["ALL"]
             readOnlyRootFilesystem: true
           volumeMounts:
-            - name: runtime-secret
-              mountPath: /var/run/secrets/sentinelops
+            - name: control-gateway-identity
+              mountPath: /var/run/secrets/sentinelops-control-gateway
               readOnly: true
             - name: executor-health
               mountPath: /var/run/sentinelops/health
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: runtime-secret
+        - name: control-gateway-identity
           projected:
             defaultMode: 288
             sources:
-              - secret:
-                  name: sentinelops-runtime
-                  items:
-                    - key: database-url
-                      path: database-url
-                    - key: audit-hmac-key
-                      path: audit-hmac-key
+              - serviceAccountToken:
+                  audience: sentinelops-control-gateway
+                  expirationSeconds: 600
+                  path: gateway-token
         - name: executor-health
           emptyDir: {}
         - name: tmp

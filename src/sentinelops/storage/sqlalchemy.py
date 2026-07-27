@@ -4333,6 +4333,48 @@ class SqlIncidentStore:
                 now=now,
                 cluster_id=cluster_id,
             )
+            replayed = (
+                (
+                    await connection.execute(
+                        select(action_intents)
+                        .where(
+                            action_intents.c.cluster_id == cluster_id,
+                            action_intents.c.cluster_generation
+                            == agent_lease.routing_generation,
+                            action_intents.c.executor_id == owner_id,
+                            action_intents.c.attempt_id == attempt_id,
+                            action_intents.c.executor_session_id
+                            == agent_lease.session_id,
+                            action_intents.c.executor_session_generation
+                            == agent_lease.generation,
+                            action_intents.c.executor_lease_until
+                            > now.isoformat(),
+                            action_intents.c.status.in_(
+                                ["claimed", "dispatched"]
+                            ),
+                        )
+                        .limit(1)
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if replayed is not None:
+                return ExecutorClaim(
+                    idempotency_key=replayed["idempotency_key"],
+                    incident_id=replayed["incident_id"],
+                    cluster_id=cluster_id,
+                    cluster_generation=agent_lease.routing_generation,
+                    owner_id=owner_id,
+                    generation=int(replayed["executor_generation"]),
+                    attempt_id=attempt_id,
+                    session_id=agent_lease.session_id,
+                    session_generation=agent_lease.generation,
+                    expires_at=datetime.fromisoformat(
+                        replayed["executor_lease_until"]
+                    ),
+                )
             row = (
                 (
                     await connection.execute(
@@ -4483,6 +4525,41 @@ class SqlIncidentStore:
                 claim,
                 agent_lease,
             )
+            replayed = (
+                (
+                    await connection.execute(
+                        select(action_intents)
+                        .where(
+                            action_intents.c.idempotency_key
+                            == claim.idempotency_key,
+                            action_intents.c.incident_id
+                            == claim.incident_id,
+                            action_intents.c.cluster_id
+                            == claim.cluster_id,
+                            action_intents.c.cluster_generation
+                            == claim.cluster_generation,
+                            action_intents.c.executor_id
+                            == claim.owner_id,
+                            action_intents.c.executor_generation
+                            == claim.generation,
+                            action_intents.c.attempt_id
+                            == claim.attempt_id,
+                            action_intents.c.executor_session_id
+                            == claim.session_id,
+                            action_intents.c.executor_session_generation
+                            == claim.session_generation,
+                            action_intents.c.executor_lease_until
+                            > now.isoformat(),
+                            action_intents.c.status == "dispatched",
+                        )
+                        .with_for_update()
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if replayed is not None:
+                return self._stored_action(replayed)
             await self._assert_dispatch_allowed(
                 connection,
                 claim.incident_id,

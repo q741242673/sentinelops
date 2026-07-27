@@ -531,6 +531,8 @@ async def _wait_for_claimed_action(
 async def _webhook_receiver_pod(
     context: str,
     pod_names: list[str],
+    *,
+    baseline_counts: dict[str, int],
 ) -> str:
     matches: list[str] = []
     for pod_name in pod_names:
@@ -544,13 +546,36 @@ async def _webhook_receiver_pod(
             f"pod/{pod_name}",
             "--since=5m",
         )
-        if "POST /api/v1/webhooks/alertmanager" in logs:
+        if logs.count("POST /api/v1/webhooks/alertmanager") > baseline_counts.get(
+            pod_name,
+            0,
+        ):
             matches.append(pod_name)
     if len(matches) != 1:
         raise RuntimeError(
             f"could not identify the single Alertmanager webhook receiver: {matches}"
         )
     return matches[0]
+
+
+async def _webhook_log_counts(
+    context: str,
+    pod_names: list[str],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for pod_name in pod_names:
+        logs = await _command(
+            "kubectl",
+            "--context",
+            context,
+            "--namespace",
+            "sentinelops-system",
+            "logs",
+            f"pod/{pod_name}",
+            "--since=5m",
+        )
+        counts[pod_name] = logs.count("POST /api/v1/webhooks/alertmanager")
+    return counts
 
 
 async def _delete_pod(
@@ -647,6 +672,100 @@ async def _ready_pod_names(
         if any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions):
             names.append(str(pod["metadata"]["name"]))
     return sorted(names)
+
+
+async def _ready_pod_identities(
+    context: str,
+    namespace: str,
+    selector: str,
+) -> dict[str, str]:
+    pods = await _kubectl_json(
+        context,
+        namespace,
+        "get",
+        "pods",
+        "--selector",
+        selector,
+    )
+    identities: dict[str, str] = {}
+    for pod in pods.get("items", []):
+        conditions = pod.get("status", {}).get("conditions", [])
+        if not any(
+            item.get("type") == "Ready" and item.get("status") == "True"
+            for item in conditions
+        ):
+            continue
+        metadata = pod.get("metadata", {})
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        if isinstance(name, str) and isinstance(uid, str) and name and uid:
+            identities[name] = uid
+    return identities
+
+
+async def _executor_identity_boundary(context: str) -> tuple[bool, bool]:
+    deployment = await _kubectl_json(
+        context,
+        "sentinelops-system",
+        "get",
+        "deployment",
+        "sentinelops-executor",
+    )
+    runtime = await _kubectl_json(
+        context,
+        "sentinelops-system",
+        "get",
+        "configmap",
+        "sentinelops-topology-runtime",
+    )
+    pod_spec = deployment.get("spec", {}).get("template", {}).get("spec", {})
+    containers = pod_spec.get("containers", [])
+    executor = next(
+        (
+            item
+            for item in containers
+            if item.get("name") == "executor"
+        ),
+        {},
+    )
+    serialized_executor = json.dumps(executor, sort_keys=True)
+    runtime_data = runtime.get("data", {})
+    forbidden = {
+        "SENTINELOPS_DATABASE_URL",
+        "SENTINELOPS_DATABASE_URL_FILE",
+        "SENTINELOPS_AUDIT_HMAC_KEY",
+        "SENTINELOPS_AUDIT_HMAC_KEY_FILE",
+    }
+    no_control_plane_secrets = (
+        not any(name in serialized_executor for name in forbidden)
+        and isinstance(runtime_data, dict)
+        and forbidden.isdisjoint(runtime_data)
+    )
+    projected_tokens = [
+        source.get("serviceAccountToken", {})
+        for volume in pod_spec.get("volumes", [])
+        if volume.get("name") == "control-gateway-identity"
+        for source in volume.get("projected", {}).get("sources", [])
+        if isinstance(source, dict)
+    ]
+    environment = {
+        item.get("name"): item.get("value")
+        for item in executor.get("env", [])
+        if isinstance(item, dict)
+    }
+    projected_identity = (
+        environment.get("SENTINELOPS_CONTROL_GATEWAY_URL")
+        == "http://sentinelops-api.sentinelops-system.svc.cluster.local:8000"
+        and environment.get("SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE")
+        == "/var/run/secrets/sentinelops-control-gateway/gateway-token"
+        and any(
+            token.get("audience") == "sentinelops-control-gateway"
+            and token.get("path") == "gateway-token"
+            and 600 <= int(token.get("expirationSeconds", 0)) <= 900
+            for token in projected_tokens
+        )
+    )
+    return no_control_plane_secrets, projected_identity
 
 
 def _evidence_sources(record: dict[str, Any]) -> list[str]:
@@ -811,7 +930,9 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
     background_outcomes: Counter[str] = Counter()
     recovered_outcomes: Counter[str] = Counter()
     database_snapshot: dict[str, Any] = {}
-    chaos: dict[str, Any] = {}
+    chaos: dict[str, Any] = (
+        {"enabled": True} if args.control_plane_chaos else {}
+    )
     security: dict[str, Any] = {}
     viewer_token: str | None = None
     approver_token: str | None = None
@@ -866,8 +987,22 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                 "app.kubernetes.io/name=sentinelops-executor",
             )
             current_executor_pods = list(executor_pods)
+            current_executor_identities = await _ready_pod_identities(
+                args.context,
+                "sentinelops-system",
+                "app.kubernetes.io/name=sentinelops-executor",
+            )
+            webhook_log_counts = (
+                await _webhook_log_counts(args.context, api_pods)
+                if args.control_plane_chaos
+                else {}
+            )
             checks["two_api_replicas_ready"] = len(api_pods) == 2
             checks["two_executor_replicas_ready"] = len(executor_pods) == 2
+            (
+                checks["executor_has_no_database_or_audit_credentials"],
+                checks["executor_uses_projected_workload_identity"],
+            ) = await _executor_identity_boundary(args.context)
             if args.security_e2e:
                 publisher_pods = await _ready_pod_names(
                     args.context,
@@ -1060,6 +1195,7 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                 webhook_pod = await _webhook_receiver_pod(
                     args.context,
                     api_pods,
+                    baseline_counts=webhook_log_counts,
                 )
                 webhook_pod_index = api_pods.index(webhook_pod)
                 surviving_url = args.api_url[1 - webhook_pod_index]
@@ -1126,8 +1262,16 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                     timeout_seconds=args.timeout,
                 )
                 first_executor_id = str(first_claim.get("executor_id") or "")
-                first_executor_pod = first_executor_id.split(":", 1)[0]
-                if first_executor_pod not in executor_pods:
+                first_executor_pod = next(
+                    (
+                        pod_name
+                        for pod_name, pod_uid in current_executor_identities.items()
+                        if pod_uid == first_executor_id
+                        or first_executor_id.startswith(f"{pod_name}:")
+                    ),
+                    "",
+                )
+                if not first_executor_pod:
                     raise RuntimeError(
                         f"claimed action is not owned by a ready Executor pod: {first_claim}"
                     )
@@ -1150,6 +1294,11 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
                     first_executor_pod not in replacement_executor_pods
                 )
                 current_executor_pods = replacement_executor_pods
+                current_executor_identities = await _ready_pod_identities(
+                    args.context,
+                    "sentinelops-system",
+                    "app.kubernetes.io/name=sentinelops-executor",
+                )
                 chaos.update(
                     {
                         "first_executor_id": first_executor_id,
@@ -1206,8 +1355,12 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
             )
             checks["independent_executor_claimed_action"] = bool(
                 executor_id
-                and any(
-                    executor_id.startswith(f"{pod_name}:") for pod_name in current_executor_pods
+                and (
+                    executor_id in current_executor_identities.values()
+                    or any(
+                        executor_id.startswith(f"{pod_name}:")
+                        for pod_name in current_executor_pods
+                    )
                 )
             )
             if args.control_plane_chaos:

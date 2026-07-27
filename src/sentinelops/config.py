@@ -265,6 +265,48 @@ class Settings(BaseSettings):
         le=120,
     )
     executor_health_file: str | None = None
+    control_gateway_url: str | None = None
+    control_gateway_token_file: str | None = None
+    control_gateway_timeout_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=120,
+    )
+    control_gateway_auth_mode: Literal[
+        "disabled",
+        "workload_oidc",
+    ] = "disabled"
+    control_gateway_trust_bundle_file: str | None = None
+    control_gateway_jwks_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=30,
+    )
+    control_gateway_jwks_cache_seconds: float = Field(
+        default=300,
+        ge=30,
+        le=3600,
+    )
+    control_gateway_jwks_hard_cache_seconds: float = Field(
+        default=900,
+        ge=60,
+        le=7200,
+    )
+    control_gateway_jwks_min_refresh_seconds: float = Field(
+        default=5,
+        ge=1,
+        le=60,
+    )
+    control_gateway_clock_skew_seconds: int = Field(
+        default=30,
+        ge=0,
+        le=300,
+    )
+    control_gateway_max_token_lifetime_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+    )
 
     @model_validator(mode="after")
     def validate_production_cluster_identity(self) -> Self:
@@ -287,6 +329,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS "
                 "不能超过 registry TTL 的三分之一"
+            )
+        if (
+            self.control_gateway_jwks_hard_cache_seconds
+            < self.control_gateway_jwks_cache_seconds
+        ):
+            raise ValueError(
+                "Control Gateway JWKS hard cache 必须大于等于普通 cache"
             )
         return self
 

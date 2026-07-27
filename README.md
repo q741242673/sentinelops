@@ -68,8 +68,11 @@ flowchart TB
     POLICY --> PREFLIGHT["执行前重新读取集群"]
     PREFLIGHT --> CATALOG["Action Plugin 合同"]
     CATALOG --> QUEUE["PostgreSQL Action Intent 队列"]
-    QUEUE --> EXECUTOR["独立 Executor"]
-    EXECUTOR -->|"注册 + 短租约心跳"| REGISTRY["PostgreSQL 集群目录"]
+    QUEUE --> GATEWAY["受认证的 Control Gateway"]
+    EXECUTOR["独立 Executor"] -->|"短期 ServiceAccount Token + HTTPS"| GATEWAY
+    OIDC["集群 OIDC / JWKS"] -->|"验证 Pod、ServiceAccount 和集群"| GATEWAY
+    GATEWAY -->|"领取、续租、结果回传"| QUEUE
+    GATEWAY -->|"注册 + 短租约心跳"| REGISTRY["PostgreSQL 集群目录"]
     REGISTRY -->|"在线状态 + 执行代次"| API
     EXECUTOR --> CONTRACT["不可变 SentinelRemediation"]
     CONTRACT --> CONTROLLER["Go Remediation Controller"]
@@ -87,12 +90,13 @@ flowchart TB
     VERIFY --> API
 ```
 
-项目分成九块：
+项目分成十块：
 
 - **前端控制台**：用 React 和 TypeScript 编写，实时显示 Agent 正在做什么、查了哪些证据、为什么暂停、最终是否恢复。
 - **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
-- **独立 Executor**：单独进程领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
+- **Control Gateway 与工作负载身份**：Executor 不再连接控制面的 PostgreSQL，也不持有审计 HMAC。它用 Kubernetes 投影的短期 ServiceAccount Token 访问固定 Gateway；服务端按管理员维护的集群、Issuer、ServiceAccount UID 和 Pod UID 信任清单验签，Token 自己声明的角色不会扩大权限。
+- **独立 Executor**：单独进程通过 Gateway 领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
 - **集群目录和执行租约**：每个 Executor 启动后用稳定实例身份和随机 Session 注册，并按数据库时间续约。领取任务、续租、跨过写入分界和结果对账都会重新检查集群代次、Session 代次和能力声明；过期实例不能继续使用旧任务。控制台里的“已连接”只表示最近收到 Executor 心跳，不代表集群里的业务服务健康。
 - **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间；还会绕过本地缓存，直接向 API Server 重新核对准入策略完整性。
 - **集群准入写闸门**：使用 Kubernetes 原生 `ValidatingAdmissionPolicy` 保护明确标记的 namespace。即使某个账号已经拿到 Deployment 写 RBAC，只要不在该 namespace 的允许身份清单中，API Server 仍会拒绝写入；策略可先用 Warn/Audit 灰度观察，再切到 Deny。白名单和正式启用标签也受独立策略保护，不能由普通发布账号自行修改。
@@ -256,15 +260,16 @@ SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 
 当前阶段已经把集群身份绑定到事故、审批恢复和执行队列，并增加了持久化集群目录和
 Executor 短租约心跳。Executor 领取任务、续租、标记“即将写入”和领取只读对账任务时，
-数据库都会重新确认它仍属于目标集群、Session 没有过期、路由代次没有变化，并且声明了
-所需能力。某个集群整体离线后，中心侧回收器仍能把“确认尚未写入”的过期任务重新排队；
-已经跨过写入分界的任务只会标成结果未知并进入只读对账，不会猜测重放。
+Gateway 与数据库都会重新确认它仍属于目标集群、Pod 和 Session，路由代次没有变化，并且
+管理员信任清单授予了所需能力。某个集群整体离线后，中心侧回收器仍能把“确认尚未写入”
+的过期任务重新排队；已经跨过写入分界的任务只会标成结果未知并进入只读对账，不会猜测重放。
 
 这还不是集中保存多份 kubeconfig 的集群代理。每个集群仍部署自己的 Executor 和
 Remediation Controller，两者必须使用同一个 `SENTINELOPS_CLUSTER_ID`；Kubernetes
-ServiceAccount 凭据始终留在目标集群。当前参考拓扑通过共享 PostgreSQL 交换任务，
-因此数据库凭据仍属于重要信任边界。下一阶段会把 Executor 改为使用集群服务身份访问
-受认证的 Control Gateway，不再让每个集群直接持有控制面数据库凭据。
+ServiceAccount 凭据始终留在目标集群。生产 Executor 不挂载数据库地址和审计 HMAC，
+只持有由 Kubernetes 自动轮换的短期 Token。Control Gateway 固定校验 issuer、audience、
+JWKS、namespace、ServiceAccount 名称与 UID、Pod UID 和服务端能力清单；请求中的
+`cluster_id`、owner、Session 和返回数据还会再次做跨集群约束。
 
 生产 Executor 还需要稳定的实例身份。仓库清单通过 Downward API 把 Pod UID 注入
 `SENTINELOPS_EXECUTOR_INSTANCE_ID`；每次进程启动都会生成新的 Session。默认租约为
@@ -274,6 +279,8 @@ ServiceAccount 凭据始终留在目标集群。当前参考拓扑通过共享 P
 SENTINELOPS_EXECUTOR_INSTANCE_ID=由-Pod-UID-注入
 SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS=60
 SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS=15
+SENTINELOPS_CONTROL_GATEWAY_URL=https://公司内网-control-gateway.example
+SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE=/var/run/secrets/sentinelops-control-gateway/gateway-token
 ```
 
 心跳间隔不能超过租约的三分之一。网页中的集群目录会显示在线 Executor 数量和最后心跳，
@@ -458,10 +465,11 @@ sentinelops gitops-publisher \
 
 - 在 `sentinelops-system` 运行两个 API、两个独立 Executor、两个 Remediation Controller、两个 GitOps Publisher 和两个审计锚定 Publisher；
 - 让 API 使用只读 ServiceAccount；Executor 只能创建和查看不可变的 `SentinelRemediation`，没有 Deployment 写权限；
+- 让 Executor 通过投影的短期 ServiceAccount Token 访问 Control Gateway，不向 Executor 下发 PostgreSQL URL 或审计 HMAC；
 - 让 Controller 只读取 `SentinelRemediation` 和 ReplicaSet，只更新目标 Deployment 与执行状态，并使用 namespace 内 Lease 选主；
 - 让 GitOps 与锚定 Publisher 都不挂载 Kubernetes Token，分别只访问数据库及自己的外部服务；
 - 使用单独的数据库迁移 Job，迁移进程拿不到 Kubernetes 凭据；
-- 把数据库地址、模型 Key、Webhook Token、审计 Key 和锚定 Token 作为只读 Secret 文件挂载；
+- 只向确实需要的组件挂载数据库地址、模型 Key、Webhook Token、审计 Key 和锚定 Token，Executor 不在其中；
 - 使用非 root 用户、只读根文件系统、默认 seccomp、资源限制和最小 Linux capabilities；
 - 为 API 配置 `/health`、`/ready`，为 Executor 配置本地心跳探针；
 - 使用 PDB 和节点拓扑分散，减少维护节点时同时中断所有副本的风险；
@@ -1187,16 +1195,20 @@ SENTINELOPS_KEEP_OBSERVABILITY_CLUSTER=true make kubernetes-readiness
 `make topology-readiness` 检查的不是单进程 Demo，而是下面这条真实链路：
 
 ```text
-Prometheus → Alertmanager → 2 个 API → PostgreSQL → 2 个 Executor → Kubernetes
-                                      ↓
-                              审批、操作意图和审计记录
+Prometheus → Alertmanager → 2 个 API / Control Gateway → PostgreSQL
+                                      ↑                    ↓
+                 短期 ServiceAccount Token          审批、操作意图和审计记录
+                                      ↑                    ↓
+                              2 个 Executor ─────────→ Kubernetes
 ```
 
-测试会在 kind 中启动 PostgreSQL 16、两个 API Pod 和两个独立 Executor Pod。然后发布一个真实
-故障版本，让 Prometheus 产生告警、Alertmanager 携带 Bearer Token 调用 API。API 只负责调查和
-生成待审批操作，真正的 Kubernetes 写入由 Executor 从数据库领取并执行。测试最后会同时检查：
+测试会在 kind 中启动 PostgreSQL 16、两个 API Pod 和两个独立 Executor Pod。脚本从 kind API
+读取 ServiceAccount Issuer 和 JWKS，并为每个 Executor 投影 10 分钟 Token。然后发布一个真实
+故障版本，让 Prometheus 产生告警、Alertmanager 携带 Bearer Token 调用 API。API 负责调查和
+生成待审批操作，Executor 只能通过 Gateway 领取并回传动作，不能直接访问数据库。测试最后会同时检查：
 
 - 两个 API 是否看到同一份事故和审批；
+- Executor 是否以真实 Pod UID 完成身份验证，且 Pod 配置中不存在数据库 URL 和审计 HMAC；
 - 数据库是否只有一条成功的操作意图，是否由真实 Executor Pod 领取；
 - 是否只回滚到上一健康 revision，没有多余写入；
 - Deployment、业务请求、错误率、告警和新 Trace 是否都恢复；
@@ -1218,13 +1230,13 @@ macOS arm64 上的 kind：
 | 指标 | 结果 |
 |---|---:|
 | API / Executor 副本 | 2 / 2 |
-| Alertmanager 告警进入 API | 17.858 ms |
-| 故障生效到后端确认恢复 | 22.992 秒 |
-| 故障生效到告警清除 | 23.233 秒 |
+| Alertmanager 告警进入 API | 12.905 ms |
+| 故障生效到后端确认恢复 | 21.874 秒 |
+| 故障生效到告警清除 | 22.114 秒 |
 | 数据库操作意图 | 1 条成功 |
 | 错误修复计划 / 非预期写入 | 0 / 0 |
-| HMAC 审计事件 | 23 条 |
-| 最终验收项 | 19/19 通过 |
+| HMAC 审计事件 | 22 条 |
+| 最终验收项 | 22/22 通过 |
 
 这里使用确定性 Provider，是为了让 CI 每次得到同样的故障判断；远程模型仍可通过统一 Provider
 接口替换。该结果证明的是一套可重复的 staging 闭环：真实告警、多副本 API、持久化状态、独立
@@ -1318,6 +1330,9 @@ src/sentinelops/
 ├── storage/        # PostgreSQL 事故、审批、租约和操作意图
 ├── tools/          # Kubernetes、监控和 Git 查询工具
 ├── executor.py     # 独立 Action Intent 领取、合同提交和结果回写
+├── executor_control.py # Executor 的窄 HTTP 控制面协议和安全失败客户端
+├── control_gateway.py  # 工作负载身份认证后的领取、续租和结果接口
+├── workload_identity.py # Kubernetes OIDC/JWKS、Pod 与 ServiceAccount 身份校验
 ├── remediation_controller.py # 生成不可变 CR、提交并等待 Go Controller 结果
 ├── api.py          # FastAPI 接口、告警接收和实时进度
 ├── demo.py         # 本地演示的故障注入与环境恢复
@@ -1344,6 +1359,7 @@ tests/              # 单元测试和安全边界测试
 - kind、监控系统和 GitHub Actions 端到端测试；
 - PostgreSQL 事故快照、追加式事件、一次性审批和等待审批状态的重启恢复；
 - 持久化集群目录、Executor Pod UID 实例身份、短租约心跳、Session/路由代次 fencing，以及跨集群统一过期任务回收；
+- 受认证的 Control Gateway、Kubernetes 投影短期 Token、管理员维护的多集群信任清单，以及不持有数据库和审计密钥的生产 Executor；
 - 带数据库 fencing generation 的 Worker Lease，以及写操作 Action Intent、审批自动过期和崩溃结果判定；
 - 独立 `sentinelops executor`、单独的 Executor generation，以及生产环境 create-only 的修复合同提交权限；
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；

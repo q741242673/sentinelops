@@ -13,6 +13,10 @@ from sentinelops.agent.execution import (
     ActionOutcomeUnknown,
 )
 from sentinelops.domain import RemediationAction, ToolResult
+from sentinelops.executor_control import (
+    ExecutorControlPlane,
+    ExecutorControlUnavailableError,
+)
 from sentinelops.remediation_controller import RemediationGateway
 from sentinelops.storage.base import (
     ActionIntentConflictError,
@@ -52,7 +56,7 @@ class QueuedActionExecutor(ActionExecutor):
 
     def __init__(
         self,
-        store: IncidentStore,
+        store: ExecutorControlPlane,
         token: LeaseToken,
         *,
         poll_interval_seconds: float = 0.1,
@@ -225,12 +229,21 @@ class ExecutorWorker:
         self,
         agent_lease: ClusterAgentLeaseToken,
     ) -> bool:
-        claim = await self.store.claim_action_execution(
-            agent_lease=agent_lease,
-            owner_id=self.owner_id,
-            attempt_id=str(uuid4()),
-            ttl_seconds=self.claim_ttl_seconds,
-        )
+        attempt_id = str(uuid4())
+        try:
+            claim = await self.store.claim_action_execution(
+                agent_lease=agent_lease,
+                owner_id=self.owner_id,
+                attempt_id=attempt_id,
+                ttl_seconds=self.claim_ttl_seconds,
+            )
+        except ExecutorControlUnavailableError:
+            claim = await self.store.claim_action_execution(
+                agent_lease=agent_lease,
+                owner_id=self.owner_id,
+                attempt_id=attempt_id,
+                ttl_seconds=self.claim_ttl_seconds,
+            )
         if claim is None:
             return False
         if claim.cluster_id != self.cluster_id:
@@ -249,10 +262,16 @@ class ExecutorWorker:
 
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            dispatched = await self.store.mark_action_dispatched(
-                claim,
-                agent_lease=agent_lease,
-            )
+            try:
+                dispatched = await self.store.mark_action_dispatched(
+                    claim,
+                    agent_lease=agent_lease,
+                )
+            except ExecutorControlUnavailableError:
+                dispatched = await self.store.mark_action_dispatched(
+                    claim,
+                    agent_lease=agent_lease,
+                )
             if (
                 dispatched.cluster_id != self.cluster_id
                 or dispatched.precondition.get("cluster_id") != self.cluster_id
@@ -281,11 +300,18 @@ class ExecutorWorker:
             heartbeat_task.cancel()
             with suppress(asyncio.CancelledError, Exception):
                 await heartbeat_task
-        await self.store.complete_action(
-            claim=claim,
-            agent_lease=agent_lease,
-            result=result,
-        )
+        try:
+            await self.store.complete_action(
+                claim=claim,
+                agent_lease=agent_lease,
+                result=result,
+            )
+        except ExecutorControlUnavailableError:
+            await self.store.complete_action(
+                claim=claim,
+                agent_lease=agent_lease,
+                result=result,
+            )
         return True
 
     async def _reconcile_once(
