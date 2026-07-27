@@ -71,6 +71,7 @@ def _execution_precondition(
     action,
 ) -> dict[str, object]:
     precondition: dict[str, object] = {
+        "cluster_id": "local",
         "action_fingerprint": "approved-action",
         "tool_name": action.tool_name,
         "target": action.arguments["name"],
@@ -204,6 +205,7 @@ async def test_executor_is_the_only_component_that_calls_write_backend(tmp_path)
         store,
         ToolRegistry(backend),
         owner_id="executor-a",
+        cluster_id="local",
     )
 
     assert await worker.run_once() is True
@@ -227,6 +229,7 @@ async def test_executor_submits_immutable_contract_without_direct_write_access(
         store,
         None,
         owner_id="executor-controller",
+        cluster_id="local",
         remediation_gateway=gateway,
     )
 
@@ -256,6 +259,7 @@ async def test_executor_health_pulse_continues_while_store_call_is_blocked() -> 
         store,  # type: ignore[arg-type]
         ToolRegistry(RecordingWriteBackend()),
         owner_id="executor-health-test",
+        cluster_id="local",
         health_callback=health,
         health_interval_seconds=0.01,
     )
@@ -273,6 +277,7 @@ async def test_executor_health_pulse_continues_while_store_call_is_blocked() -> 
 async def test_resolved_after_claim_before_dispatch_causes_zero_writes(tmp_path) -> None:
     store, record, _, intent = await _queued_intent(tmp_path)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="claim-before-resolved",
         ttl_seconds=60,
@@ -315,10 +320,11 @@ async def test_executor_rejects_intent_that_does_not_match_approved_action(
         lease,
         idempotency_key="t" * 64,
         action=tampered_action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await store.enqueue_action(lease, idempotency_key=tampered.idempotency_key)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="tampered-attempt",
         ttl_seconds=60,
@@ -337,12 +343,14 @@ async def test_executor_rejects_intent_that_does_not_match_approved_action(
 async def test_expired_claim_is_requeued_and_stale_attempt_is_fenced(tmp_path) -> None:
     store, record, _, _ = await _queued_intent(tmp_path)
     stale = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="stale-attempt",
         ttl_seconds=-1,
     )
     assert stale is not None
     current = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-b",
         attempt_id="current-attempt",
         ttl_seconds=60,
@@ -365,6 +373,7 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
 ) -> None:
     store, record, _, _ = await _queued_intent(tmp_path)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="immutable-attempt",
         ttl_seconds=1,
@@ -375,6 +384,7 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
 
     assert (
         await store.claim_action_execution(
+            cluster_id="local",
             owner_id="executor-b",
             attempt_id="must-not-replay",
             ttl_seconds=60,
@@ -411,6 +421,7 @@ async def test_replacement_executor_recovers_controller_result_without_replay(
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="e")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-crash",
         attempt_id="crashed-after-controller-submit",
         ttl_seconds=60,
@@ -445,6 +456,7 @@ async def test_replacement_executor_recovers_controller_result_without_replay(
         store,
         None,
         owner_id="executor-replacement",
+        cluster_id="local",
         remediation_gateway=gateway,
         claim_ttl_seconds=60,
     )
@@ -476,6 +488,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
 ) -> None:
     store, _, _, intent = await _queued_intent(tmp_path, suffix="f")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-crash",
         attempt_id="expired-controller-attempt",
         ttl_seconds=60,
@@ -489,12 +502,14 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
 
     first = await store.claim_action_reconciliation(
+        cluster_id="local",
         owner_id="reconciler-a",
         ttl_seconds=1,
     )
     assert first is not None
     assert (
         await store.claim_action_reconciliation(
+            cluster_id="local",
             owner_id="reconciler-b",
             ttl_seconds=1,
         )
@@ -515,6 +530,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
             .values(next_attempt_at="2000-01-01T00:00:00+00:00")
         )
     second = await store.claim_action_reconciliation(
+        cluster_id="local",
         owner_id="reconciler-b",
         ttl_seconds=1,
     )
@@ -544,6 +560,7 @@ async def test_missing_controller_contract_dead_letters_only_after_fence_grace(
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="m")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-missing-contract",
         attempt_id="missing-contract-attempt",
         ttl_seconds=60,
@@ -561,6 +578,7 @@ async def test_missing_controller_contract_dead_letters_only_after_fence_grace(
         store,
         None,
         owner_id="executor-missing-contract-reconciler",
+        cluster_id="local",
         remediation_gateway=gateway,
         claim_ttl_seconds=60,
         missing_contract_grace_seconds=0,
@@ -595,6 +613,7 @@ async def test_in_progress_controller_contract_retries_after_fence_expiry(
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="p")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-in-progress-contract",
         attempt_id="in-progress-contract-attempt",
         ttl_seconds=60,
@@ -622,6 +641,7 @@ async def test_in_progress_controller_contract_retries_after_fence_expiry(
         store,
         None,
         owner_id="executor-in-progress-reconciler",
+        cluster_id="local",
         remediation_gateway=gateway,
         claim_ttl_seconds=60,
         missing_contract_grace_seconds=0,
@@ -644,6 +664,7 @@ async def test_temporary_controller_error_retries_after_fence_expiry(
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="t")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-temporary-error",
         attempt_id="temporary-error-attempt",
         ttl_seconds=60,
@@ -667,6 +688,7 @@ async def test_temporary_controller_error_retries_after_fence_expiry(
         store,
         None,
         owner_id="executor-temporary-error-reconciler",
+        cluster_id="local",
         remediation_gateway=gateway,
         claim_ttl_seconds=60,
         missing_contract_grace_seconds=0,
@@ -689,6 +711,7 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="d")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-before-invalid-result",
         attempt_id="invalid-controller-result-attempt",
         ttl_seconds=60,
@@ -708,6 +731,7 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
         store,
         None,
         owner_id="executor-dead-letter",
+        cluster_id="local",
         remediation_gateway=gateway,
         claim_ttl_seconds=60,
     )
@@ -719,6 +743,7 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
     assert preserved.error == "Controller outcome digest is invalid"
     assert (
         await store.claim_action_reconciliation(
+            cluster_id="local",
             owner_id="must-not-retry-dead-letter",
             ttl_seconds=60,
         )
@@ -762,6 +787,7 @@ async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="c")
     original = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-original",
         attempt_id="original-late-result",
         ttl_seconds=60,
@@ -774,6 +800,7 @@ async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
     reconciliation = await store.claim_action_reconciliation(
+        cluster_id="local",
         owner_id="executor-reconciler",
         ttl_seconds=60,
     )

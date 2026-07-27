@@ -29,6 +29,7 @@ from sentinelops.tools.kubernetes import KubernetesBackend
 
 NAMESPACE = os.environ.get("SENTINELOPS_E2E_NAMESPACE", "sentinelops-demo")
 DEPLOYMENT = os.environ.get("SENTINELOPS_E2E_DEPLOYMENT", "order-service")
+CLUSTER_ID = os.environ.get("SENTINELOPS_CLUSTER_ID", "local-kind")
 
 
 def executor_custom_objects_api() -> client.CustomObjectsApi:
@@ -99,7 +100,7 @@ async def main() -> None:
         os.environ.get("SENTINELOPS_E2E_SINGLE_CONTROLLER_ACTION", "false")
         == "true"
     )
-    backend = KubernetesBackend(NAMESPACE)
+    backend = KubernetesBackend(NAMESPACE, cluster_id=CLUSTER_ID)
     rollout_result = await backend.call(
         "get_rollout_history",
         {"name": DEPLOYMENT},
@@ -118,6 +119,7 @@ async def main() -> None:
         "action_fingerprint": "kind-controller-restart",
         "tool_name": "restart_deployment",
         "target": DEPLOYMENT,
+        "cluster_id": CLUSTER_ID,
         "namespace": NAMESPACE,
         "deployment_uid": str(rollout["deployment_uid"]),
         "generation": int(rollout["generation"]),
@@ -149,6 +151,7 @@ async def main() -> None:
     intent = StoredActionIntent(
         idempotency_key=action_id,
         incident_id="kind-controller-e2e",
+        cluster_id=CLUSTER_ID,
         lease_generation=1,
         approval_id=None,
         approval_version=None,
@@ -164,6 +167,7 @@ async def main() -> None:
     )
     gateway = KubernetesRemediationGateway(
         NAMESPACE,
+        cluster_id=CLUSTER_ID,
         custom_objects_api=executor_custom_objects_api(),
         poll_interval_seconds=0.2,
         result_timeout_seconds=30,
@@ -242,6 +246,7 @@ async def main() -> None:
         "action_fingerprint": "kind-controller-crash-recovery",
         "tool_name": "restart_deployment",
         "target": DEPLOYMENT,
+        "cluster_id": CLUSTER_ID,
         "namespace": NAMESPACE,
         "deployment_uid": str(recovery_rollout["deployment_uid"]),
         "generation": int(recovery_rollout["generation"]),
@@ -274,6 +279,7 @@ async def main() -> None:
             id="kind-controller-crash-recovery",
             alert=Alert(
                 name="ExecutorCrashRecovery",
+                cluster_id=CLUSTER_ID,
                 namespace=NAMESPACE,
                 service=DEPLOYMENT,
                 severity="critical",
@@ -302,6 +308,7 @@ async def main() -> None:
             idempotency_key=recovery_action_id,
         )
         original_claim = await store.claim_action_execution(
+            cluster_id=CLUSTER_ID,
             owner_id="kind-executor-before-crash",
             attempt_id="kind-controller-crash-attempt",
             ttl_seconds=0.2,
@@ -328,8 +335,10 @@ async def main() -> None:
             store,
             None,
             owner_id="kind-executor-replacement",
+            cluster_id=CLUSTER_ID,
             remediation_gateway=KubernetesRemediationGateway(
                 NAMESPACE,
+                cluster_id=CLUSTER_ID,
                 custom_objects_api=ReadOnlyRecoveryApi(executor_api),
                 poll_interval_seconds=0.2,
                 result_timeout_seconds=30,

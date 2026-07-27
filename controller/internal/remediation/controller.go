@@ -39,6 +39,7 @@ type Reconciler struct {
 	client.Client
 	Scheme             *runtime.Scheme
 	ControllerID       string
+	ExpectedClusterID  string
 	Clock              func() time.Time
 	AfterWrite         func(*opsv1alpha1.SentinelRemediation, *appsv1.Deployment) error
 	AdmissionIntegrity func(context.Context) admissionintegrity.Result
@@ -165,6 +166,16 @@ func (r *Reconciler) validateStatic(
 	remediation *opsv1alpha1.SentinelRemediation,
 ) *validationFailure {
 	spec := remediation.Spec
+	if r.ExpectedClusterID == "" ||
+		spec.Target.ClusterID == "" ||
+		spec.Precondition.ClusterID == "" ||
+		spec.Target.ClusterID != spec.Precondition.ClusterID ||
+		spec.Target.ClusterID != r.ExpectedClusterID {
+		return rejected(
+			"ClusterIdentityMismatch",
+			"target, execution snapshot, and controller cluster identities must match",
+		)
+	}
 	if remediation.Name != spec.ActionID {
 		return rejected("ActionIdentityMismatch", "metadata.name does not match actionId")
 	}

@@ -129,14 +129,23 @@ function currentHeadline(incident: Incident, active?: ExecutionStep): string {
   return STATUS_LABELS[incident.status];
 }
 
+function clusterLabel(incident: Incident, runtime: RuntimeInfo | null): string {
+  if (runtime?.cluster_id === incident.alert.cluster_id) {
+    return `${runtime.cluster_display_name}（${runtime.cluster_id}）`;
+  }
+  return incident.alert.cluster_id;
+}
+
 function IncidentQueue({
   incidents,
   selectedId,
   onSelect,
+  runtime,
 }: {
   incidents: Incident[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  runtime: RuntimeInfo | null;
 }) {
   return (
     <aside className="incident-queue">
@@ -156,7 +165,7 @@ function IncidentQueue({
             <span className={`severity ${incident.alert.severity}`} />
             <span className="queue-copy">
               <strong>{incident.alert.service}</strong>
-              <small>{alertTitle(incident.alert.name)}</small>
+              <small>{clusterLabel(incident, runtime)} · {alertTitle(incident.alert.name)}</small>
             </span>
             <span className="queue-meta">
               <small>{timeLabel(incident.created_at)}</small>
@@ -597,7 +606,13 @@ function App() {
         <div className="product-name"><span>S</span><div><strong>SentinelOps</strong><small>Agent 事故响应控制台</small></div></div>
         <div className="header-status">
           <span><i className={streamConnected ? "connected" : ""} />{streamConnected ? "实时事件已连接" : "正在重连事件流"}</span>
-          <span>{liveMode ? "Kubernetes 已连接" : "本地模拟环境"}</span>
+          <span>
+            {runtime
+              ? `${runtime.cluster_display_name}（${runtime.cluster_id}）`
+              : liveMode
+                ? "Kubernetes 已连接"
+                : "本地模拟环境"}
+          </span>
           {labAvailable && (
             <button
               type="button"
@@ -624,7 +639,12 @@ function App() {
       {visibleError && <div className="error-banner" role="alert">{visibleError.message}</div>}
 
       <div className="console-layout">
-        <IncidentQueue incidents={incidents} selectedId={selected?.id ?? null} onSelect={setSelectedId} />
+        <IncidentQueue
+          incidents={incidents}
+          selectedId={selected?.id ?? null}
+          onSelect={setSelectedId}
+          runtime={runtime}
+        />
         <main className="incident-workspace">
           {loading ? (
             <div className="empty-state"><i /><strong>正在连接事故控制面…</strong></div>
@@ -640,7 +660,10 @@ function App() {
                 <div>
                   <span className={`status-pill ${selected.status}`}>{STATUS_LABELS[selected.status]}</span>
                   <h1>{alertTitle(selected.alert.name)}</h1>
-                  <p>{selected.alert.service} · {selected.alert.namespace} · {timeLabel(selected.created_at)}</p>
+                  <p>
+                    {clusterLabel(selected, runtime)} · {selected.alert.namespace} ·{" "}
+                    {selected.alert.service} · {timeLabel(selected.created_at)}
+                  </p>
                 </div>
                 <div className="incident-facts">
                   <span><small>处置策略</small><strong>{executionProfileLabel(selected)}</strong></span>

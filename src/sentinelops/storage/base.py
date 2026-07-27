@@ -65,6 +65,7 @@ class LeaseToken:
 class ExecutorClaim:
     idempotency_key: str
     incident_id: str
+    cluster_id: str
     owner_id: str
     generation: int
     attempt_id: str
@@ -74,6 +75,7 @@ class ExecutorClaim:
 @dataclass(frozen=True)
 class ActionReconciliationClaim:
     intent: StoredActionIntent
+    cluster_id: str
     owner_id: str
     generation: int
     attempt_id: str
@@ -106,6 +108,7 @@ ChangeProposalStatus = Literal[
 class StoredActionIntent:
     idempotency_key: str
     incident_id: str
+    cluster_id: str
     lease_generation: int
     approval_id: str | None
     approval_version: int | None
@@ -346,7 +349,11 @@ class IncidentStore(Protocol):
 
     async def list(self, *, limit: int = 200) -> list[StoredIncident]: ...
 
-    async def list_recoverable(self) -> list[StoredIncident]: ...
+    async def list_recoverable(
+        self,
+        *,
+        cluster_id: str,
+    ) -> list[StoredIncident]: ...
 
     async def claim_approval(
         self,
@@ -427,6 +434,7 @@ class IncidentStore(Protocol):
     async def claim_action_execution(
         self,
         *,
+        cluster_id: str,
         owner_id: str,
         attempt_id: str,
         ttl_seconds: float,
@@ -461,6 +469,7 @@ class IncidentStore(Protocol):
     async def claim_action_reconciliation(
         self,
         *,
+        cluster_id: str,
         owner_id: str,
         ttl_seconds: float,
     ) -> ActionReconciliationClaim | None: ...

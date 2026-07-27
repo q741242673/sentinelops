@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -198,7 +199,24 @@ async def test_action_reconciliation_migration_backfills_unknown_intents(
     await _upgrade(database_url, "0009_gitops_proposal_outbox")
     engine = create_async_engine(database_url)
     timestamp = "2026-07-26T08:00:00+00:00"
+    record = _record("migration-reconciliation").model_copy(
+        update={"id": "migration-reconciliation"}
+    )
+    legacy_payload = record.model_dump(mode="json")
+    legacy_payload["alert"].pop("cluster_id")
     async with engine.begin() as connection:
+        await connection.execute(
+            insert(incidents).values(
+                id=record.id,
+                version=1,
+                status=record.status.value,
+                execution_profile_id=record.execution_profile_id,
+                record=legacy_payload,
+                graph_state=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+        )
         await connection.execute(
             insert(action_intents).values(
                 idempotency_key="a" * 64,
@@ -249,6 +267,139 @@ async def test_action_reconciliation_migration_backfills_unknown_intents(
         assert row["action_id"] == "a" * 64
         assert row["status"] == "pending"
         assert row["next_attempt_at"] == timestamp
+    finally:
+        await migrated.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cluster_routing_migration_fences_nonterminal_actions(
+    tmp_path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    await _upgrade(database_url, "0009_gitops_proposal_outbox")
+    engine = create_async_engine(database_url)
+    timestamp = "2026-07-27T08:00:00+00:00"
+    record = _record("legacy-cluster-routing").model_copy(
+        update={"id": "legacy-cluster-routing"}
+    )
+    legacy_payload = record.model_dump(mode="json")
+    legacy_payload["alert"].pop("cluster_id")
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(incidents).values(
+                id=record.id,
+                version=1,
+                status=record.status.value,
+                execution_profile_id=record.execution_profile_id,
+                record=legacy_payload,
+                graph_state=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+        )
+        for index, status in enumerate(
+            ["prepared", "queued", "claimed", "dispatched", "succeeded"],
+            start=1,
+        ):
+            await connection.execute(
+                insert(action_intents).values(
+                    idempotency_key=str(index) * 64,
+                    incident_id=record.id,
+                    lease_generation=1,
+                    approval_id=None,
+                    approval_version=None,
+                    action={
+                        "tool_name": "restart_deployment",
+                        "arguments": {"name": "order-service"},
+                        "rationale": "migration fixture",
+                        "expected_outcome": "healthy",
+                        "risk": "medium",
+                    },
+                    precondition={"resource_version": str(index)},
+                    status=status,
+                    executor_id=(
+                        "legacy-executor"
+                        if status in {"claimed", "dispatched", "succeeded"}
+                        else None
+                    ),
+                    executor_generation=(
+                        1
+                        if status in {"claimed", "dispatched", "succeeded"}
+                        else 0
+                    ),
+                    executor_lease_until=(
+                        timestamp
+                        if status in {"claimed", "dispatched", "succeeded"}
+                        else None
+                    ),
+                    attempt_id=(
+                        f"legacy-attempt-{index}"
+                        if status in {"claimed", "dispatched", "succeeded"}
+                        else None
+                    ),
+                    result=None,
+                    error=None,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                    queued_at=timestamp if status != "prepared" else None,
+                    claimed_at=(
+                        timestamp
+                        if status in {"claimed", "dispatched", "succeeded"}
+                        else None
+                    ),
+                    dispatched_at=(
+                        timestamp
+                        if status in {"dispatched", "succeeded"}
+                        else None
+                    ),
+                    finished_at=timestamp if status == "succeeded" else None,
+                )
+            )
+    await engine.dispose()
+
+    await _upgrade(database_url)
+
+    migrated = create_async_engine(database_url)
+    try:
+        async with migrated.connect() as connection:
+            action_rows = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT idempotency_key, cluster_id, status, error
+                        FROM sentinelops_action_intents
+                        ORDER BY idempotency_key
+                        """
+                    )
+                )
+            ).mappings().all()
+            incident_row = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT cluster_id, record
+                        FROM sentinelops_incidents
+                        WHERE id = 'legacy-cluster-routing'
+                        """
+                    )
+                )
+            ).mappings().one()
+        assert [row["status"] for row in action_rows] == [
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "unknown",
+            "succeeded",
+        ]
+        assert {row["cluster_id"] for row in action_rows} == {
+            "legacy-unassigned"
+        }
+        assert action_rows[4]["error"] is None
+        assert incident_row["cluster_id"] == "legacy-unassigned"
+        incident_payload = incident_row["record"]
+        if isinstance(incident_payload, str):
+            incident_payload = json.loads(incident_payload)
+        assert incident_payload["alert"]["cluster_id"] == "legacy-unassigned"
     finally:
         await migrated.dispose()
 
@@ -403,11 +554,12 @@ async def test_production_startup_rejects_old_revision_without_modifying_it(
     await _upgrade(database_url, "0001_durable_store")
     settings = Settings(
         environment="production",
+        cluster_id="migration-production-cluster",
         database_url=database_url,
-            database_auto_create=False,
-            executor_mode="external",
-            executor_backend="controller",
-            alertmanager_source_id="migration-production-test",
+        database_auto_create=False,
+        executor_mode="external",
+        executor_backend="controller",
+        alertmanager_source_id="migration-production-test",
         alertmanager_webhook_auth_mode="bearer",
         alertmanager_webhook_bearer_token=(
             "migration-production-test-token-0001"

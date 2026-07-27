@@ -81,6 +81,7 @@ def rollback_precondition(
         "public_arguments_fingerprint": tool_call_fingerprint(
             tool_name, public_arguments
         ),
+        "cluster_id": "local",
         "namespace": "sentinelops-demo",
         "target": "order-service",
         "deployment_uid": "deployment-uid",
@@ -125,6 +126,7 @@ def test_owned_replica_sets_are_filtered_and_sorted() -> None:
 def test_deployment_snapshot_exposes_only_bounded_change_fields() -> None:
     backend = object.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     backend.apps.read_namespaced_deployment.return_value = ns(
         metadata=ns(uid="deployment-uid", resource_version="42", generation=7),
@@ -205,6 +207,7 @@ def test_replica_set_health_requires_a_valid_revision_bound_proof() -> None:
 def test_attestation_writes_proof_to_exact_ready_replica_set_metadata() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     backend.core = Mock()
     deployment = ns(metadata=ns(uid="deployment-uid"))
@@ -255,6 +258,7 @@ def test_attestation_writes_proof_to_exact_ready_replica_set_metadata() -> None:
 def test_rollback_restores_target_template_with_resource_version_guard() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     current_template = ns(
         metadata=ns(annotations={"sentinelops.io/version": "broken"}),
@@ -293,6 +297,7 @@ def test_rollback_restores_target_template_with_resource_version_guard() -> None
 def test_backend_rejects_rollback_if_proof_changes_after_preflight() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     deployment = ns(
         metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
@@ -321,6 +326,7 @@ def test_backend_rejects_rollback_if_proof_changes_after_preflight() -> None:
 def test_backend_rejects_rollback_when_public_revision_differs_from_guard() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     deployment = ns(
         metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
@@ -347,6 +353,7 @@ def test_backend_rejects_rollback_when_public_revision_differs_from_guard() -> N
 def test_backend_rejects_rollback_when_current_revision_self_recovers() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     deployment = ns(
         metadata=ns(uid="deployment-uid", resource_version="42", generation=2),
@@ -375,6 +382,7 @@ def test_backend_rejects_rollback_when_current_revision_self_recovers() -> None:
 def test_backend_rejects_guard_replayed_to_another_write_tool() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
 
     with pytest.raises(RuntimeError, match="tool or arguments changed"):
@@ -390,9 +398,33 @@ def test_backend_rejects_guard_replayed_to_another_write_tool() -> None:
     backend.apps.patch_namespaced_deployment.assert_not_called()
 
 
+def test_backend_rejects_guard_from_another_cluster_before_api_read() -> None:
+    backend = KubernetesBackend.__new__(KubernetesBackend)
+    backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "cluster-b"
+    backend.apps = Mock()
+    arguments = {"name": "order-service"}
+    precondition = rollback_precondition(
+        replica_set(1, healthy_proof=True),
+        tool_name="restart_deployment",
+        arguments=arguments,
+    )
+    precondition.pop("rollback_target")
+    precondition["cluster_id"] = "cluster-a"
+
+    with pytest.raises(RuntimeError, match="cluster_id"):
+        backend._tool_restart_deployment(
+            {**arguments, "_precondition": precondition}
+        )
+
+    backend.apps.read_namespaced_deployment.assert_not_called()
+    backend.apps.patch_namespaced_deployment.assert_not_called()
+
+
 def test_restart_uses_fresh_resource_version_as_a_cas_guard() -> None:
     backend = KubernetesBackend.__new__(KubernetesBackend)
     backend.namespace = "sentinelops-demo"
+    backend.cluster_id = "local"
     backend.apps = Mock()
     deployment = ns(
         metadata=ns(uid="deployment-uid", resource_version="42", generation=2),

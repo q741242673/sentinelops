@@ -58,6 +58,7 @@ var contracts = map[string]actionContract{
 
 func workloadPreconditions() []string {
 	return []string{
+		"clusterId",
 		"resourceVersion",
 		"generation",
 		"desiredReplicas",
@@ -122,6 +123,7 @@ func RollbackHealthProofDigest(
 func SnapshotDigest(precondition opsv1alpha1.ExecutionPrecondition) string {
 	payload := map[string]any{
 		"capturedAt":           precondition.CapturedAt,
+		"clusterId":            precondition.ClusterID,
 		"currentReplicaSetUid": precondition.CurrentReplicaSetUID,
 		"currentRevision":      precondition.CurrentRevision,
 		"currentTemplateHash":  precondition.CurrentTemplateHash,

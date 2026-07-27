@@ -34,6 +34,7 @@ def _alert() -> Alert:
 def _snapshot() -> DeploymentSnapshot:
     return DeploymentSnapshot(
         name="order-service",
+        cluster_id="local",
         namespace="sentinelops-demo",
         uid="deployment-uid",
         resource_version="42",
@@ -95,6 +96,7 @@ def test_change_proposal_builds_bounded_diff_without_execution_capability() -> N
     assert preview.executable is False
     assert preview.requires_human_approval is True
     assert preview.execution_channel == "gitops_pr"
+    assert preview.target["cluster_id"] == "local"
     assert preview.target["uid"] == "deployment-uid"
     assert preview.target["resource_version"] == "42"
     assert [(item.before, item.after) for item in preview.diff] == [

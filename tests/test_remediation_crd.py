@@ -109,6 +109,10 @@ def test_crd_action_contract_matches_the_server_owned_plugin_catalog() -> None:
 
     cross_field_rules = " ".join(_validations(spec))
     assert "self.action.parameters.name == self.target.name" in cross_field_rules
+    assert (
+        "self.target.clusterId == self.precondition.clusterId"
+        in cross_field_rules
+    )
     assert "self.precondition.rollbackTarget.revision" in cross_field_rules
     assert "self.action.parameters.revision" in cross_field_rules
 
@@ -117,6 +121,7 @@ def test_crd_binds_authorization_snapshot_and_monotonic_fence() -> None:
     spec = _schema()["properties"]["spec"]
     authorization = spec["properties"]["authorization"]
     precondition = spec["properties"]["precondition"]
+    target = spec["properties"]["target"]
     fence = spec["properties"]["fence"]
 
     assert authorization.get("x-kubernetes-preserve-unknown-fields") is not True
@@ -129,6 +134,7 @@ def test_crd_binds_authorization_snapshot_and_monotonic_fence() -> None:
     assert precondition.get("x-kubernetes-preserve-unknown-fields") is not True
     assert {
         "snapshotDigest",
+        "clusterId",
         "resourceVersion",
         "generation",
         "desiredReplicas",
@@ -139,6 +145,9 @@ def test_crd_binds_authorization_snapshot_and_monotonic_fence() -> None:
         "capturedAt",
     } <= set(precondition["required"])
     assert precondition["properties"]["snapshotDigest"]["pattern"] == "^[a-f0-9]{64}$"
+    assert "clusterId" in target["required"]
+    assert target["properties"]["clusterId"] == precondition["properties"]["clusterId"]
+    assert precondition["properties"]["clusterId"]["maxLength"] == 63
 
     assert fence.get("x-kubernetes-preserve-unknown-fields") is not True
     assert fence["properties"]["generation"]["minimum"] == 1

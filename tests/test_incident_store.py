@@ -42,6 +42,41 @@ async def _paused_incident():
     return agent, record
 
 
+async def _queued_cluster_intent(
+    store: SqlIncidentStore,
+    *,
+    cluster_id: str,
+    key_character: str,
+):
+    _, record = await _paused_incident()
+    record.alert = record.alert.model_copy(update={"cluster_id": cluster_id})
+    assert record.approval is not None
+    await store.save(record, expected_version=None, graph_state=None)
+    await store.claim_approval(
+        record.id,
+        approval_id=record.approval.approval_id,
+        approval_version=record.approval.version,
+        approved=True,
+        note=f"{cluster_id} routing test",
+    )
+    lease = await store.acquire_lease(
+        record.id,
+        owner_id=f"worker-{cluster_id}",
+        ttl_seconds=60,
+    )
+    intent = await store.prepare_action(
+        lease,
+        idempotency_key=key_character * 64,
+        action=record.approval.action,
+        precondition={
+            "cluster_id": cluster_id,
+            "resource_version": f"rv-{cluster_id}",
+        },
+    )
+    await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
+    return record, lease, intent
+
+
 async def _enqueue_claim_dispatch(
     store: SqlIncidentStore,
     lease,
@@ -52,6 +87,7 @@ async def _enqueue_claim_dispatch(
 ):
     await store.enqueue_action(lease, idempotency_key=idempotency_key)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id=owner_id,
         attempt_id=f"attempt-{idempotency_key[:16]}",
         ttl_seconds=ttl_seconds,
@@ -450,7 +486,11 @@ async def test_action_intent_records_dispatch_and_result_before_incident_termina
         owner_id="worker-a",
         ttl_seconds=60,
     )
-    precondition = {"resource_version": "17", "generation": 4}
+    precondition = {
+        "cluster_id": "local",
+        "resource_version": "17",
+        "generation": 4,
+    }
     prepared = await store.prepare_action(
         lease,
         idempotency_key="a" * 64,
@@ -461,6 +501,7 @@ async def test_action_intent_records_dispatch_and_result_before_incident_termina
 
     await store.enqueue_action(lease, idempotency_key=prepared.idempotency_key)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="attempt-a",
         ttl_seconds=60,
@@ -514,7 +555,7 @@ async def test_prepared_intent_can_be_fenced_and_reassigned_before_dispatch(
         first,
         idempotency_key="b" * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await store.release_lease(first)
     second = await store.acquire_lease(
@@ -584,7 +625,7 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
         lease,
         idempotency_key=("d" if complete_before_crash else "c") * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     claim = await _enqueue_claim_dispatch(
         before_crash,
@@ -656,7 +697,7 @@ async def test_durable_resolved_state_blocks_dispatch_across_replicas(tmp_path) 
         lease,
         idempotency_key="e" * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await worker.enqueue_action(lease, idempotency_key=intent.idempotency_key)
 
@@ -673,6 +714,7 @@ async def test_durable_resolved_state_blocks_dispatch_across_replicas(tmp_path) 
     )
 
     claim = await worker.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="resolved-before-dispatch",
         ttl_seconds=60,
@@ -812,7 +854,7 @@ async def test_crashed_live_lease_is_reconciled_after_ttl_without_restart(
         lease,
         idempotency_key="f" * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await _enqueue_claim_dispatch(
         crashed_worker,
@@ -874,7 +916,7 @@ async def test_resolved_after_dispatch_preserves_late_durable_result(tmp_path) -
         lease,
         idempotency_key="1" * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     claim = await _enqueue_claim_dispatch(
         store,
@@ -937,9 +979,134 @@ async def test_recoverable_query_is_not_limited_to_latest_two_hundred(tmp_path) 
         await store.save(record, expected_version=None, graph_state=None)
 
     visible_history = await store.list()
-    recoverable = await store.list_recoverable()
+    recoverable = await store.list_recoverable(cluster_id="local")
 
     assert len(visible_history) == 200
     assert len(recoverable) == 205
     assert oldest_id in {item.record.id for item in recoverable}
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_recoverable_incidents_are_filtered_by_cluster(tmp_path) -> None:
+    store = SqlIncidentStore(_database_url(tmp_path))
+    await store.setup()
+    record_a = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="ClusterARecovery",
+            cluster_id="cluster-a",
+            service="shared-service",
+            summary="cluster A",
+        ),
+        status=IncidentStatus.INVESTIGATING,
+    )
+    record_b = record_a.model_copy(
+        update={
+            "id": "cluster-b-recoverable",
+            "alert": record_a.alert.model_copy(
+                update={"cluster_id": "cluster-b"}
+            ),
+        },
+        deep=True,
+    )
+    await store.save(record_a, expected_version=None, graph_state=None)
+    await store.save(record_b, expected_version=None, graph_state=None)
+
+    recoverable_a = await store.list_recoverable(cluster_id="cluster-a")
+    recoverable_b = await store.list_recoverable(cluster_id="cluster-b")
+
+    assert [item.record.id for item in recoverable_a] == [record_a.id]
+    assert [item.record.id for item in recoverable_b] == [record_b.id]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_executor_claim_only_selects_its_cluster(tmp_path) -> None:
+    store = SqlIncidentStore(_database_url(tmp_path))
+    await store.setup()
+    record_a, _, _ = await _queued_cluster_intent(
+        store,
+        cluster_id="cluster-a",
+        key_character="a",
+    )
+    record_b, _, _ = await _queued_cluster_intent(
+        store,
+        cluster_id="cluster-b",
+        key_character="b",
+    )
+
+    claim_b = await store.claim_action_execution(
+        cluster_id="cluster-b",
+        owner_id="executor-b",
+        attempt_id="cluster-b-attempt",
+        ttl_seconds=60,
+    )
+    claim_a = await store.claim_action_execution(
+        cluster_id="cluster-a",
+        owner_id="executor-a",
+        attempt_id="cluster-a-attempt",
+        ttl_seconds=60,
+    )
+
+    assert claim_b is not None
+    assert claim_b.cluster_id == "cluster-b"
+    assert claim_b.incident_id == record_b.id
+    assert claim_a is not None
+    assert claim_a.cluster_id == "cluster-a"
+    assert claim_a.incident_id == record_a.id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_claim_only_selects_its_cluster(tmp_path) -> None:
+    store = SqlIncidentStore(_database_url(tmp_path))
+    await store.setup()
+    _, _, intent_a = await _queued_cluster_intent(
+        store,
+        cluster_id="cluster-a",
+        key_character="c",
+    )
+    _, _, intent_b = await _queued_cluster_intent(
+        store,
+        cluster_id="cluster-b",
+        key_character="d",
+    )
+    claim_a = await store.claim_action_execution(
+        cluster_id="cluster-a",
+        owner_id="executor-a",
+        attempt_id="cluster-a-dispatch",
+        ttl_seconds=2,
+    )
+    claim_b = await store.claim_action_execution(
+        cluster_id="cluster-b",
+        owner_id="executor-b",
+        attempt_id="cluster-b-dispatch",
+        ttl_seconds=2,
+    )
+    assert claim_a is not None and claim_b is not None
+    await store.mark_action_dispatched(claim_a)
+    await store.mark_action_dispatched(claim_b)
+    await store.mark_action_unknown(claim=claim_a, reason="test reconciliation")
+    await store.mark_action_unknown(claim=claim_b, reason="test reconciliation")
+    # SQLite CURRENT_TIMESTAMP has one-second precision, so cross a full
+    # database clock tick before the reconciliation lease becomes eligible.
+    await asyncio.sleep(2.1)
+
+    reconciliation_b = await store.claim_action_reconciliation(
+        cluster_id="cluster-b",
+        owner_id="reconciler-b",
+        ttl_seconds=60,
+    )
+    reconciliation_a = await store.claim_action_reconciliation(
+        cluster_id="cluster-a",
+        owner_id="reconciler-a",
+        ttl_seconds=60,
+    )
+
+    assert reconciliation_b is not None
+    assert reconciliation_b.cluster_id == "cluster-b"
+    assert reconciliation_b.intent.idempotency_key == intent_b.idempotency_key
+    assert reconciliation_a is not None
+    assert reconciliation_a.cluster_id == "cluster-a"
+    assert reconciliation_a.intent.idempotency_key == intent_a.idempotency_key
     await store.close()

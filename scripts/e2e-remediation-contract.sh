@@ -42,10 +42,12 @@ spec:
   target:
     apiVersion: apps/v1
     kind: Deployment
+    clusterId: local-kind
     namespace: ${NAMESPACE}
     name: inventory-service
     uid: contract-test-deployment-uid
   precondition:
+    clusterId: local-kind
     snapshotDigest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     resourceVersion: "1"
     generation: 1

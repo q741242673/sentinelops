@@ -156,6 +156,7 @@ WORKLOAD_PRECONDITIONS = (
     "action_fingerprint",
     "tool_name",
     "target",
+    "cluster_id",
     "namespace",
     "deployment_uid",
     "generation",

@@ -569,6 +569,7 @@ func validateRemediationSchema(
 		[]string{
 			"self == oldSelf",
 			"self.action.parameters.name == self.target.name",
+			"self.target.clusterId == self.precondition.clusterId",
 			"(self.action.plugin == 'rollback_deployment' && has(self.precondition.rollbackTarget) && self.precondition.rollbackTarget.revision == self.action.parameters.revision) || (self.action.plugin != 'rollback_deployment' && !has(self.precondition.rollbackTarget))",
 		},
 	) {
@@ -576,6 +577,10 @@ func validateRemediationSchema(
 	}
 	specProperties, ok := spec["properties"].(map[string]any)
 	if !ok {
+		return "schema_weakened"
+	}
+	if !hasRequiredClusterIdentity(specProperties["target"]) ||
+		!hasRequiredClusterIdentity(specProperties["precondition"]) {
 		return "schema_weakened"
 	}
 	action, ok := specProperties["action"].(map[string]any)
@@ -649,6 +654,27 @@ func validateRemediationSchema(
 		return "schema_weakened"
 	}
 	return ""
+}
+
+func hasRequiredClusterIdentity(value any) bool {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := stringSet(object["required"])["clusterId"]; !ok {
+		return false
+	}
+	properties, ok := object["properties"].(map[string]any)
+	if !ok {
+		return false
+	}
+	clusterID, ok := properties["clusterId"].(map[string]any)
+	return ok &&
+		clusterID["type"] == "string" &&
+		clusterID["minLength"] == int64(1) &&
+		clusterID["maxLength"] == int64(63) &&
+		clusterID["pattern"] ==
+			"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
 }
 
 func sameValidationRules(raw any, expected []string) bool {

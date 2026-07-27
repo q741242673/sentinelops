@@ -50,6 +50,7 @@ def _preview():
         ),
         snapshot=DeploymentSnapshot(
             name="order-service",
+            cluster_id="local",
             namespace="sentinelops-demo",
             uid="deployment-uid",
             resource_version="42",

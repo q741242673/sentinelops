@@ -65,6 +65,8 @@ async def test_api_incident_approval_flow(monkeypatch: pytest.MonkeyPatch) -> No
         assert runtime.json()["model_provider"] == "rule_based"
         assert runtime.json()["approval_mode"] == "risk_based"
         assert runtime.json()["alert_ingestion"] == "alertmanager_webhook"
+        assert runtime.json()["cluster_id"] == "local"
+        assert runtime.json()["cluster_display_name"] == "本地集群"
 
         demo = await client.post("/api/v1/demo/incidents")
         assert demo.status_code == 201
@@ -230,7 +232,7 @@ async def test_alertmanager_webhook_accepts_and_deduplicates_firing_alerts(
         confidence_threshold=0.8,
     ) is None
     assert resolved.json()["accepted"][0]["status"] == "resolved"
-    assert "demo-fingerprint" not in api_module.alert_fingerprints
+    assert ("default", "demo-fingerprint") not in api_module.alert_fingerprints
 
 
 @pytest.mark.asyncio
@@ -252,7 +254,9 @@ async def test_resolved_alert_invalidates_pending_approval_before_write() -> Non
             },
         )
         incident = created.json()
-        api_module.alert_fingerprints["stale-approval"] = incident["id"]
+        api_module.alert_fingerprints[
+            ("default", "stale-approval")
+        ] = incident["id"]
 
         resolved = await client.post(
             "/api/v1/webhooks/alertmanager",
@@ -305,6 +309,7 @@ async def test_untrusted_alert_labels_cannot_select_profile_or_enable_lab_side_e
                 "labels": {
                     "alertname": "InventoryTransientRuntimeFault",
                     "service": "inventory-service",
+                    "cluster_id": "forged-remote-cluster",
                     "auto_remediation": "true",
                     "reflection_demo": "true",
                     "scenario": "transient_runtime_fault",
@@ -321,9 +326,117 @@ async def test_untrusted_alert_labels_cannot_select_profile_or_enable_lab_side_e
     incident_id = response.json()["accepted"][0]["incident_id"]
     record = api_module.incident_records[incident_id]
     assert record.execution_profile_id == "production-default"
+    assert record.alert.cluster_id == "local"
+    assert record.alert.labels["cluster_id"] == "local"
     assert record.active_step_id is None
     assert [step.id for step in record.execution_trace] == ["incident_received:1"]
     assert captured[0][2] is None
+
+
+@pytest.mark.asyncio
+async def test_direct_api_rejects_foreign_cluster_incident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(cluster_id="cluster-a"),
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/incidents",
+            json={
+                "name": "HighOrderServiceErrorRate",
+                "cluster_id": "cluster-b",
+                "namespace": "sentinelops-demo",
+                "service": "order-service",
+                "severity": "critical",
+                "summary": "must not run against cluster-a",
+            },
+        )
+
+    assert response.status_code == 409
+    assert "cluster-b" in response.json()["detail"]
+    assert "cluster-a" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_incident_owned_by_another_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(cluster_id="cluster-a")
+    monkeypatch.setattr(api_module, "get_settings", lambda: settings)
+    foreign = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="HighErrorRate",
+            cluster_id="cluster-b",
+            service="order-service",
+            summary="foreign incident",
+        )
+    )
+    api_module.incident_records[foreign.id] = foreign
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/incidents/{foreign.id}/approval",
+            json={
+                "approval_id": "foreign-approval",
+                "approval_version": 1,
+                "approved": True,
+            },
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Incident not found"
+    api_module.incident_records.pop(foreign.id, None)
+
+
+@pytest.mark.asyncio
+async def test_incident_reads_hide_records_owned_by_another_cluster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        api_module,
+        "get_settings",
+        lambda: Settings(cluster_id="cluster-a"),
+    )
+    local = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="LocalErrorRate",
+            cluster_id="cluster-a",
+            service="order-service",
+            summary="local incident",
+        )
+    )
+    foreign = api_module.IncidentRecord(
+        alert=api_module.Alert(
+            name="ForeignErrorRate",
+            cluster_id="cluster-b",
+            service="order-service",
+            summary="foreign incident",
+        )
+    )
+    api_module.incident_records[local.id] = local
+    api_module.incident_records[foreign.id] = foreign
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            listed = await client.get("/api/v1/incidents")
+            fetched = await client.get(f"/api/v1/incidents/{foreign.id}")
+            streamed = await client.get(
+                f"/api/v1/incidents/{foreign.id}/events"
+            )
+    finally:
+        api_module.incident_records.pop(local.id, None)
+        api_module.incident_records.pop(foreign.id, None)
+
+    assert listed.status_code == 200
+    listed_ids = {item["id"] for item in listed.json()}
+    assert local.id in listed_ids
+    assert foreign.id not in listed_ids
+    assert fetched.status_code == 404
+    assert streamed.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -346,6 +459,8 @@ async def test_publish_incident_notifies_live_stream_queue() -> None:
     feed_payload = json.loads(await feed_queue.get())
     assert payload["id"] == record.id
     assert feed_payload["id"] == record.id
+    assert payload["alert"]["cluster_id"] == "local"
+    assert feed_payload["alert"]["cluster_id"] == "local"
     assert payload["execution_trace"] == []
     api_module.incident_streams.clear()
     api_module.incident_feed_streams.clear()

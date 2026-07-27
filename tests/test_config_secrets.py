@@ -11,6 +11,15 @@ from sentinelops.config import Settings
 from sentinelops.healthcheck import check_heartbeat
 
 
+@pytest.mark.parametrize(
+    "cluster_id",
+    ("Prod-A", "prod_cluster_a", "-prod-a", "prod-a-", "prod.a"),
+)
+def test_cluster_id_must_be_a_dns_label(cluster_id: str) -> None:
+    with pytest.raises(ValueError, match="cluster_id"):
+        Settings(cluster_id=cluster_id)
+
+
 def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None:
     database_file = tmp_path / "database-url"
     database_file.write_text("sqlite+aiosqlite:///state.db\n")

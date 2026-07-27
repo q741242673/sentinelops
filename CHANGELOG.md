@@ -19,12 +19,13 @@
 - Kubernetes 原生准入写闸门；即使 RBAC 已允许，未列入参数的 Deployment 和修复合同写入仍会被 API Server 拒绝；
 - 准入写闸门支持 Warn/Audit 灰度观察后再切换 Deny，并由独立治理策略保护允许名单和正式启用标签；
 - Go Controller 持续核验准入 CRD、策略、绑定、白名单与 namespace 模式，并在每次 Deployment 写入前通过非缓存 API 读取 fail-closed；
+- 事故、审批快照、Action Intent、Executor 队列和 Controller 合同绑定服务端 `cluster_id`，共享数据库下不会跨集群领取或恢复写操作；
 - 确定性安全评估、真实模型只读评估、kind E2E、PostgreSQL 合同和持续故障压测。
 
 升级与迁移：
 
 - 数据库必须先运行 Alembic migration，当前 schema head 为
-  `0010_action_reconcile_outbox`；
+  `0011_cluster_routing_fence`；
 - API、Executor、Migration Job 和 Anchor Publisher 必须使用同一镜像版本；
 - 生产部署应把清单里的示例镜像替换为 RC 镜像的不可变 digest；
 - 旧 SQLite 本地演示可以继续使用，但多副本生产模式必须使用 PostgreSQL。

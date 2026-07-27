@@ -53,6 +53,8 @@ python "${ROOT_DIR}/scripts/observability_e2e.py"
 
 export SENTINELOPS_TOOL_BACKEND=kubernetes
 export SENTINELOPS_MODEL_PROVIDER="${SENTINELOPS_MODEL_PROVIDER:-rule_based}"
+export SENTINELOPS_CLUSTER_ID=local-kind
+export SENTINELOPS_CLUSTER_DISPLAY_NAME=本地-kind-集群
 export SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 export SENTINELOPS_PROMETHEUS_URL=http://127.0.0.1:19090
 export SENTINELOPS_LOKI_URL=http://127.0.0.1:13100

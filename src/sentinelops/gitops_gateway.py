@@ -36,6 +36,11 @@ class GitOpsTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=253)
+    cluster_id: str = Field(
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+    )
     namespace: str = Field(min_length=1, max_length=253)
     uid: str = Field(min_length=1, max_length=256)
     resource_version: str = Field(min_length=1, max_length=128)

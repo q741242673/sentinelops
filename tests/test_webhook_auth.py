@@ -447,6 +447,7 @@ async def test_production_startup_rejects_anonymous_or_incomplete_webhook_auth(
 ) -> None:
     anonymous = Settings(
         environment="production",
+        cluster_id="prod-cluster",
         executor_mode="external",
         alertmanager_source_id="prod-cluster",
     )
@@ -463,6 +464,7 @@ async def test_production_startup_rejects_anonymous_or_incomplete_webhook_auth(
 
     empty = Settings(
         environment="production",
+        cluster_id="prod-cluster",
         executor_mode="external",
         alertmanager_source_id="prod-cluster",
         alertmanager_webhook_auth_mode="bearer",
@@ -474,6 +476,7 @@ async def test_production_startup_rejects_anonymous_or_incomplete_webhook_auth(
 
     missing_audit_key = Settings(
         environment="production",
+        cluster_id="prod-cluster",
         executor_mode="external",
         alertmanager_source_id="prod-cluster",
         alertmanager_webhook_auth_mode="bearer",
@@ -486,6 +489,12 @@ async def test_production_startup_rejects_anonymous_or_incomplete_webhook_auth(
     )
     with pytest.raises(RuntimeError, match="审计 HMAC"):
         await api_module.initialize_persistence()
+
+
+def test_production_settings_require_explicit_cluster_identity() -> None:
+    for forbidden in ("local", "default", "legacy-unassigned"):
+        with pytest.raises(ValueError, match="SENTINELOPS_CLUSTER_ID"):
+            Settings(environment="production", cluster_id=forbidden)
 
 
 def test_secret_values_are_masked_in_settings_representation() -> None:

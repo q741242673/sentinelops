@@ -146,6 +146,7 @@ def _intent(
         risk = RiskLevel.HIGH
     precondition: dict[str, object] = {
         "action_fingerprint": "approved-action",
+        "cluster_id": "prod-cluster-a",
         "tool_name": action_name,
         "target": "order-service",
         "namespace": "sentinelops-workloads",
@@ -176,6 +177,7 @@ def _intent(
     return StoredActionIntent(
         idempotency_key="a" * 64,
         incident_id="incident-01",
+        cluster_id="prod-cluster-a",
         lease_generation=2,
         approval_id="approval-01" if approval else None,
         approval_version=3 if approval else None,
@@ -200,15 +202,15 @@ def _intent(
 def test_python_catalog_digests_match_controller_contract() -> None:
     assert (
         action_catalog_digest("restart_deployment")
-        == "29dbaa37e2caaaaa8056267c1b6ff8c9dc18f5fe3311353154634beee7c65bf9"
+        == "c417d3f9952779f103b2a80c8b1271cd15468357e1b4aa3faa7fe5c5d56a1569"
     )
     assert (
         action_catalog_digest("rollback_deployment")
-        == "c431542012a61d0f456d839569c3b7f9d4c3a817395357dbfc77374f3fa445ea"
+        == "59708f23f4b777687ff488d96caae1676a9b6e04fda417e7a0d95656667e3524"
     )
     assert (
         action_catalog_digest("scale_deployment")
-        == "856ea7b9c7740c7147307a7c665ed6c2a851c45b117889de78e29758f551127d"
+        == "323e8de7071a289afbdbe2fbb1cfa3c84949ae5dd2155f0cde19b6ee011af591"
     )
 
 
@@ -221,7 +223,9 @@ def test_build_automatic_contract_binds_snapshot_and_workload_generation() -> No
     }
     spec = body["spec"]
     assert spec["action"]["plugin"] == "restart_deployment"
+    assert spec["target"]["clusterId"] == "prod-cluster-a"
     assert spec["target"]["uid"] == "deployment-uid"
+    assert spec["precondition"]["clusterId"] == "prod-cluster-a"
     assert spec["fence"] == {
         "generation": 4,
         "expiresAt": "2026-07-26T06:15:00Z",
@@ -289,11 +293,20 @@ def test_contract_rejects_action_target_mismatch() -> None:
         build_sentinel_remediation(intent)
 
 
+def test_contract_rejects_cluster_identity_mismatch() -> None:
+    intent = _intent()
+    intent.precondition["cluster_id"] = "prod-cluster-b"
+
+    with pytest.raises(ValueError, match="cluster_id 不一致"):
+        build_sentinel_remediation(intent)
+
+
 @pytest.mark.asyncio
 async def test_gateway_creates_contract_and_waits_for_bound_success() -> None:
     api = FakeCustomObjectsApi()
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
         poll_interval_seconds=0,
         result_timeout_seconds=1,
@@ -325,6 +338,7 @@ async def test_gateway_reuses_only_an_identical_existing_contract() -> None:
     )
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
         poll_interval_seconds=0,
         result_timeout_seconds=1,
@@ -349,6 +363,7 @@ async def test_controller_rejection_is_a_failed_tool_result() -> None:
     )
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
         poll_interval_seconds=0,
         result_timeout_seconds=1,
@@ -368,6 +383,7 @@ async def test_controller_rejection_is_a_failed_tool_result() -> None:
         "AdmissionFenceNotEnforced",
         "AdmissionIntegrityDrift",
         "AdmissionIntegrityUnknown",
+        "ClusterIdentityMismatch",
     ],
 )
 async def test_admission_integrity_rejections_prove_no_write(
@@ -379,6 +395,7 @@ async def test_admission_integrity_rejections_prove_no_write(
     )
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
         poll_interval_seconds=0,
         result_timeout_seconds=1,
@@ -396,6 +413,7 @@ async def test_observe_missing_contract_never_creates_or_replays_it() -> None:
     api = MissingCustomObjectsApi()
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
     )
 
@@ -419,6 +437,7 @@ async def test_observe_accepts_only_a_fully_bound_controller_result() -> None:
     api.get_calls = 1
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
     )
 
@@ -449,6 +468,7 @@ async def test_observe_rejects_false_success_digest_and_unknown_stale_outcome() 
     api.get_calls = 1
     gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=api,
     )
 
@@ -470,6 +490,7 @@ async def test_observe_rejects_false_success_digest_and_unknown_stale_outcome() 
     unsafe_api.get_calls = 1
     unsafe_gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=unsafe_api,
     )
     unsafe = await unsafe_gateway.observe(_intent())
@@ -491,8 +512,29 @@ async def test_observe_rejects_false_success_digest_and_unknown_stale_outcome() 
     after_write_api.get_calls = 1
     after_write_gateway = KubernetesRemediationGateway(
         "sentinelops-workloads",
+        cluster_id="prod-cluster-a",
         custom_objects_api=after_write_api,
     )
     after_write = await after_write_gateway.observe(_intent())
     assert after_write.state == "unknown"
     assert "不能证明写操作未发生" in str(after_write.reason)
+
+
+@pytest.mark.asyncio
+async def test_gateway_rejects_wrong_cluster_before_any_kubernetes_request() -> None:
+    api = MissingCustomObjectsApi()
+    gateway = KubernetesRemediationGateway(
+        "sentinelops-workloads",
+        cluster_id="prod-cluster-b",
+        custom_objects_api=api,
+    )
+
+    with pytest.raises(ValueError, match="当前 Executor 只允许集群"):
+        await gateway.execute(_intent())
+    observation = await gateway.observe(_intent())
+
+    assert observation.state == "unknown"
+    assert observation.retryable is False
+    assert "当前 Executor 只允许集群" in str(observation.reason)
+    assert api.create_calls == 0
+    assert api.get_calls == 0

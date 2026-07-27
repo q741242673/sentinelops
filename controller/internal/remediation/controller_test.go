@@ -22,14 +22,15 @@ import (
 const (
 	testNamespace  = "sentinelops-workloads"
 	testDeployment = "order-service"
+	testClusterID  = "prod-cluster-a"
 	testNowText    = "2026-07-26T06:00:00Z"
 )
 
 func TestCrossLanguageContractDigests(t *testing.T) {
 	expected := map[string]string{
-		ActionRestart:  "29dbaa37e2caaaaa8056267c1b6ff8c9dc18f5fe3311353154634beee7c65bf9",
-		ActionRollback: "c431542012a61d0f456d839569c3b7f9d4c3a817395357dbfc77374f3fa445ea",
-		ActionScale:    "856ea7b9c7740c7147307a7c665ed6c2a851c45b117889de78e29758f551127d",
+		ActionRestart:  "c417d3f9952779f103b2a80c8b1271cd15468357e1b4aa3faa7fe5c5d56a1569",
+		ActionRollback: "59708f23f4b777687ff488d96caae1676a9b6e04fda417e7a0d95656667e3524",
+		ActionScale:    "323e8de7071a289afbdbe2fbb1cfa3c84949ae5dd2155f0cde19b6ee011af591",
 	}
 	for action, want := range expected {
 		got, ok := CatalogDigest(action)
@@ -43,7 +44,7 @@ func TestCrossLanguageContractDigests(t *testing.T) {
 		"human_approval",
 		catalogDigest,
 	)
-	if policyDigest != "b47c4efbda8eee5fe667f4e45592fb40c27a694478bda2d20e38d071045b0552" {
+	if policyDigest != "052150405c4500c3df974ebbc2afdbfc581e379401b32db2f42df49efefc6a2f" {
 		t.Fatalf("human policy digest = %q", policyDigest)
 	}
 	if got := HumanApprovalDigest(
@@ -51,7 +52,7 @@ func TestCrossLanguageContractDigests(t *testing.T) {
 		"approval-01",
 		3,
 		policyDigest,
-	); got != "8e6d5730c5e1305d67ea41e40789e724f8b55446bbe1ea688b41961f3caa33be" {
+	); got != "53f3af3433c04424eb546ced8767e954c0bccec9d881643d14716d96e2028388" {
 		t.Fatalf("human approval digest = %q", got)
 	}
 	capturedAt, err := time.Parse(time.RFC3339Nano, "2026-07-26T10:06:19.316941Z")
@@ -59,6 +60,7 @@ func TestCrossLanguageContractDigests(t *testing.T) {
 		t.Fatalf("parse snapshot time: %v", err)
 	}
 	snapshot := opsv1alpha1.ExecutionPrecondition{
+		ClusterID:            testClusterID,
 		ResourceVersion:      "919",
 		Generation:           1,
 		DesiredReplicas:      1,
@@ -69,7 +71,7 @@ func TestCrossLanguageContractDigests(t *testing.T) {
 		CapturedAt:           metav1.NewTime(capturedAt),
 	}
 	if got := SnapshotDigest(snapshot); got !=
-		"183295b557b263268185d9dc9a877ece7a735a1887130c8cb07e42192db3e125" {
+		"57fd6030506849b9626899ec3e1a8e8258b30c95c75d954e2ca88ba0b777fa31" {
 		t.Fatalf("snapshot digest = %q", got)
 	}
 }
@@ -91,6 +93,50 @@ func TestRestartAppliesRegisteredAction(t *testing.T) {
 		t.Fatalf("action plugin marker = %q, want %q", got, ActionRestart)
 	}
 	assertPhase(t, kubeClient, remediation, PhaseSucceeded, "ActionApplied")
+}
+
+func TestTargetClusterMismatchRejectsBeforeWriteBoundary(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		func(remediation *opsv1alpha1.SentinelRemediation) {
+			remediation.Spec.Target.ClusterID = "prod-cluster-b"
+		},
+	)
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "ClusterIdentityMismatch")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
+func TestPreconditionClusterMismatchRejectsBeforeWriteBoundary(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		func(remediation *opsv1alpha1.SentinelRemediation) {
+			remediation.Spec.Precondition.ClusterID = "prod-cluster-b"
+		},
+	)
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "ClusterIdentityMismatch")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
+}
+
+func TestControllerWithoutExpectedClusterRejectsBeforeWriteBoundary(t *testing.T) {
+	reconciler, kubeClient, remediation := newTestReconciler(
+		t,
+		ActionRestart,
+		nil,
+	)
+	reconciler.ExpectedClusterID = ""
+
+	reconcileOnce(t, reconciler, remediation)
+
+	assertPhase(t, kubeClient, remediation, PhaseRejected, "ClusterIdentityMismatch")
+	assertNoWriteBoundaryCrossed(t, kubeClient, remediation)
 }
 
 func TestAdmissionDriftRejectsBeforeDeploymentWrite(t *testing.T) {
@@ -472,9 +518,10 @@ func TestCrashAfterWriteRecoversWithoutRepeatingAction(t *testing.T) {
 	}
 
 	restarted := &Reconciler{
-		Client:       kubeClient,
-		ControllerID: "controller-after-restart",
-		Clock:        func() time.Time { return mustTime(t) },
+		Client:            kubeClient,
+		ControllerID:      "controller-after-restart",
+		ExpectedClusterID: testClusterID,
+		Clock:             func() time.Time { return mustTime(t) },
 	}
 	reconcileOnce(t, restarted, remediation)
 
@@ -600,10 +647,11 @@ func newTestReconciler(
 		WithObjects(deployment, current, rollback, remediation).
 		Build()
 	reconciler := &Reconciler{
-		Client:       kubeClient,
-		Scheme:       scheme,
-		ControllerID: "controller-test",
-		Clock:        func() time.Time { return mustTime(t) },
+		Client:            kubeClient,
+		Scheme:            scheme,
+		ControllerID:      "controller-test",
+		ExpectedClusterID: testClusterID,
+		Clock:             func() time.Time { return mustTime(t) },
 	}
 	return reconciler, kubeClient, remediation
 }
@@ -818,11 +866,13 @@ func baseRemediation(action string) *opsv1alpha1.SentinelRemediation {
 			Target: opsv1alpha1.RemediationTarget{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
+				ClusterID:  testClusterID,
 				Namespace:  testNamespace,
 				Name:       testDeployment,
 				UID:        types.UID("deployment-uid"),
 			},
 			Precondition: opsv1alpha1.ExecutionPrecondition{
+				ClusterID:            testClusterID,
 				ResourceVersion:      "10",
 				Generation:           4,
 				DesiredReplicas:      3,

@@ -281,10 +281,12 @@ spec:
   target:
     apiVersion: apps/v1
     kind: Deployment
+    clusterId: local-kind
     namespace: ${NAMESPACE}
     name: admission-target
     uid: admission-test-deployment-uid
   precondition:
+    clusterId: local-kind
     snapshotDigest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     resourceVersion: "1"
     generation: 1
@@ -321,10 +323,12 @@ spec:
   target:
     apiVersion: apps/v1
     kind: Deployment
+    clusterId: local-kind
     namespace: ${NAMESPACE}
     name: admission-target
     uid: admission-test-deployment-uid
   precondition:
+    clusterId: local-kind
     snapshotDigest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     resourceVersion: "1"
     generation: 1

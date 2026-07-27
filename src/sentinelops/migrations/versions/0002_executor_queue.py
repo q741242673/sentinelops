@@ -89,9 +89,18 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
         actual_columns = {
             column["name"]: column for column in inspector.get_columns(table)
         }
-        if set(actual_columns) != set(expected_columns):
+        allowed_extra_columns = (
+            {"cluster_id"}
+            if table == "sentinelops_action_intents"
+            else set()
+        )
+        missing_columns = set(expected_columns) - set(actual_columns)
+        unexpected_columns = (
+            set(actual_columns) - set(expected_columns) - allowed_extra_columns
+        )
+        if missing_columns or unexpected_columns:
             problems.append(
-                f"{table} 字段应为={sorted(expected_columns)}，"
+                f"{table} 字段至少应为={sorted(expected_columns)}，"
                 f"实际={sorted(actual_columns)}"
             )
             continue
@@ -112,6 +121,17 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
                 problems.append(
                     f"{table}.{name} nullable 应为={nullable}，"
                     f"实际={column['nullable']}"
+                )
+        cluster_column = actual_columns.get("cluster_id")
+        if cluster_column is not None:
+            cluster_type = cluster_column["type"]
+            if (
+                not _type_matches(cluster_type, sa.String)
+                or getattr(cluster_type, "length", None) != 128
+                or bool(cluster_column["nullable"])
+            ):
+                problems.append(
+                    f"{table}.cluster_id 必须是 VARCHAR(128) NOT NULL"
                 )
 
         primary_key = tuple(
@@ -139,6 +159,12 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
             problems.append(
                 f"{table} 缺少索引={sorted(contract['indexes'] - indexes)}"
             )
+        if (
+            table == "sentinelops_action_intents"
+            and "cluster_id" in actual_columns
+            and ("cluster_id",) not in indexes
+        ):
+            problems.append(f"{table} 缺少 cluster_id 索引")
 
     if problems:
         raise RuntimeError(

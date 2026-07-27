@@ -19,6 +19,8 @@ trap cleanup EXIT
 
 export SENTINELOPS_TOOL_BACKEND=kubernetes
 export SENTINELOPS_MODEL_PROVIDER=rule_based
+export SENTINELOPS_CLUSTER_ID=local-kind
+export SENTINELOPS_CLUSTER_DISPLAY_NAME=本地-kind-集群
 export SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 
 OUTPUT_FILE="$(mktemp)"

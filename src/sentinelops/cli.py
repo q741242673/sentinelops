@@ -52,6 +52,7 @@ async def run_demo(scenario: str, approve: bool) -> None:
     agent = build_simulated_lab_agent(settings, scenario=scenario)
     alert = Alert(
         name="HighOrderServiceErrorRate",
+        cluster_id=settings.cluster_id,
         namespace=settings.kubernetes_namespace,
         service="order-service",
         severity="critical",
@@ -88,6 +89,7 @@ async def run_live(approve: bool, service: str, trace_id: str, summary: str) -> 
     labels = {"trace_id": trace_id} if trace_id else {}
     alert = Alert(
         name=f"High{service.title().replace('-', '')}ErrorRate",
+        cluster_id=settings.cluster_id,
         namespace=settings.kubernetes_namespace,
         service=service,
         severity="critical",
@@ -161,6 +163,7 @@ async def run_executor() -> None:
     remediation_gateway = (
         KubernetesRemediationGateway(
             settings.kubernetes_namespace,
+            cluster_id=settings.cluster_id,
             poll_interval_seconds=settings.executor_poll_interval_seconds,
             result_timeout_seconds=settings.executor_result_timeout_seconds,
         )
@@ -175,6 +178,7 @@ async def run_executor() -> None:
             else None
         ),
         owner_id=owner_id,
+        cluster_id=settings.cluster_id,
         remediation_gateway=remediation_gateway,
         claim_ttl_seconds=settings.executor_claim_ttl_seconds,
         poll_interval_seconds=settings.executor_poll_interval_seconds,

@@ -36,6 +36,7 @@ def execution_precondition(
         "action_fingerprint": "approved-action",
         "tool_name": tool_name,
         "target": arguments["name"],
+        "cluster_id": "local",
         "namespace": "default",
         "deployment_uid": "deployment-uid",
         "generation": 2,
@@ -77,6 +78,25 @@ async def test_registry_rejects_unlisted_tool() -> None:
     result = await registry.call("arbitrary_shell", {"command": "whoami"})
     assert result.success is False
     assert result.error == "Tool is not allowlisted"
+
+
+@pytest.mark.asyncio
+async def test_simulator_rejects_guard_from_another_cluster() -> None:
+    backend = SimulatedKubernetesBackend(cluster_id="cluster-b")
+    registry = ToolRegistry(backend)
+    arguments = {"name": "order-service"}
+    precondition = execution_precondition("restart_deployment", arguments)
+    precondition["cluster_id"] = "cluster-a"
+
+    result = await registry.call_guarded(
+        "restart_deployment",
+        arguments,
+        precondition,
+    )
+
+    assert result.success is False
+    assert result.error == "Execution precondition failed: cluster_id"
+    assert backend.resolved is False
 
 
 @pytest.mark.asyncio
