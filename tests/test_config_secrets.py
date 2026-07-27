@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import sentinelops.cli as cli_module
 from sentinelops.cli import _touch_executor_health_file, run_executor
 from sentinelops.config import Settings
 from sentinelops.healthcheck import check_heartbeat
@@ -62,6 +63,84 @@ async def test_production_executor_requires_explicit_instance_identity(
     )
 
     with pytest.raises(SystemExit, match="EXECUTOR_INSTANCE_ID"):
+        await run_executor()
+
+
+@pytest.mark.asyncio
+async def test_production_executor_uses_gateway_without_database_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_file = tmp_path / "gateway-token"
+    token_file.write_text("projected-token", encoding="utf-8")
+    settings = Settings(
+        environment="production",
+        cluster_id="prod-cluster-a",
+        cluster_display_name="Production A",
+        kubernetes_namespace="sentinelops-workloads",
+        tool_backend="kubernetes",
+        executor_mode="external",
+        executor_backend="controller",
+        executor_instance_id="pod-uid-a",
+        control_gateway_url="https://control.example.test",
+        control_gateway_token_file=str(token_file),
+    )
+    created: dict[str, object] = {}
+
+    class FakeControl:
+        def __init__(self, base_url: str, **kwargs) -> None:
+            created["base_url"] = base_url
+            created["control"] = kwargs
+
+        async def aclose(self) -> None:
+            created["closed"] = True
+
+    class FakeGateway:
+        namespace = "sentinelops-workloads"
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    class FakeWorker:
+        def __init__(self, control, _tools, **kwargs) -> None:
+            created["worker_control"] = control
+            created["worker"] = kwargs
+
+        async def run_forever(self) -> None:
+            created["ran"] = True
+
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "HttpExecutorControlPlane", FakeControl)
+    monkeypatch.setattr(cli_module, "KubernetesRemediationGateway", FakeGateway)
+    monkeypatch.setattr(cli_module, "ExecutorWorker", FakeWorker)
+
+    await run_executor()
+
+    assert created["base_url"] == "https://control.example.test"
+    assert created["ran"] is True
+    assert created["closed"] is True
+    assert created["worker"]["owner_id"] == "pod-uid-a"
+    assert created["control"]["cluster_id"] == "prod-cluster-a"
+
+
+@pytest.mark.asyncio
+async def test_production_executor_never_falls_back_to_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        environment="production",
+        cluster_id="prod-cluster-a",
+        tool_backend="kubernetes",
+        executor_mode="external",
+        executor_backend="controller",
+        executor_instance_id="pod-uid-a",
+        database_url="postgresql+asyncpg://must-not-be-used",
+        audit_hmac_key="a" * 32,
+        audit_key_id="prod-audit-v1",
+    )
+    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
+
+    with pytest.raises(SystemExit, match="Control Gateway"):
         await run_executor()
 
 

@@ -27,6 +27,7 @@ from sentinelops.audit_anchor import (
 from sentinelops.config import Settings, get_settings
 from sentinelops.domain import Alert, IncidentStatus
 from sentinelops.executor import ExecutorWorker
+from sentinelops.executor_control import HttpExecutorControlPlane
 from sentinelops.gitops import GitOpsPublisher, HttpGitOpsSink
 from sentinelops.gitops_gateway import (
     GitHubPullRequestClient,
@@ -129,22 +130,7 @@ async def check_database() -> None:
 
 async def run_executor() -> None:
     settings = get_settings()
-    database_url = settings.resolved_database_url()
-    if not database_url:
-        raise SystemExit("Set SENTINELOPS_DATABASE_URL before running executor")
-    audit_hmac_key = settings.resolved_audit_hmac_key()
     production = settings.environment.strip().casefold() in {"prod", "production"}
-    if (
-        production
-        and (
-            not audit_hmac_key
-            or len(audit_hmac_key.encode()) < 32
-            or settings.audit_key_id == "development-unkeyed"
-        )
-    ):
-        raise SystemExit(
-            "Production Executor requires a dedicated audit HMAC key and key ID"
-        )
     if production and settings.executor_backend != "controller":
         raise SystemExit(
             "Production Executor must submit SentinelRemediation through the Controller"
@@ -158,13 +144,47 @@ async def run_executor() -> None:
             "Production Executor requires SENTINELOPS_EXECUTOR_INSTANCE_ID "
             "from the Kubernetes Pod UID"
         )
-    store = SqlIncidentStore(
-        database_url,
-        audit_hmac_key=audit_hmac_key,
-        audit_key_id=settings.audit_key_id,
-        operation_timeout_seconds=settings.database_operation_timeout_seconds,
-    )
-    owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
+    use_control_gateway = bool(settings.control_gateway_url)
+    if production and (
+        not settings.control_gateway_url
+        or not settings.control_gateway_token_file
+    ):
+        raise SystemExit(
+            "Production Executor requires Control Gateway URL and projected "
+            "Workload Identity Token file"
+        )
+    if use_control_gateway:
+        assert settings.control_gateway_url is not None
+        if not settings.control_gateway_token_file:
+            raise SystemExit(
+                "Set SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE before running executor"
+            )
+        if production and not settings.control_gateway_url.startswith("https://"):
+            raise SystemExit("Production Control Gateway URL must use HTTPS")
+        control = HttpExecutorControlPlane(
+            settings.control_gateway_url,
+            cluster_id=settings.cluster_id,
+            token_file=settings.control_gateway_token_file,
+            deadline_seconds=settings.control_gateway_timeout_seconds,
+        )
+        owner_id = settings.executor_instance_id or socket.gethostname()
+    else:
+        database_url = settings.resolved_database_url()
+        if not database_url:
+            raise SystemExit(
+                "Set SENTINELOPS_CONTROL_GATEWAY_URL or SENTINELOPS_DATABASE_URL "
+                "before running executor"
+            )
+        audit_hmac_key = settings.resolved_audit_hmac_key()
+        control = SqlIncidentStore(
+            database_url,
+            audit_hmac_key=audit_hmac_key,
+            audit_key_id=settings.audit_key_id,
+            operation_timeout_seconds=(
+                settings.database_operation_timeout_seconds
+            ),
+        )
+        owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
     remediation_gateway = (
         KubernetesRemediationGateway(
             settings.kubernetes_namespace,
@@ -176,7 +196,7 @@ async def run_executor() -> None:
         else None
     )
     worker = ExecutorWorker(
-        store,
+        control,
         (
             build_tool_registry(settings, allow_guarded_writes=True)
             if remediation_gateway is None
@@ -206,20 +226,14 @@ async def run_executor() -> None:
         ),
     )
     try:
-        await require_current_schema(store)
-        if (
-            settings.audit_anchor_enforcement_required
-            and await store.audit_anchor_security_state() is None
-        ):
-            await store.set_audit_anchor_security_state(
-                status="initializing",
-                write_blocked=True,
-                reason="first_reconciliation_pending",
-                successful=False,
-            )
+        if isinstance(control, SqlIncidentStore):
+            await require_current_schema(control)
         await worker.run_forever()
     finally:
-        await store.close()
+        if isinstance(control, SqlIncidentStore):
+            await control.close()
+        else:
+            await control.aclose()
 
 
 async def run_gitops_publisher(env_file: str | None = None) -> None:

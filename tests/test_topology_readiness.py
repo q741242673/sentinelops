@@ -500,6 +500,8 @@ def test_committed_security_report_proves_identity_and_external_anchor() -> None
     assert all(trial["checks"].values())
     assert trial["checks"]["missing_operator_token_rejected"] is True
     assert trial["checks"]["invalid_oidc_token_rejected"] is True
+    assert trial["checks"]["deleted_pod_workload_token_rejected"] is True
+    assert trial["checks"]["replacement_pod_workload_token_accepted"] is True
     assert trial["checks"]["viewer_cannot_approve"] is True
     assert trial["checks"]["verified_oidc_approval_audited"] is True
     assert trial["checks"]["anchor_gate_started_blocked"] is True

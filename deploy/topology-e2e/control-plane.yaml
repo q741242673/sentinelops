@@ -47,6 +47,10 @@ spec:
                 secretKeyRef:
                   name: sentinelops-topology-secrets
                   key: webhook-bearer-token
+            - name: SENTINELOPS_CONTROL_GATEWAY_AUTH_MODE
+              value: workload_oidc
+            - name: SENTINELOPS_CONTROL_GATEWAY_TRUST_BUNDLE_FILE
+              value: /etc/sentinelops-control-gateway/trust.json
           ports:
             - name: http
               containerPort: 8000
@@ -85,9 +89,15 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: control-gateway-trust
+              mountPath: /etc/sentinelops-control-gateway
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: control-gateway-trust
+          configMap:
+            name: sentinelops-topology-workload-trust
 ---
 apiVersion: v1
 kind: Service
@@ -137,16 +147,12 @@ spec:
             - configMapRef:
                 name: sentinelops-topology-runtime
           env:
-            - name: SENTINELOPS_DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: sentinelops-topology-secrets
-                  key: database-url
-            - name: SENTINELOPS_AUDIT_HMAC_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: sentinelops-topology-secrets
-                  key: audit-hmac-key
+            - name: SENTINELOPS_CONTROL_GATEWAY_URL
+              value: http://sentinelops-api.sentinelops-system.svc.cluster.local:8000
+            - name: SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE
+              value: /var/run/secrets/sentinelops-control-gateway/gateway-token
+            - name: SENTINELOPS_CONTROL_GATEWAY_TIMEOUT_SECONDS
+              value: "10"
             - name: SENTINELOPS_EXECUTOR_HEALTH_FILE
               value: /var/run/sentinelops/health/heartbeat
             - name: SENTINELOPS_EXECUTOR_INSTANCE_ID
@@ -198,8 +204,98 @@ spec:
               mountPath: /var/run/sentinelops/health
             - name: tmp
               mountPath: /tmp
+            - name: control-gateway-identity
+              mountPath: /var/run/secrets/sentinelops-control-gateway
+              readOnly: true
       volumes:
         - name: health
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        - name: control-gateway-identity
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  path: gateway-token
+                  audience: sentinelops-control-gateway
+                  expirationSeconds: 600
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinelops-workload-jwks
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/name: sentinelops-workload-jwks
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-workload-jwks
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sentinelops-workload-jwks
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: jwks
+          image: sentinelops:topology-e2e
+          imagePullPolicy: Never
+          command:
+            - python
+            - -m
+            - http.server
+            - "8080"
+            - --directory
+            - /var/run/sentinelops-jwks
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /jwks.json
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: jwks
+              mountPath: /var/run/sentinelops-jwks
+              readOnly: true
+      volumes:
+        - name: jwks
+          configMap:
+            name: sentinelops-topology-workload-jwks
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinelops-workload-jwks
+  namespace: sentinelops-system
+spec:
+  selector:
+    app.kubernetes.io/name: sentinelops-workload-jwks
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

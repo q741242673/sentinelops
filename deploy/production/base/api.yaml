@@ -89,6 +89,9 @@ spec:
             - name: runtime-secret
               mountPath: /var/run/secrets/sentinelops
               readOnly: true
+            - name: control-gateway-trust
+              mountPath: /etc/sentinelops-control-gateway
+              readOnly: true
             - name: tmp
               mountPath: /tmp
       volumes:
@@ -107,6 +110,12 @@ spec:
                       path: webhook-bearer-token
                     - key: model-api-key
                       path: model-api-key
+        - name: control-gateway-trust
+          configMap:
+            name: sentinelops-control-gateway-trust
+            items:
+              - key: trust.json
+                path: trust.json
         - name: tmp
           emptyDir: {}
 ---

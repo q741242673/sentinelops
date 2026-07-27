@@ -43,6 +43,50 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
+  name: sentinelops-executor-egress
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sentinelops-executor
+  policyTypes: ["Egress"]
+  egress:
+    # DNS is selected explicitly so the policy does not silently open all
+    # traffic in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Replace this TEST-NET address with the production Kubernetes API CIDR.
+    # NetworkPolicy cannot select an external API endpoint by Service name.
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 443
+    # Replace this TEST-NET address with the pinned Control Gateway CIDR.
+    # This sample is fail-closed until both placeholder CIDRs are configured.
+    - to:
+        - ipBlock:
+            cidr: 198.51.100.10/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
   name: sentinelops-anchor-publisher-deny-ingress
   namespace: sentinelops-system
   labels:

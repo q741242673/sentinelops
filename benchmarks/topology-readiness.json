@@ -1,15 +1,17 @@
 {
   "schema_version": "sentinelops.topology-readiness.v1",
-  "run_id": "7961479b7cbb493ea6769c18bcf28eaf",
-  "generated_at": "2026-07-24T09:51:00.420436+00:00",
+  "run_id": "3a7939d729074bb0bafed647cb804e5d",
+  "generated_at": "2026-07-27T04:37:28.434511+00:00",
   "environment": {
-    "python": "3.13.3",
-    "platform": "macOS-15.3.2-arm64-arm-64bit-Mach-O",
+    "python": "3.11.0",
+    "platform": "macOS-15.3.2-arm64-arm-64bit",
     "kubernetes": "kind",
     "api_replicas": 2,
     "executor_replicas": 2,
     "database": "PostgreSQL 16",
-    "model_provider": "rule_based"
+    "model_provider": "rule_based",
+    "control_plane_chaos": false,
+    "security_e2e": false
   },
   "scope": "staging acceptance topology with ephemeral credentials; enterprise OIDC and external audit anchoring remain production deployment requirements",
   "thresholds": {
@@ -23,79 +25,83 @@
     "wrong_remediation_plans": 0,
     "unsafe_writes": 0,
     "action_intents": 1,
-    "audit_events": 23,
-    "duration_ms": 27898.795
+    "audit_events": 21,
+    "control_plane_chaos": false,
+    "security_e2e": false,
+    "duration_ms": 25936.288
   },
   "latency_ms": {
     "fault_rollout": {
-      "p50": 3997.26,
-      "p95": 3997.26,
-      "max": 3997.26
+      "p50": 2425.491,
+      "p95": 2425.491,
+      "max": 2425.491
     },
     "fault_to_prometheus_firing": {
-      "p50": 8170.549,
-      "p95": 8170.549,
-      "max": 8170.549
+      "p50": 8210.563,
+      "p95": 8210.563,
+      "max": 8210.563
     },
     "prometheus_firing_to_webhook_incident": {
-      "p50": 17.858,
-      "p95": 17.858,
-      "max": 17.858
+      "p50": 12.905,
+      "p95": 12.905,
+      "max": 12.905
     },
     "webhook_to_approval_plan": {
-      "p50": 9.296,
-      "p95": 9.296,
-      "max": 9.296
+      "p50": 7.67,
+      "p95": 7.67,
+      "max": 7.67
     },
     "approval_to_verified_recovery": {
-      "p50": 14773.555,
-      "p95": 14773.555,
-      "max": 14773.555
+      "p50": 13626.765,
+      "p95": 13626.765,
+      "max": 13626.765
     },
     "fault_to_verified_recovery": {
-      "p50": 22992.136,
-      "p95": 22992.136,
-      "max": 22992.136
+      "p50": 21874.456,
+      "p95": 21874.456,
+      "max": 21874.456
     },
     "fault_to_alert_cleared": {
-      "p50": 23233.487,
-      "p95": 23233.487,
-      "max": 23233.487
+      "p50": 22113.519,
+      "p95": 22113.519,
+      "max": 22113.519
     }
   },
   "trial": {
     "passed": true,
-    "incident_id": "ba6d6ea6-d3b2-4a8e-a857-f47410973428",
+    "incident_id": "64c3835f-f616-4925-9866-d55c251420e3",
     "incident_status": "resolved",
-    "injected_revision": 115,
-    "expected_revision": 114,
-    "root_cause": "库存服务 Deployment revision 115 启用了合成预留故障",
+    "injected_revision": 5,
+    "expected_revision": 4,
+    "root_cause": "库存服务 Deployment revision 5 启用了合成预留故障",
     "evidence_sources": [
       "kubernetes_logs",
       "loki",
       "prometheus"
     ],
-    "failed_trace_id": "7e058fa4430f81e0ecda19cbbdd1c7c4",
+    "failed_trace_id": "bdb75dc139aac680b519f4917c8fe6f6",
     "approving_api_url": "http://127.0.0.1:18100",
-    "executor_id": "sentinelops-executor-65846f94f-zsbtg:1:9136339e-3e27-413a-81c7-b19eb1223c7c",
+    "executor_id": "476bfedf-f810-4b57-9091-c032e05ddf95",
     "action_intents": 1,
-    "audit_events": 23,
+    "audit_events": 21,
     "failed_requests_before_recovery": 21,
     "healthy_requests_after_recovery": 10,
     "wrong_remediation_plans": 0,
     "unsafe_writes": 0,
     "timings_ms": {
-      "fault_rollout": 3997.26,
-      "fault_to_prometheus_firing": 8170.549,
-      "prometheus_firing_to_webhook_incident": 17.858,
-      "webhook_to_approval_plan": 9.296,
-      "approval_to_verified_recovery": 14773.555,
-      "fault_to_verified_recovery": 22992.136,
-      "fault_to_alert_cleared": 23233.487
+      "fault_rollout": 2425.491,
+      "fault_to_prometheus_firing": 8210.563,
+      "prometheus_firing_to_webhook_incident": 12.905,
+      "webhook_to_approval_plan": 7.67,
+      "approval_to_verified_recovery": 13626.765,
+      "fault_to_verified_recovery": 21874.456,
+      "fault_to_alert_cleared": 22113.519
     },
     "checks": {
       "two_api_replicas_ready": true,
       "two_executor_replicas_ready": true,
+      "executor_has_no_database_or_audit_credentials": true,
+      "executor_uses_projected_workload_identity": true,
       "baseline_traffic_healthy": true,
       "alertmanager_webhook_received": true,
       "approval_gate_reached": true,
@@ -116,20 +122,20 @@
       "final_state_visible_on_all_api_replicas": true
     },
     "database_snapshot": {
-      "schema_revision": "0008_anchor_unlock_workflow",
+      "schema_revision": "0012_cluster_registry_leases",
       "action_intents": [
         {
           "status": "succeeded",
-          "executor_id": "sentinelops-executor-65846f94f-zsbtg:1:9136339e-3e27-413a-81c7-b19eb1223c7c",
+          "executor_id": "476bfedf-f810-4b57-9091-c032e05ddf95",
           "executor_generation": 1,
-          "attempt_id": "25e2b601-5523-4225-900a-bd45eb0da03a",
+          "attempt_id": "d78fc06f-a3ea-4d75-9fa6-4a8870ab976b",
           "action": {
             "tool_name": "rollback_deployment",
             "arguments": {
               "name": "inventory-service",
-              "revision": 114
+              "revision": 4
             },
-            "rationale": "revision 115 引入库存服务 HTTP 503，而 revision 114 已知健康",
+            "rationale": "revision 5 引入库存服务 HTTP 503，而 revision 4 已知健康",
             "expected_outcome": "库存服务不再返回 HTTP 503，结账流量恢复",
             "risk": "high"
           },
@@ -139,19 +145,250 @@
             "content": {
               "deployment": "inventory-service",
               "rolled_back": true,
-              "source_revision": 114,
-              "source_replica_set": "inventory-service-546c569db7"
+              "source_revision": 4,
+              "source_replica_set": "inventory-service-6fd9978b79",
+              "cluster_id": "kind-topology-e2e"
             },
             "error": null,
-            "duration_ms": 38.64883299684152
+            "duration_ms": 39.31945899967104
           }
         }
       ],
       "approval_status": "approved",
       "alert_binding_status": "resolved",
-      "audit_events": 23,
-      "hmac_audit_events": 23
+      "audit_events": 22,
+      "hmac_audit_events": 22,
+      "approval_audit_events": [
+        {
+          "actor_id": "unattributed-api-client",
+          "actor_assurance": "unverified",
+          "actor_type": "operator"
+        }
+      ],
+      "audit_head_sequence": 22,
+      "audit_head_hash": "59abf5384e1618846d9dd4f1f07d8e289add1d8b60e159d1a05ec5871bb329a7",
+      "anchor_outbox_total": 22,
+      "anchor_outbox_undelivered": 22,
+      "anchor_outbox_blockers": [
+        {
+          "sequence": 1,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:12.897816+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 2,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:12.897816+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 3,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 4,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 5,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 6,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 7,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 8,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 9,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.072955+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 10,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.769429+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 11,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.802583+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 12,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.809288+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 13,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.875263+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 14,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.885230+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 15,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:13.937041+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 16,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 17,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 18,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 19,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 20,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 21,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.366191+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        },
+        {
+          "sequence": 22,
+          "status": "pending",
+          "attempt_count": 0,
+          "claim_generation": 0,
+          "next_attempt_at": "2026-07-27T04:37:27.903705+00:00",
+          "claim_until": null,
+          "last_error_sha256": null
+        }
+      ],
+      "latest_anchor_receipt": null,
+      "anchor_security_status": null,
+      "anchor_security_write_blocked": null,
+      "action_claim_events": [
+        {
+          "actor_id": "476bfedf-f810-4b57-9091-c032e05ddf95",
+          "payload": {
+            "executor_generation": 1,
+            "attempt_id": "d78fc06f-a3ea-4d75-9fa6-4a8870ab976b",
+            "cluster_generation": 1,
+            "agent_session_id": "0cb1aac4-197e-4603-b1f0-3b472329e97d",
+            "agent_session_generation": 1,
+            "lease_expires_at": "2026-07-27T04:37:33.875263+00:00"
+          }
+        }
+      ],
+      "action_requeue_events": []
     },
+    "chaos": {},
+    "security": {},
     "error_type": null,
     "error": null
   }

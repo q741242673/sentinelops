@@ -620,6 +620,8 @@ async def test_production_startup_rejects_old_revision_without_modifying_it(
         oidc_issuer="https://identity.example.test",
         oidc_audience="sentinelops-api",
         oidc_jwks_url="https://identity.example.test/jwks",
+        control_gateway_auth_mode="workload_oidc",
+        control_gateway_trust_bundle_file=str(tmp_path / "not-read-before-schema-check.json"),
     )
     monkeypatch.setattr(api_module, "get_settings", lambda: settings)
 

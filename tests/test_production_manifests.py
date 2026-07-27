@@ -67,6 +67,14 @@ def test_production_yaml_resources_are_unique_and_do_not_commit_secrets() -> Non
     assert cluster_resources == {
         (
             "ClusterRole",
+            "sentinelops-api-token-review",
+        ),
+        (
+            "ClusterRoleBinding",
+            "sentinelops-api-token-review",
+        ),
+        (
+            "ClusterRole",
             "sentinelops-remediation-controller-admission-integrity",
         ),
         (
@@ -74,10 +82,39 @@ def test_production_yaml_resources_are_unique_and_do_not_commit_secrets() -> Non
             "sentinelops-remediation-controller-admission-integrity",
         ),
     }
+    token_review_role = _resource(
+        "ClusterRole",
+        "sentinelops-api-token-review",
+        None,
+    )
+    assert token_review_role["rules"] == [
+        {
+            "apiGroups": ["authentication.k8s.io"],
+            "resources": ["tokenreviews"],
+            "verbs": ["create"],
+        }
+    ]
+    token_review_binding = _resource(
+        "ClusterRoleBinding",
+        "sentinelops-api-token-review",
+        None,
+    )
+    assert token_review_binding["subjects"] == [
+        {
+            "kind": "ServiceAccount",
+            "name": "sentinelops-api",
+            "namespace": "sentinelops-system",
+        }
+    ]
 
 
 def test_runtime_configuration_fails_closed_for_production() -> None:
     runtime = _resource("ConfigMap", "sentinelops-runtime", "sentinelops-system")["data"]
+    executor_runtime = _resource(
+        "ConfigMap",
+        "sentinelops-executor-runtime",
+        "sentinelops-system",
+    )["data"]
     api = _resource("ConfigMap", "sentinelops-api", "sentinelops-system")["data"]
     anchor = _resource(
         "ConfigMap",
@@ -98,13 +135,29 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     assert 1 <= int(
         runtime["SENTINELOPS_DATABASE_OPERATION_TIMEOUT_SECONDS"]
     ) <= 120
-    assert runtime["SENTINELOPS_EXECUTOR_MODE"] == "external"
-    assert runtime["SENTINELOPS_EXECUTOR_BACKEND"] == "controller"
+    assert executor_runtime == {
+        "SENTINELOPS_ENVIRONMENT": "production",
+        "SENTINELOPS_TOOL_BACKEND": "kubernetes",
+        "SENTINELOPS_CLUSTER_ID": "prod-cluster-a",
+        "SENTINELOPS_CLUSTER_DISPLAY_NAME": "生产集群 A",
+        "SENTINELOPS_KUBERNETES_NAMESPACE": "sentinelops-workloads",
+        "SENTINELOPS_EXECUTOR_MODE": "external",
+        "SENTINELOPS_EXECUTOR_BACKEND": "controller",
+        "SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS": "60",
+        "SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS": "60",
+        "SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS": "15",
+        "SENTINELOPS_CONTROL_GATEWAY_URL": (
+            "https://replace-with-company-control-gateway.example"
+        ),
+        "SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE": (
+            "/var/run/secrets/sentinelops-control-gateway/gateway-token"
+        ),
+    }
     registry_ttl = float(
-        runtime["SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS"]
+        executor_runtime["SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS"]
     )
     registry_heartbeat = float(
-        runtime["SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS"]
+        executor_runtime["SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS"]
     )
     assert 10 <= registry_ttl <= 600
     assert 1 <= registry_heartbeat <= registry_ttl / 3
@@ -126,6 +179,33 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     assert api["SENTINELOPS_OIDC_AUDIENCE"] == "sentinelops-api"
     assert api["SENTINELOPS_OIDC_JWKS_URL"].startswith("https://")
     assert api["SENTINELOPS_OIDC_HUMAN_VALUE"] == "human"
+    assert api["SENTINELOPS_CONTROL_GATEWAY_AUTH_MODE"] == "workload_oidc"
+    assert api["SENTINELOPS_CONTROL_GATEWAY_TRUST_BUNDLE_FILE"].startswith(
+        "/etc/"
+    )
+    workload_trust = json.loads(
+        _resource(
+            "ConfigMap",
+            "sentinelops-control-gateway-trust",
+            "sentinelops-system",
+        )["data"]["trust.json"]
+    )
+    trusted_cluster = workload_trust["clusters"][0]
+    assert trusted_cluster["cluster_id"] == "prod-cluster-a"
+    assert trusted_cluster["audience"] == "sentinelops-control-gateway"
+    assert trusted_cluster["issuer"].startswith("https://")
+    assert trusted_cluster["jwks_url"].startswith("https://")
+    assert trusted_cluster["token_review_url"] == (
+        "https://kubernetes.default.svc/"
+        "apis/authentication.k8s.io/v1/tokenreviews"
+    )
+    assert trusted_cluster["reviewer_token_file"] == (
+        "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    )
+    assert trusted_cluster["token_review_ca_file"] == (
+        "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    )
+    assert "action.execute" in trusted_cluster["allowed_capabilities"]
     assert anchor["SENTINELOPS_AUDIT_ANCHOR_URL"].startswith("https://")
     assert anchor["SENTINELOPS_AUDIT_ANCHOR_INVENTORY_URL"].startswith(
         "https://"
@@ -198,7 +278,7 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         assert max_age <= float(
             _resource(
                 "ConfigMap",
-                "sentinelops-runtime",
+                "sentinelops-executor-runtime",
                 "sentinelops-system",
             )["data"]["SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS"]
         )
@@ -231,11 +311,15 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
     controller_container = _container(controller)
     publisher_container = _container(publisher)
     gitops_container = _container(gitops_publisher)
-    for container in (api_container, executor_container, controller_container):
+    for container in (api_container, controller_container):
         assert {
             item["configMapRef"]["name"]
             for item in container["envFrom"]
         } >= {"sentinelops-runtime"}
+    assert {
+        item["configMapRef"]["name"]
+        for item in executor_container["envFrom"]
+    } == {"sentinelops-executor-runtime"}
     assert api_container["livenessProbe"]["httpGet"]["path"] == "/health"
     assert api_container["readinessProbe"]["httpGet"]["path"] == "/ready"
     assert api_container["startupProbe"]["httpGet"]["path"] == "/health"
@@ -285,13 +369,62 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         assert container["resources"]["requests"]
         assert container["resources"]["limits"]
 
-    executor_secret_items = executor["spec"]["template"]["spec"]["volumes"][0][
+    executor_pod_spec = executor["spec"]["template"]["spec"]
+    assert executor_pod_spec["automountServiceAccountToken"] is True
+    assert executor_pod_spec["volumes"][0] == {
+        "name": "control-gateway-identity",
+        "projected": {
+            "defaultMode": 288,
+            "sources": [
+                {
+                    "serviceAccountToken": {
+                        "audience": "sentinelops-control-gateway",
+                        "expirationSeconds": 600,
+                        "path": "gateway-token",
+                    }
+                }
+            ],
+        },
+    }
+    assert executor_container["volumeMounts"][0] == {
+        "name": "control-gateway-identity",
+        "mountPath": "/var/run/secrets/sentinelops-control-gateway",
+        "readOnly": True,
+    }
+    forbidden_executor_configuration = (
+        "database",
+        "postgres",
+        "audit_hmac",
+        "database-url",
+        "audit-hmac-key",
+    )
+    executor_configuration = json.dumps(
+        {
+            "config": _resource(
+                "ConfigMap",
+                "sentinelops-executor-runtime",
+                "sentinelops-system",
+            ),
+            "deployment": executor,
+        },
+        sort_keys=True,
+    ).casefold()
+    assert all(
+        forbidden not in executor_configuration
+        for forbidden in forbidden_executor_configuration
+    )
+
+    api_secret_items = api["spec"]["template"]["spec"]["volumes"][0][
         "projected"
     ]["sources"][0]["secret"]["items"]
-    assert executor_secret_items == [
-        {"key": "database-url", "path": "database-url"},
-        {"key": "audit-hmac-key", "path": "audit-hmac-key"},
-    ]
+    assert {"key": "database-url", "path": "database-url"} in api_secret_items
+    api_volumes = {
+        volume["name"]: volume
+        for volume in api["spec"]["template"]["spec"]["volumes"]
+    }
+    assert api_volumes["control-gateway-trust"]["configMap"]["name"] == (
+        "sentinelops-control-gateway-trust"
+    )
     publisher_secret_items = publisher["spec"]["template"]["spec"]["volumes"][0][
         "projected"
     ]["sources"][0]["secret"]["items"]
@@ -326,6 +459,15 @@ def test_migration_job_is_bounded_and_has_no_cluster_credentials() -> None:
     assert pod_spec["serviceAccountName"] == "sentinelops-migrator"
     assert container["args"] == ["db-init"]
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
+    assert container["env"] == [
+        {
+            "name": "SENTINELOPS_DATABASE_URL_FILE",
+            "value": "/var/run/secrets/sentinelops/database-url",
+        }
+    ]
+    assert pod_spec["volumes"][0]["projected"]["sources"][0]["secret"]["items"] == [
+        {"key": "database-url", "path": "database-url"}
+    ]
 
 
 def test_rbac_keeps_api_readonly_and_controller_as_only_workload_writer() -> None:
@@ -736,6 +878,11 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "sentinelops-executor-deny-ingress",
         "sentinelops-system",
     )
+    executor_egress_policy = _resource(
+        "NetworkPolicy",
+        "sentinelops-executor-egress",
+        "sentinelops-system",
+    )
     controller_policy = _resource(
         "NetworkPolicy",
         "sentinelops-remediation-controller-ingress",
@@ -757,6 +904,41 @@ def test_pdb_service_and_ingress_policy_match_deployments() -> None:
         "namespaceSelector"
     ]["matchLabels"] == {"sentinelops.io/metrics-access": "true"}
     assert executor_policy["spec"]["ingress"] == []
+    assert executor_egress_policy["spec"]["policyTypes"] == ["Egress"]
+    assert executor_egress_policy["spec"]["podSelector"]["matchLabels"] == {
+        "app.kubernetes.io/name": "sentinelops-executor"
+    }
+    egress = executor_egress_policy["spec"]["egress"]
+    assert egress[0]["to"] == [
+        {
+            "namespaceSelector": {
+                "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system",
+                }
+            },
+            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+        }
+    ]
+    assert egress[0]["ports"] == [
+        {"protocol": "UDP", "port": 53},
+        {"protocol": "TCP", "port": 53},
+    ]
+    assert {
+        (
+            rule["to"][0]["ipBlock"]["cidr"],
+            rule["ports"][0]["protocol"],
+            rule["ports"][0]["port"],
+        )
+        for rule in egress[1:]
+    } == {
+        ("192.0.2.10/32", "TCP", 443),
+        ("198.51.100.10/32", "TCP", 443),
+    }
+    assert all(
+        port["port"] != 5432
+        for rule in egress
+        for port in rule["ports"]
+    )
     assert controller_policy["spec"]["ingress"][0]["ports"] == [
         {"protocol": "TCP", "port": 8080}
     ]

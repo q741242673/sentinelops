@@ -14,6 +14,32 @@ metadata:
     app.kubernetes.io/part-of: sentinelops
 automountServiceAccountToken: false
 ---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sentinelops-api-token-review
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sentinelops-api-token-review
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+subjects:
+  - kind: ServiceAccount
+    name: sentinelops-api
+    namespace: sentinelops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sentinelops-api-token-review
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -105,6 +131,27 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
+  name: sentinelops-executor-runtime
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  SENTINELOPS_ENVIRONMENT: production
+  SENTINELOPS_TOOL_BACKEND: kubernetes
+  SENTINELOPS_CLUSTER_ID: prod-cluster-a
+  SENTINELOPS_CLUSTER_DISPLAY_NAME: 生产集群 A
+  SENTINELOPS_KUBERNETES_NAMESPACE: sentinelops-workloads
+  SENTINELOPS_EXECUTOR_MODE: external
+  SENTINELOPS_EXECUTOR_BACKEND: controller
+  SENTINELOPS_EXECUTOR_CLAIM_TTL_SECONDS: "60"
+  SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS: "60"
+  SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS: "15"
+  SENTINELOPS_CONTROL_GATEWAY_URL: https://replace-with-company-control-gateway.example
+  SENTINELOPS_CONTROL_GATEWAY_TOKEN_FILE: /var/run/secrets/sentinelops-control-gateway/gateway-token
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
   name: sentinelops-anchor
   namespace: sentinelops-system
   labels:
@@ -168,3 +215,16 @@ data:
   SENTINELOPS_OIDC_ROLES_CLAIM: roles
   SENTINELOPS_OIDC_HUMAN_CLAIM: sentinelops_actor_type
   SENTINELOPS_OIDC_HUMAN_VALUE: human
+  SENTINELOPS_CONTROL_GATEWAY_AUTH_MODE: workload_oidc
+  SENTINELOPS_CONTROL_GATEWAY_TRUST_BUNDLE_FILE: /etc/sentinelops-control-gateway/trust.json
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinelops-control-gateway-trust
+  namespace: sentinelops-system
+  labels:
+    app.kubernetes.io/part-of: sentinelops
+data:
+  trust.json: >-
+    {"clusters":[{"cluster_id":"prod-cluster-a","display_name":"生产集群 A","default_namespace":"sentinelops-workloads","issuer":"https://replace-with-cluster-oidc-issuer.example","audience":"sentinelops-control-gateway","jwks_url":"https://replace-with-cluster-oidc-issuer.example/openid/v1/jwks","token_review_url":"https://kubernetes.default.svc/apis/authentication.k8s.io/v1/tokenreviews","reviewer_token_file":"/var/run/secrets/kubernetes.io/serviceaccount/token","token_review_ca_file":"/var/run/secrets/kubernetes.io/serviceaccount/ca.crt","namespace":"sentinelops-system","service_account":"sentinelops-executor","service_account_uid":"replace-with-service-account-uid","allowed_capabilities":["agent.register","agent.heartbeat","action.execute","action.reconcile","backend.controller"]}]}
