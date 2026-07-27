@@ -86,22 +86,22 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
         if table not in existing_tables:
             continue
         expected_columns = contract["columns"]
-        actual_columns = {
-            column["name"]: column for column in inspector.get_columns(table)
-        }
+        actual_columns = {column["name"]: column for column in inspector.get_columns(table)}
         allowed_extra_columns = (
-            {"cluster_id"}
+            {
+                "cluster_id",
+                "cluster_generation",
+                "executor_session_id",
+                "executor_session_generation",
+            }
             if table == "sentinelops_action_intents"
             else set()
         )
         missing_columns = set(expected_columns) - set(actual_columns)
-        unexpected_columns = (
-            set(actual_columns) - set(expected_columns) - allowed_extra_columns
-        )
+        unexpected_columns = set(actual_columns) - set(expected_columns) - allowed_extra_columns
         if missing_columns or unexpected_columns:
             problems.append(
-                f"{table} 字段至少应为={sorted(expected_columns)}，"
-                f"实际={sorted(actual_columns)}"
+                f"{table} 字段至少应为={sorted(expected_columns)}，实际={sorted(actual_columns)}"
             )
             continue
         for name, (type_class, length, nullable) in expected_columns.items():
@@ -114,13 +114,11 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
                 )
             if length is not None and getattr(actual_type, "length", None) != length:
                 problems.append(
-                    f"{table}.{name} 长度应为={length}，"
-                    f"实际={getattr(actual_type, 'length', None)}"
+                    f"{table}.{name} 长度应为={length}，实际={getattr(actual_type, 'length', None)}"
                 )
             if bool(column["nullable"]) is not nullable:
                 problems.append(
-                    f"{table}.{name} nullable 应为={nullable}，"
-                    f"实际={column['nullable']}"
+                    f"{table}.{name} nullable 应为={nullable}，实际={column['nullable']}"
                 )
         cluster_column = actual_columns.get("cluster_id")
         if cluster_column is not None:
@@ -130,17 +128,34 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
                 or getattr(cluster_type, "length", None) != 128
                 or bool(cluster_column["nullable"])
             ):
-                problems.append(
-                    f"{table}.cluster_id 必须是 VARCHAR(128) NOT NULL"
-                )
+                problems.append(f"{table}.cluster_id 必须是 VARCHAR(128) NOT NULL")
+        if table == "sentinelops_action_intents":
+            forward_columns = {
+                "cluster_generation": (sa.BigInteger, None, False),
+                "executor_session_id": (sa.String, 64, True),
+                "executor_session_generation": (
+                    sa.BigInteger,
+                    None,
+                    True,
+                ),
+            }
+            present_forward = {name for name in forward_columns if name in actual_columns}
+            if present_forward and present_forward != set(forward_columns):
+                problems.append("sentinelops_action_intents 的 0012 前向字段必须完整出现")
+            for name in present_forward:
+                type_class, length, nullable = forward_columns[name]
+                column = actual_columns[name]
+                actual_type = column["type"]
+                if (
+                    not _type_matches(actual_type, type_class)
+                    or (length is not None and getattr(actual_type, "length", None) != length)
+                    or bool(column["nullable"]) is not nullable
+                ):
+                    problems.append(f"sentinelops_action_intents.{name} 结构不匹配")
 
-        primary_key = tuple(
-            inspector.get_pk_constraint(table).get("constrained_columns") or ()
-        )
+        primary_key = tuple(inspector.get_pk_constraint(table).get("constrained_columns") or ())
         if primary_key != contract["primary_key"]:
-            problems.append(
-                f"{table} 主键应为={contract['primary_key']}，实际={primary_key}"
-            )
+            problems.append(f"{table} 主键应为={contract['primary_key']}，实际={primary_key}")
         unique_constraints = {
             tuple(item.get("column_names") or ())
             for item in inspector.get_unique_constraints(table)
@@ -156,9 +171,7 @@ def _validate_existing_schema(inspector: sa.Inspector) -> None:
             if not item.get("unique")
         }
         if not contract["indexes"].issubset(indexes):
-            problems.append(
-                f"{table} 缺少索引={sorted(contract['indexes'] - indexes)}"
-            )
+            problems.append(f"{table} 缺少索引={sorted(contract['indexes'] - indexes)}")
         if (
             table == "sentinelops_action_intents"
             and "cluster_id" in actual_columns

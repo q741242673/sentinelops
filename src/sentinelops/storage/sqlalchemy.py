@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -10,6 +11,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Column,
+    ForeignKey,
     Index,
     Integer,
     MetaData,
@@ -64,6 +66,12 @@ from sentinelops.storage.base import (
     AuditAnchorConflictError,
     AuditAnchorUnlockConflictError,
     ChangeProposalConflictError,
+    ClusterAgentLease,
+    ClusterAgentLeaseConflictError,
+    ClusterAgentLeaseToken,
+    ClusterConnection,
+    ClusterRegistration,
+    ClusterRegistrationConflictError,
     ExecutorClaim,
     GitOpsProposalClaim,
     LeaseConflictError,
@@ -75,6 +83,7 @@ from sentinelops.storage.base import (
 )
 
 metadata = MetaData()
+CLUSTER_ID_PATTERN = re.compile(r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$")
 
 
 def _has_table(connection: Connection, table_name: str) -> bool:
@@ -93,6 +102,56 @@ incidents = Table(
     Column("graph_state", JSON, nullable=True),
     Column("created_at", String(40), nullable=False),
     Column("updated_at", String(40), nullable=False),
+)
+
+cluster_registrations = Table(
+    "sentinelops_cluster_registrations",
+    metadata,
+    Column(
+        "cluster_id",
+        String(63),
+        primary_key=True,
+    ),
+    Column("display_name", String(128), nullable=False),
+    Column("default_namespace", String(253), nullable=False),
+    Column("routing_generation", BigInteger, nullable=False),
+    Column("lifecycle", String(24), nullable=False, index=True),
+    Column("metadata_state", String(16), nullable=False),
+    Column("created_at", String(40), nullable=False),
+    Column("updated_at", String(40), nullable=False),
+)
+
+cluster_agent_leases = Table(
+    "sentinelops_cluster_agent_leases",
+    metadata,
+    Column(
+        "cluster_id",
+        String(63),
+        ForeignKey("sentinelops_cluster_registrations.cluster_id"),
+        primary_key=True,
+    ),
+    Column("instance_id", String(200), primary_key=True),
+    Column("session_id", String(64), nullable=False, unique=True),
+    Column("generation", BigInteger, nullable=False),
+    Column("routing_generation", BigInteger, nullable=False),
+    Column("capabilities", JSON, nullable=False),
+    Column("version", String(128), nullable=False),
+    Column("registered_at", String(40), nullable=False),
+    Column("last_seen_at", String(40), nullable=False),
+    Column("lease_until", String(40), nullable=False),
+    Column("status", String(16), nullable=False, index=True),
+    Column("updated_at", String(40), nullable=False),
+)
+Index(
+    "ix_sentinelops_cluster_agent_cluster_status_lease",
+    cluster_agent_leases.c.cluster_id,
+    cluster_agent_leases.c.status,
+    cluster_agent_leases.c.lease_until,
+)
+Index(
+    "ix_sentinelops_cluster_agent_status_lease",
+    cluster_agent_leases.c.status,
+    cluster_agent_leases.c.lease_until,
 )
 
 incident_events = Table(
@@ -287,6 +346,7 @@ action_intents = Table(
     Column("idempotency_key", String(64), primary_key=True),
     Column("incident_id", String(64), nullable=False, index=True),
     Column("cluster_id", String(128), nullable=False, index=True),
+    Column("cluster_generation", BigInteger, nullable=False),
     Column("lease_generation", BigInteger, nullable=False),
     Column("approval_id", String(64), nullable=True),
     Column("approval_version", Integer, nullable=True),
@@ -297,6 +357,8 @@ action_intents = Table(
     Column("executor_generation", BigInteger, nullable=False, default=0),
     Column("executor_lease_until", String(40), nullable=True),
     Column("attempt_id", String(64), nullable=True, unique=True),
+    Column("executor_session_id", String(64), nullable=True),
+    Column("executor_session_generation", BigInteger, nullable=True),
     Column("result", JSON, nullable=True),
     Column("error", Text, nullable=True),
     Column("created_at", String(40), nullable=False),
@@ -470,6 +532,373 @@ class SqlIncidentStore:
                 )
             ).scalars()
             return tuple(sorted(revisions))
+
+    async def ensure_cluster_registration(
+        self,
+        *,
+        cluster_id: str,
+        display_name: str,
+        default_namespace: str,
+    ) -> ClusterRegistration:
+        self._validate_cluster_registration_input(
+            cluster_id=cluster_id,
+            display_name=display_name,
+            default_namespace=default_namespace,
+        )
+        try:
+            async with self.engine.begin() as connection:
+                now = await self._database_now(connection)
+                row = (
+                    (
+                        await connection.execute(
+                            select(cluster_registrations)
+                            .where(cluster_registrations.c.cluster_id == cluster_id)
+                            .with_for_update()
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    await connection.execute(
+                        insert(cluster_registrations).values(
+                            cluster_id=cluster_id,
+                            display_name=display_name,
+                            default_namespace=default_namespace,
+                            routing_generation=1,
+                            lifecycle="active",
+                            metadata_state="configured",
+                            created_at=now.isoformat(),
+                            updated_at=now.isoformat(),
+                        )
+                    )
+                elif row["lifecycle"] != "active":
+                    raise ClusterRegistrationConflictError("集群注册不是 active 状态")
+                elif row["metadata_state"] == "inferred":
+                    claimed = await connection.execute(
+                        update(cluster_registrations)
+                        .where(
+                            cluster_registrations.c.cluster_id == cluster_id,
+                            cluster_registrations.c.routing_generation == row["routing_generation"],
+                            cluster_registrations.c.lifecycle == "active",
+                            cluster_registrations.c.metadata_state == "inferred",
+                        )
+                        .values(
+                            display_name=display_name,
+                            default_namespace=default_namespace,
+                            metadata_state="configured",
+                            updated_at=now.isoformat(),
+                        )
+                    )
+                    if claimed.rowcount != 1:
+                        raise ClusterRegistrationConflictError("迁移产生的集群占位注册已被并发认领")
+                elif (
+                    row["display_name"] != display_name
+                    or row["default_namespace"] != default_namespace
+                ):
+                    raise ClusterRegistrationConflictError(
+                        "cluster_id 已绑定到不同的权威集群元数据"
+                    )
+        except IntegrityError as exc:
+            raise ClusterRegistrationConflictError("集群注册已被并发创建") from exc
+        registration = await self._get_cluster_registration(cluster_id)
+        if registration is None:
+            raise ClusterRegistrationConflictError("集群注册没有成功持久化")
+        return registration
+
+    async def register_cluster_agent(
+        self,
+        *,
+        cluster_id: str,
+        instance_id: str,
+        session_id: str,
+        capabilities: tuple[str, ...],
+        version: str,
+        ttl_seconds: float,
+    ) -> ClusterAgentLeaseToken:
+        normalized_capabilities = self._normalize_capabilities(capabilities)
+        self._validate_cluster_agent_input(
+            cluster_id=cluster_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            version=version,
+            ttl_seconds=ttl_seconds,
+        )
+        try:
+            async with self.engine.begin() as connection:
+                now = await self._database_now(connection)
+                registration = (
+                    (
+                        await connection.execute(
+                            select(cluster_registrations)
+                            .where(cluster_registrations.c.cluster_id == cluster_id)
+                            .with_for_update(read=True)
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if registration is None:
+                    raise ClusterRegistrationConflictError("集群尚未注册")
+                if registration["lifecycle"] != "active":
+                    raise ClusterRegistrationConflictError("集群注册不是 active 状态")
+                existing = (
+                    (
+                        await connection.execute(
+                            select(cluster_agent_leases)
+                            .where(
+                                cluster_agent_leases.c.cluster_id == cluster_id,
+                                cluster_agent_leases.c.instance_id == instance_id,
+                            )
+                            .with_for_update()
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                lease_until = now + timedelta(seconds=ttl_seconds)
+                routing_generation = int(registration["routing_generation"])
+                if existing is None:
+                    generation = 1
+                    registered_at = now
+                    await connection.execute(
+                        insert(cluster_agent_leases).values(
+                            cluster_id=cluster_id,
+                            instance_id=instance_id,
+                            session_id=session_id,
+                            generation=generation,
+                            routing_generation=routing_generation,
+                            capabilities=list(normalized_capabilities),
+                            version=version,
+                            registered_at=registered_at.isoformat(),
+                            last_seen_at=now.isoformat(),
+                            lease_until=lease_until.isoformat(),
+                            status="active",
+                            updated_at=now.isoformat(),
+                        )
+                    )
+                elif (
+                    existing["status"] == "active"
+                    and datetime.fromisoformat(existing["lease_until"]) > now
+                ):
+                    if existing["session_id"] != session_id:
+                        raise ClusterAgentLeaseConflictError("同一集群 Agent 实例已有活动 Session")
+                    if (
+                        tuple(existing["capabilities"]) != normalized_capabilities
+                        or existing["version"] != version
+                        or int(existing["routing_generation"]) != routing_generation
+                    ):
+                        raise ClusterAgentLeaseConflictError(
+                            "幂等注册请求与已有 Session 元数据不一致"
+                        )
+                    generation = int(existing["generation"])
+                    registered_at = datetime.fromisoformat(existing["registered_at"])
+                    renewed = await connection.execute(
+                        update(cluster_agent_leases)
+                        .where(
+                            cluster_agent_leases.c.cluster_id == cluster_id,
+                            cluster_agent_leases.c.instance_id == instance_id,
+                            cluster_agent_leases.c.session_id == session_id,
+                            cluster_agent_leases.c.generation == generation,
+                            cluster_agent_leases.c.status == "active",
+                            cluster_agent_leases.c.lease_until > now.isoformat(),
+                        )
+                        .values(
+                            last_seen_at=now.isoformat(),
+                            lease_until=lease_until.isoformat(),
+                            updated_at=now.isoformat(),
+                        )
+                    )
+                    if renewed.rowcount != 1:
+                        raise ClusterAgentLeaseConflictError("集群 Agent Session 已被并发更新")
+                else:
+                    generation = int(existing["generation"]) + 1
+                    registered_at = now
+                    replaced = await connection.execute(
+                        update(cluster_agent_leases)
+                        .where(
+                            cluster_agent_leases.c.cluster_id == cluster_id,
+                            cluster_agent_leases.c.instance_id == instance_id,
+                            cluster_agent_leases.c.session_id == existing["session_id"],
+                            cluster_agent_leases.c.generation == existing["generation"],
+                            or_(
+                                cluster_agent_leases.c.status == "closed",
+                                cluster_agent_leases.c.lease_until <= now.isoformat(),
+                            ),
+                        )
+                        .values(
+                            session_id=session_id,
+                            generation=generation,
+                            routing_generation=routing_generation,
+                            capabilities=list(normalized_capabilities),
+                            version=version,
+                            registered_at=registered_at.isoformat(),
+                            last_seen_at=now.isoformat(),
+                            lease_until=lease_until.isoformat(),
+                            status="active",
+                            updated_at=now.isoformat(),
+                        )
+                    )
+                    if replaced.rowcount != 1:
+                        raise ClusterAgentLeaseConflictError("集群 Agent Session 已被并发接管")
+        except IntegrityError as exc:
+            raise ClusterAgentLeaseConflictError("Session ID 已绑定到其他集群 Agent") from exc
+        return ClusterAgentLeaseToken(
+            cluster_id=cluster_id,
+            instance_id=instance_id,
+            session_id=session_id,
+            generation=generation,
+            routing_generation=routing_generation,
+            capabilities=normalized_capabilities,
+            version=version,
+            registered_at=registered_at,
+            last_seen_at=now,
+            lease_until=lease_until,
+        )
+
+    async def heartbeat_cluster_agent(
+        self,
+        token: ClusterAgentLeaseToken,
+        *,
+        ttl_seconds: float,
+    ) -> ClusterAgentLeaseToken:
+        if ttl_seconds <= 0:
+            raise ValueError("集群 Agent 租约 TTL 必须为正数")
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                token,
+                now=now,
+                required_capability=None,
+            )
+            lease_until = now + timedelta(seconds=ttl_seconds)
+            heartbeat = await connection.execute(
+                update(cluster_agent_leases)
+                .where(
+                    cluster_agent_leases.c.cluster_id == token.cluster_id,
+                    cluster_agent_leases.c.instance_id == token.instance_id,
+                    cluster_agent_leases.c.session_id == token.session_id,
+                    cluster_agent_leases.c.generation == token.generation,
+                    cluster_agent_leases.c.routing_generation == token.routing_generation,
+                    cluster_agent_leases.c.status == "active",
+                    cluster_agent_leases.c.lease_until > now.isoformat(),
+                )
+                .values(
+                    last_seen_at=now.isoformat(),
+                    lease_until=lease_until.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if heartbeat.rowcount != 1:
+                raise ClusterAgentLeaseConflictError("集群 Agent Session 已过期或被替换")
+        return ClusterAgentLeaseToken(
+            cluster_id=token.cluster_id,
+            instance_id=token.instance_id,
+            session_id=token.session_id,
+            generation=token.generation,
+            routing_generation=token.routing_generation,
+            capabilities=token.capabilities,
+            version=token.version,
+            registered_at=token.registered_at,
+            last_seen_at=now,
+            lease_until=lease_until,
+        )
+
+    async def close_cluster_agent(
+        self,
+        token: ClusterAgentLeaseToken,
+    ) -> None:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            closed = await connection.execute(
+                update(cluster_agent_leases)
+                .where(
+                    cluster_agent_leases.c.cluster_id == token.cluster_id,
+                    cluster_agent_leases.c.instance_id == token.instance_id,
+                    cluster_agent_leases.c.session_id == token.session_id,
+                    cluster_agent_leases.c.generation == token.generation,
+                    cluster_agent_leases.c.routing_generation == token.routing_generation,
+                    cluster_agent_leases.c.status == "active",
+                )
+                .values(
+                    status="closed",
+                    lease_until=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if closed.rowcount != 1:
+                raise ClusterAgentLeaseConflictError("集群 Agent Session 已关闭或被替换")
+
+    async def list_cluster_connections(
+        self,
+    ) -> list[ClusterConnection]:
+        async with self.engine.connect() as connection:
+            now = await self._database_now(connection)
+            registrations = list(
+                (
+                    await connection.execute(
+                        select(cluster_registrations).order_by(
+                            cluster_registrations.c.cluster_id.asc()
+                        )
+                    )
+                ).mappings()
+            )
+            leases = list(
+                (
+                    await connection.execute(
+                        select(cluster_agent_leases).order_by(
+                            cluster_agent_leases.c.cluster_id.asc(),
+                            cluster_agent_leases.c.instance_id.asc(),
+                        )
+                    )
+                ).mappings()
+            )
+        by_cluster: dict[str, list[Any]] = {}
+        for lease in leases:
+            by_cluster.setdefault(lease["cluster_id"], []).append(lease)
+        return [
+            self._stored_cluster_connection(
+                registration,
+                by_cluster.get(registration["cluster_id"], []),
+                now=now,
+            )
+            for registration in registrations
+        ]
+
+    async def get_cluster_connection(
+        self,
+        cluster_id: str,
+    ) -> ClusterConnection | None:
+        async with self.engine.connect() as connection:
+            now = await self._database_now(connection)
+            registration = (
+                (
+                    await connection.execute(
+                        select(cluster_registrations).where(
+                            cluster_registrations.c.cluster_id == cluster_id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if registration is None:
+                return None
+            leases = list(
+                (
+                    await connection.execute(
+                        select(cluster_agent_leases)
+                        .where(cluster_agent_leases.c.cluster_id == cluster_id)
+                        .order_by(cluster_agent_leases.c.instance_id.asc())
+                    )
+                ).mappings()
+            )
+        return self._stored_cluster_connection(
+            registration,
+            leases,
+            now=now,
+        )
 
     async def list_audit_events(self, incident_id: str) -> list[AuditEvent]:
         async with self.engine.connect() as connection:
@@ -2626,6 +3055,7 @@ class SqlIncidentStore:
             .one()
         )
         return self._stored_change_proposal(row)
+
     async def save(
         self,
         record: IncidentRecord,
@@ -3527,56 +3957,67 @@ class SqlIncidentStore:
                 ).scalar_one_or_none()
                 if incident_cluster_id is None:
                     raise ActionIntentConflictError("持久化事故不存在")
+                registration_generation = (
+                    await connection.execute(
+                        select(cluster_registrations.c.routing_generation).where(
+                            cluster_registrations.c.cluster_id == incident_cluster_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                cluster_generation = (
+                    int(registration_generation) if registration_generation is not None else 1
+                )
                 precondition_cluster_id = precondition.get("cluster_id")
                 if (
                     not isinstance(precondition_cluster_id, str)
                     or not precondition_cluster_id.strip()
                     or precondition_cluster_id != incident_cluster_id
                 ):
-                    raise ActionIntentConflictError(
-                        "Action Intent cluster_id 与事故绑定集群不一致"
-                    )
+                    raise ActionIntentConflictError("Action Intent cluster_id 与事故绑定集群不一致")
                 approval_row = (
-                    await connection.execute(
-                        select(
-                            approvals.c.approval_id,
-                            approvals.c.version,
-                            approvals.c.status,
+                    (
+                        await connection.execute(
+                            select(
+                                approvals.c.approval_id,
+                                approvals.c.version,
+                                approvals.c.status,
+                            )
+                            .where(approvals.c.incident_id == token.incident_id)
+                            .order_by(approvals.c.version.desc())
+                            .limit(1)
                         )
-                        .where(approvals.c.incident_id == token.incident_id)
-                        .order_by(approvals.c.version.desc())
-                        .limit(1)
                     )
-                ).mappings().one_or_none()
+                    .mappings()
+                    .one_or_none()
+                )
                 existing = (
-                    await connection.execute(
-                        select(action_intents).where(
-                            action_intents.c.idempotency_key == idempotency_key
+                    (
+                        await connection.execute(
+                            select(action_intents).where(
+                                action_intents.c.idempotency_key == idempotency_key
+                            )
                         )
                     )
-                ).mappings().one_or_none()
+                    .mappings()
+                    .one_or_none()
+                )
                 if existing is not None:
                     stored = self._stored_action(existing)
                     if (
                         stored.incident_id != token.incident_id
                         or stored.cluster_id != incident_cluster_id
+                        or stored.cluster_generation != cluster_generation
                         or stored.action.model_dump(mode="json") != action_payload
                         or stored.precondition != precondition
                     ):
-                        raise ActionIntentConflictError(
-                            "幂等键已绑定到不同的集群操作"
-                        )
-                    if (
-                        stored.status == "prepared"
-                        and stored.lease_generation != token.generation
-                    ):
+                        raise ActionIntentConflictError("幂等键已绑定到不同的集群操作")
+                    if stored.status == "prepared" and stored.lease_generation != token.generation:
                         reassigned = await connection.execute(
                             update(action_intents)
                             .where(
                                 action_intents.c.idempotency_key == idempotency_key,
                                 action_intents.c.status == "prepared",
-                                action_intents.c.lease_generation
-                                == stored.lease_generation,
+                                action_intents.c.lease_generation == stored.lease_generation,
                             )
                             .values(
                                 lease_generation=token.generation,
@@ -3584,15 +4025,12 @@ class SqlIncidentStore:
                             )
                         )
                         if reassigned.rowcount != 1:
-                            raise ActionIntentConflictError(
-                                "操作意图已被其他 Worker 接管"
-                            )
+                            raise ActionIntentConflictError("操作意图已被其他 Worker 接管")
                         await self._append_audit_event(
                             connection,
                             incident_id=token.incident_id,
                             operation_id=(
-                                f"action:{idempotency_key}:prepared:"
-                                f"lease-{token.generation}"
+                                f"action:{idempotency_key}:prepared:lease-{token.generation}"
                             ),
                             event_type="action.prepared_reassigned",
                             source_component="api",
@@ -3610,6 +4048,7 @@ class SqlIncidentStore:
                             idempotency_key=stored.idempotency_key,
                             incident_id=stored.incident_id,
                             cluster_id=stored.cluster_id,
+                            cluster_generation=stored.cluster_generation,
                             lease_generation=token.generation,
                             approval_id=stored.approval_id,
                             approval_version=stored.approval_version,
@@ -3622,6 +4061,8 @@ class SqlIncidentStore:
                             executor_generation=stored.executor_generation,
                             executor_lease_until=stored.executor_lease_until,
                             attempt_id=stored.attempt_id,
+                            executor_session_id=stored.executor_session_id,
+                            executor_session_generation=(stored.executor_session_generation),
                         )
                     return stored
                 await connection.execute(
@@ -3629,6 +4070,7 @@ class SqlIncidentStore:
                         idempotency_key=idempotency_key,
                         incident_id=token.incident_id,
                         cluster_id=incident_cluster_id,
+                        cluster_generation=cluster_generation,
                         lease_generation=token.generation,
                         approval_id=(
                             approval_row["approval_id"] if approval_row is not None else None
@@ -3643,6 +4085,8 @@ class SqlIncidentStore:
                         executor_generation=0,
                         executor_lease_until=None,
                         attempt_id=None,
+                        executor_session_id=None,
+                        executor_session_generation=None,
                         result=None,
                         error=None,
                         created_at=now.isoformat(),
@@ -3665,14 +4109,10 @@ class SqlIncidentStore:
                     payload={
                         "lease_generation": token.generation,
                         "approval_id": (
-                            approval_row["approval_id"]
-                            if approval_row is not None
-                            else None
+                            approval_row["approval_id"] if approval_row is not None else None
                         ),
                         "approval_version": (
-                            int(approval_row["version"])
-                            if approval_row is not None
-                            else None
+                            int(approval_row["version"]) if approval_row is not None else None
                         ),
                         "action": action_payload,
                         "precondition_sha256": canonical_payload_hash(precondition),
@@ -3727,141 +4167,189 @@ class SqlIncidentStore:
             )
         return await self._require_action(idempotency_key)
 
+    async def reap_expired_action_claims(self) -> int:
+        async with self.engine.begin() as connection:
+            now = await self._database_now(connection)
+            return await self._reap_expired_action_claims_tx(
+                connection,
+                now=now,
+                cluster_id=None,
+            )
+
+    async def _reap_expired_action_claims_tx(
+        self,
+        connection: Any,
+        *,
+        now: datetime,
+        cluster_id: str | None,
+    ) -> int:
+        cluster_filter = (
+            action_intents.c.cluster_id == cluster_id if cluster_id is not None else True
+        )
+        expired_claims = list(
+            (
+                await connection.execute(
+                    select(action_intents)
+                    .where(
+                        cluster_filter,
+                        action_intents.c.status == "claimed",
+                        action_intents.c.executor_lease_until <= now.isoformat(),
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            ).mappings()
+        )
+        transitioned = 0
+        for expired in expired_claims:
+            requeued = await connection.execute(
+                update(action_intents)
+                .where(
+                    action_intents.c.idempotency_key == expired["idempotency_key"],
+                    action_intents.c.cluster_id == expired["cluster_id"],
+                    action_intents.c.cluster_generation == expired["cluster_generation"],
+                    action_intents.c.status == "claimed",
+                    action_intents.c.executor_id == expired["executor_id"],
+                    action_intents.c.executor_generation == expired["executor_generation"],
+                    action_intents.c.attempt_id == expired["attempt_id"],
+                    action_intents.c.executor_lease_until == expired["executor_lease_until"],
+                )
+                .values(
+                    status="queued",
+                    executor_id=None,
+                    executor_lease_until=None,
+                    attempt_id=None,
+                    executor_session_id=None,
+                    executor_session_generation=None,
+                    updated_at=now.isoformat(),
+                )
+            )
+            if requeued.rowcount == 1:
+                transitioned += 1
+                await self._append_audit_event(
+                    connection,
+                    incident_id=expired["incident_id"],
+                    operation_id=(
+                        f"action:{expired['idempotency_key']}:claim-expired:{expired['attempt_id']}"
+                    ),
+                    event_type="action.requeued",
+                    source_component="executor",
+                    actor_type="system",
+                    actor_id="executor-claim-reaper",
+                    actor_assurance="internal",
+                    subject_type="action_intent",
+                    subject_id=expired["idempotency_key"],
+                    payload={
+                        "previous_executor_id": expired["executor_id"],
+                        "previous_generation": int(expired["executor_generation"]),
+                        "previous_session_id": (expired["executor_session_id"]),
+                        "previous_session_generation": (expired["executor_session_generation"]),
+                        "reason": "claim_expired_before_dispatch",
+                    },
+                    occurred_at=now.isoformat(),
+                )
+
+        expired_dispatches = list(
+            (
+                await connection.execute(
+                    select(action_intents)
+                    .where(
+                        cluster_filter,
+                        action_intents.c.status == "dispatched",
+                        action_intents.c.executor_lease_until <= now.isoformat(),
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            ).mappings()
+        )
+        for expired in expired_dispatches:
+            unknown = await connection.execute(
+                update(action_intents)
+                .where(
+                    action_intents.c.idempotency_key == expired["idempotency_key"],
+                    action_intents.c.cluster_id == expired["cluster_id"],
+                    action_intents.c.cluster_generation == expired["cluster_generation"],
+                    action_intents.c.status == "dispatched",
+                    action_intents.c.executor_id == expired["executor_id"],
+                    action_intents.c.executor_generation == expired["executor_generation"],
+                    action_intents.c.attempt_id == expired["attempt_id"],
+                    action_intents.c.executor_lease_until == expired["executor_lease_until"],
+                )
+                .values(
+                    status="unknown",
+                    error=("Executor 在外部写入派发后失联，禁止自动重放"),
+                    finished_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+            )
+            if unknown.rowcount == 1:
+                transitioned += 1
+                await self._append_audit_event(
+                    connection,
+                    incident_id=expired["incident_id"],
+                    operation_id=(
+                        f"action:{expired['idempotency_key']}:"
+                        f"dispatch-expired:{expired['attempt_id']}"
+                    ),
+                    event_type="action.unknown",
+                    source_component="executor",
+                    actor_type="system",
+                    actor_id="executor-claim-reaper",
+                    actor_assurance="internal",
+                    subject_type="action_intent",
+                    subject_id=expired["idempotency_key"],
+                    payload={
+                        "executor_id": expired["executor_id"],
+                        "executor_generation": int(expired["executor_generation"]),
+                        "attempt_id": expired["attempt_id"],
+                        "agent_session_id": (expired["executor_session_id"]),
+                        "agent_session_generation": (expired["executor_session_generation"]),
+                        "reason": "dispatch_lease_expired",
+                    },
+                    occurred_at=now.isoformat(),
+                )
+        return transitioned
+
     async def claim_action_execution(
         self,
         *,
-        cluster_id: str,
+        agent_lease: ClusterAgentLeaseToken,
         owner_id: str,
         attempt_id: str,
         ttl_seconds: float,
     ) -> ExecutorClaim | None:
-        if not cluster_id.strip():
-            raise ValueError("cluster_id 不能为空")
+        if ttl_seconds <= 0:
+            raise ValueError("Executor claim TTL 必须为正数")
+        cluster_id = agent_lease.cluster_id
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
-            expired_claims = list(
-                (
-                    await connection.execute(
-                        select(action_intents)
-                        .where(
-                            action_intents.c.cluster_id == cluster_id,
-                            action_intents.c.status == "claimed",
-                            action_intents.c.executor_lease_until
-                            <= now.isoformat(),
-                        )
-                        .with_for_update(skip_locked=True)
-                    )
-                ).mappings()
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
             )
-            for expired in expired_claims:
-                requeued = await connection.execute(
-                    update(action_intents)
-                    .where(
-                        action_intents.c.idempotency_key
-                        == expired["idempotency_key"],
-                        action_intents.c.cluster_id == cluster_id,
-                        action_intents.c.status == "claimed",
-                    )
-                    .values(
-                        status="queued",
-                        executor_id=None,
-                        executor_lease_until=None,
-                        attempt_id=None,
-                        updated_at=now.isoformat(),
-                    )
-                )
-                if requeued.rowcount == 1:
-                    await self._append_audit_event(
-                        connection,
-                        incident_id=expired["incident_id"],
-                        operation_id=(
-                            f"action:{expired['idempotency_key']}:"
-                            f"claim-expired:{expired['attempt_id']}"
-                        ),
-                        event_type="action.requeued",
-                        source_component="executor",
-                        actor_type="system",
-                        actor_id="executor-claim-reaper",
-                        actor_assurance="internal",
-                        subject_type="action_intent",
-                        subject_id=expired["idempotency_key"],
-                        payload={
-                            "previous_executor_id": expired["executor_id"],
-                            "previous_generation": int(
-                                expired["executor_generation"]
-                            ),
-                            "reason": "claim_expired_before_dispatch",
-                        },
-                        occurred_at=now.isoformat(),
-                    )
-
-            expired_dispatches = list(
-                (
-                    await connection.execute(
-                        select(action_intents)
-                        .where(
-                            action_intents.c.cluster_id == cluster_id,
-                            action_intents.c.status == "dispatched",
-                            action_intents.c.executor_lease_until
-                            <= now.isoformat(),
-                        )
-                        .with_for_update(skip_locked=True)
-                    )
-                ).mappings()
+            await self._reap_expired_action_claims_tx(
+                connection,
+                now=now,
+                cluster_id=cluster_id,
             )
-            for expired in expired_dispatches:
-                unknown = await connection.execute(
-                    update(action_intents)
-                    .where(
-                        action_intents.c.idempotency_key
-                        == expired["idempotency_key"],
-                        action_intents.c.cluster_id == cluster_id,
-                        action_intents.c.status == "dispatched",
-                    )
-                    .values(
-                        status="unknown",
-                        error="Executor 在外部写入派发后失联，禁止自动重放",
-                        finished_at=now.isoformat(),
-                        updated_at=now.isoformat(),
-                    )
-                )
-                if unknown.rowcount == 1:
-                    await self._append_audit_event(
-                        connection,
-                        incident_id=expired["incident_id"],
-                        operation_id=(
-                            f"action:{expired['idempotency_key']}:"
-                            f"dispatch-expired:{expired['attempt_id']}"
-                        ),
-                        event_type="action.unknown",
-                        source_component="executor",
-                        actor_type="system",
-                        actor_id="executor-claim-reaper",
-                        actor_assurance="internal",
-                        subject_type="action_intent",
-                        subject_id=expired["idempotency_key"],
-                        payload={
-                            "executor_id": expired["executor_id"],
-                            "executor_generation": int(
-                                expired["executor_generation"]
-                            ),
-                            "attempt_id": expired["attempt_id"],
-                            "reason": "dispatch_lease_expired",
-                        },
-                        occurred_at=now.isoformat(),
-                    )
             row = (
-                await connection.execute(
-                    select(action_intents)
-                    .where(
-                        action_intents.c.cluster_id == cluster_id,
-                        action_intents.c.status == "queued",
+                (
+                    await connection.execute(
+                        select(action_intents)
+                        .where(
+                            action_intents.c.cluster_id == cluster_id,
+                            action_intents.c.cluster_generation == agent_lease.routing_generation,
+                            action_intents.c.status == "queued",
+                        )
+                        .order_by(action_intents.c.queued_at.asc())
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
                     )
-                    .order_by(action_intents.c.queued_at.asc())
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
                 )
-            ).mappings().one_or_none()
+                .mappings()
+                .one_or_none()
+            )
             if row is None:
                 return None
             generation = int(row["executor_generation"]) + 1
@@ -3871,6 +4359,7 @@ class SqlIncidentStore:
                 .where(
                     action_intents.c.idempotency_key == row["idempotency_key"],
                     action_intents.c.cluster_id == cluster_id,
+                    action_intents.c.cluster_generation == agent_lease.routing_generation,
                     action_intents.c.status == "queued",
                 )
                 .values(
@@ -3879,21 +4368,18 @@ class SqlIncidentStore:
                     executor_generation=generation,
                     executor_lease_until=expires_at.isoformat(),
                     attempt_id=attempt_id,
+                    executor_session_id=agent_lease.session_id,
+                    executor_session_generation=agent_lease.generation,
                     claimed_at=now.isoformat(),
                     updated_at=now.isoformat(),
                 )
             )
             if result.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "操作意图已被其他 Executor 领取"
-                )
+                raise ActionIntentConflictError("操作意图已被其他 Executor 领取")
             await self._append_audit_event(
                 connection,
                 incident_id=row["incident_id"],
-                operation_id=(
-                    f"action:{row['idempotency_key']}:claimed:"
-                    f"{generation}:{attempt_id}"
-                ),
+                operation_id=(f"action:{row['idempotency_key']}:claimed:{generation}:{attempt_id}"),
                 event_type="action.claimed",
                 source_component="executor",
                 actor_type="executor",
@@ -3904,6 +4390,9 @@ class SqlIncidentStore:
                 payload={
                     "executor_generation": generation,
                     "attempt_id": attempt_id,
+                    "cluster_generation": (agent_lease.routing_generation),
+                    "agent_session_id": agent_lease.session_id,
+                    "agent_session_generation": agent_lease.generation,
                     "lease_expires_at": expires_at.isoformat(),
                 },
                 occurred_at=now.isoformat(),
@@ -3912,9 +4401,12 @@ class SqlIncidentStore:
             idempotency_key=row["idempotency_key"],
             incident_id=row["incident_id"],
             cluster_id=cluster_id,
+            cluster_generation=agent_lease.routing_generation,
             owner_id=owner_id,
             generation=generation,
             attempt_id=attempt_id,
+            session_id=agent_lease.session_id,
+            session_generation=agent_lease.generation,
             expires_at=expires_at,
         )
 
@@ -3922,10 +4414,21 @@ class SqlIncidentStore:
         self,
         claim: ExecutorClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         ttl_seconds: float,
     ) -> ExecutorClaim:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             expires_at = now + timedelta(seconds=ttl_seconds)
             result = await connection.execute(
                 update(action_intents)
@@ -3933,9 +4436,12 @@ class SqlIncidentStore:
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
+                    action_intents.c.executor_session_id == claim.session_id,
+                    action_intents.c.executor_session_generation == claim.session_generation,
                     action_intents.c.executor_lease_until > now.isoformat(),
                     action_intents.c.status.in_(["claimed", "dispatched"]),
                 )
@@ -3950,18 +4456,33 @@ class SqlIncidentStore:
             idempotency_key=claim.idempotency_key,
             incident_id=claim.incident_id,
             cluster_id=claim.cluster_id,
+            cluster_generation=claim.cluster_generation,
             owner_id=claim.owner_id,
             generation=claim.generation,
             attempt_id=claim.attempt_id,
+            session_id=claim.session_id,
+            session_generation=claim.session_generation,
             expires_at=expires_at,
         )
 
     async def mark_action_dispatched(
         self,
         claim: ExecutorClaim,
+        *,
+        agent_lease: ClusterAgentLeaseToken,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             await self._assert_dispatch_allowed(
                 connection,
                 claim.incident_id,
@@ -3973,9 +4494,12 @@ class SqlIncidentStore:
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
+                    action_intents.c.executor_session_id == claim.session_id,
+                    action_intents.c.executor_session_generation == claim.session_generation,
                     action_intents.c.executor_lease_until > now.isoformat(),
                     action_intents.c.status == "claimed",
                 )
@@ -3986,9 +4510,7 @@ class SqlIncidentStore:
                 )
             )
             if result.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "Executor 领取已失效，禁止派发集群写操作"
-                )
+                raise ActionIntentConflictError("Executor 领取已失效，禁止派发集群写操作")
             await connection.execute(
                 insert(action_reconciliation_outbox).values(
                     action_id=claim.idempotency_key,
@@ -4030,19 +4552,33 @@ class SqlIncidentStore:
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         result: Any,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             updated = await connection.execute(
                 update(action_intents)
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
+                    action_intents.c.executor_session_id == claim.session_id,
+                    action_intents.c.executor_session_generation == claim.session_generation,
                     action_intents.c.status.in_(["dispatched", "unknown"]),
                 )
                 .values(
@@ -4055,29 +4591,33 @@ class SqlIncidentStore:
             )
             if updated.rowcount != 1:
                 existing = (
-                    await connection.execute(
-                        select(action_intents).where(
-                            action_intents.c.idempotency_key == claim.idempotency_key
+                    (
+                        await connection.execute(
+                            select(action_intents).where(
+                                action_intents.c.idempotency_key == claim.idempotency_key
+                            )
                         )
                     )
-                ).mappings().one_or_none()
+                    .mappings()
+                    .one_or_none()
+                )
                 if (
                     existing is None
                     or existing["cluster_id"] != claim.cluster_id
+                    or int(existing["cluster_generation"]) != claim.cluster_generation
                     or existing["attempt_id"] != claim.attempt_id
+                    or existing["executor_session_id"] != claim.session_id
+                    or int(existing["executor_session_generation"] or 0) != claim.session_generation
                     or existing["status"] not in {"succeeded", "failed"}
                     or existing["result"] != result.model_dump(mode="json")
                 ):
-                    raise ActionIntentConflictError(
-                        "操作结果无法绑定到同一次 Executor 尝试"
-                    )
+                    raise ActionIntentConflictError("操作结果无法绑定到同一次 Executor 尝试")
             else:
                 result_payload = result.model_dump(mode="json")
                 await connection.execute(
                     update(action_reconciliation_outbox)
                     .where(
-                        action_reconciliation_outbox.c.action_id
-                        == claim.idempotency_key,
+                        action_reconciliation_outbox.c.action_id == claim.idempotency_key,
                         action_reconciliation_outbox.c.status.in_(
                             ["pending", "claimed", "dead_letter"]
                         ),
@@ -4094,13 +4634,8 @@ class SqlIncidentStore:
                 await self._append_audit_event(
                     connection,
                     incident_id=claim.incident_id,
-                    operation_id=(
-                        f"action:{claim.idempotency_key}:completed:"
-                        f"{claim.attempt_id}"
-                    ),
-                    event_type=(
-                        "action.succeeded" if result.success else "action.failed"
-                    ),
+                    operation_id=(f"action:{claim.idempotency_key}:completed:{claim.attempt_id}"),
+                    event_type=("action.succeeded" if result.success else "action.failed"),
                     source_component="executor",
                     actor_type="executor",
                     actor_id=claim.owner_id,
@@ -4121,25 +4656,32 @@ class SqlIncidentStore:
     async def claim_action_reconciliation(
         self,
         *,
-        cluster_id: str,
+        agent_lease: ClusterAgentLeaseToken,
         owner_id: str,
         ttl_seconds: float,
     ) -> ActionReconciliationClaim | None:
-        if not cluster_id.strip():
-            raise ValueError("cluster_id 不能为空")
+        if ttl_seconds <= 0:
+            raise ValueError("Controller 对账 claim TTL 必须为正数")
+        cluster_id = agent_lease.cluster_id
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.reconcile",
+            )
             await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
                     action_reconciliation_outbox.c.action_id.in_(
                         select(action_intents.c.idempotency_key).where(
-                            action_intents.c.cluster_id == cluster_id
+                            action_intents.c.cluster_id == cluster_id,
+                            action_intents.c.cluster_generation == agent_lease.routing_generation,
                         )
                     ),
                     action_reconciliation_outbox.c.status == "claimed",
-                    action_reconciliation_outbox.c.claim_until
-                    <= now.isoformat(),
+                    action_reconciliation_outbox.c.claim_until <= now.isoformat(),
                 )
                 .values(
                     status="pending",
@@ -4168,16 +4710,13 @@ class SqlIncidentStore:
                         )
                         .where(
                             action_intents.c.cluster_id == cluster_id,
+                            action_intents.c.cluster_generation == agent_lease.routing_generation,
                             action_reconciliation_outbox.c.status == "pending",
-                            action_reconciliation_outbox.c.next_attempt_at
-                            <= now.isoformat(),
-                            action_intents.c.status.in_(
-                                ["dispatched", "unknown"]
-                            ),
+                            action_reconciliation_outbox.c.next_attempt_at <= now.isoformat(),
+                            action_intents.c.status.in_(["dispatched", "unknown"]),
                             or_(
                                 action_intents.c.executor_lease_until.is_(None),
-                                action_intents.c.executor_lease_until
-                                <= now.isoformat(),
+                                action_intents.c.executor_lease_until <= now.isoformat(),
                             ),
                         )
                         .order_by(
@@ -4200,8 +4739,7 @@ class SqlIncidentStore:
             claimed = await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
-                    action_reconciliation_outbox.c.action_id
-                    == row["idempotency_key"],
+                    action_reconciliation_outbox.c.action_id == row["idempotency_key"],
                     action_reconciliation_outbox.c.status == "pending",
                 )
                 .values(
@@ -4215,16 +4753,17 @@ class SqlIncidentStore:
                 )
             )
             if claimed.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "Controller 结果对账任务已被其他 Executor 领取"
-                )
+                raise ActionIntentConflictError("Controller 结果对账任务已被其他 Executor 领取")
             return ActionReconciliationClaim(
                 intent=self._stored_action(row),
                 cluster_id=cluster_id,
+                cluster_generation=agent_lease.routing_generation,
                 owner_id=owner_id,
                 generation=generation,
                 attempt_id=attempt_id,
                 attempt_count=attempt_count,
+                session_id=agent_lease.session_id,
+                session_generation=agent_lease.generation,
                 expires_at=expires_at,
             )
 
@@ -4232,6 +4771,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         result: Any,
     ) -> StoredActionIntent:
         result_payload = result.model_dump(mode="json")
@@ -4240,18 +4780,18 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             intent = claim.intent
             updated = await connection.execute(
                 update(action_intents)
                 .where(
-                    action_intents.c.idempotency_key
-                    == intent.idempotency_key,
+                    action_intents.c.idempotency_key == intent.idempotency_key,
                     action_intents.c.incident_id == intent.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
-                    action_intents.c.executor_generation
-                    == intent.executor_generation,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
+                    action_intents.c.executor_generation == intent.executor_generation,
                     action_intents.c.attempt_id == intent.attempt_id,
                     action_intents.c.status.in_(["dispatched", "unknown"]),
                 )
@@ -4268,8 +4808,7 @@ class SqlIncidentStore:
                     (
                         await connection.execute(
                             select(action_intents).where(
-                                action_intents.c.idempotency_key
-                                == intent.idempotency_key
+                                action_intents.c.idempotency_key == intent.idempotency_key
                             )
                         )
                     )
@@ -4280,28 +4819,22 @@ class SqlIncidentStore:
                     existing is None
                     or existing["incident_id"] != intent.incident_id
                     or existing["cluster_id"] != claim.cluster_id
-                    or existing["executor_generation"]
-                    != intent.executor_generation
+                    or int(existing["cluster_generation"]) != claim.cluster_generation
+                    or existing["executor_generation"] != intent.executor_generation
                     or existing["attempt_id"] != intent.attempt_id
                     or existing["status"] not in {"succeeded", "failed"}
                     or existing["result"] != result_payload
                 ):
-                    raise ActionIntentConflictError(
-                        "Controller 结果无法绑定到原始 Executor 尝试"
-                    )
+                    raise ActionIntentConflictError("Controller 结果无法绑定到原始 Executor 尝试")
             completed = await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
-                    action_reconciliation_outbox.c.action_id
-                    == intent.idempotency_key,
+                    action_reconciliation_outbox.c.action_id == intent.idempotency_key,
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claimed_by == claim.owner_id,
-                    action_reconciliation_outbox.c.claim_generation
-                    == claim.generation,
-                    action_reconciliation_outbox.c.attempt_id
-                    == claim.attempt_id,
-                    action_reconciliation_outbox.c.claim_until
-                    > now.isoformat(),
+                    action_reconciliation_outbox.c.claim_generation == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until > now.isoformat(),
                 )
                 .values(
                     status="completed",
@@ -4313,9 +4846,7 @@ class SqlIncidentStore:
                 )
             )
             if completed.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "Controller 结果对账租约已失效"
-                )
+                raise ActionIntentConflictError("Controller 结果对账租约已失效")
             if updated.rowcount == 1:
                 controller_receipt = (
                     result_payload.get("content")
@@ -4334,14 +4865,9 @@ class SqlIncidentStore:
                     connection,
                     incident_id=intent.incident_id,
                     operation_id=(
-                        f"action:{intent.idempotency_key}:"
-                        f"controller-reconciled:{claim.attempt_id}"
+                        f"action:{intent.idempotency_key}:controller-reconciled:{claim.attempt_id}"
                     ),
-                    event_type=(
-                        "action.succeeded"
-                        if result.success
-                        else "action.failed"
-                    ),
+                    event_type=("action.succeeded" if result.success else "action.failed"),
                     source_component="executor-reconciler",
                     actor_type="executor",
                     actor_id=claim.owner_id,
@@ -4354,39 +4880,19 @@ class SqlIncidentStore:
                         "reconciliation_generation": claim.generation,
                         "reconciliation_attempt_id": claim.attempt_id,
                         "tool_name": result.tool_name,
-                        "result_sha256": canonical_payload_hash(
-                            result_payload
-                        ),
+                        "result_sha256": canonical_payload_hash(result_payload),
                         "success": result.success,
-                        "remediation_uid": controller_receipt.get(
-                            "remediation_uid"
-                        ),
-                        "remediation_generation": controller_receipt.get(
-                            "remediation_generation"
-                        ),
-                        "observed_generation": controller_receipt.get(
-                            "observed_generation"
-                        ),
-                        "controller_phase": controller_receipt.get(
-                            "controller_phase"
-                        ),
-                        "controller_id": controller_receipt.get(
-                            "controller_id"
-                        ),
-                        "finished_at": controller_receipt.get(
-                            "finished_at"
-                        ),
-                        "spec_digest": controller_receipt.get(
-                            "spec_digest"
-                        ),
+                        "remediation_uid": controller_receipt.get("remediation_uid"),
+                        "remediation_generation": controller_receipt.get("remediation_generation"),
+                        "observed_generation": controller_receipt.get("observed_generation"),
+                        "controller_phase": controller_receipt.get("controller_phase"),
+                        "controller_id": controller_receipt.get("controller_id"),
+                        "finished_at": controller_receipt.get("finished_at"),
+                        "spec_digest": controller_receipt.get("spec_digest"),
                         "executed_condition_digest": (
-                            controller_receipt.get(
-                                "executed_condition_digest"
-                            )
+                            controller_receipt.get("executed_condition_digest")
                         ),
-                        "outcome_digest": controller_result.get(
-                            "outcomeDigest"
-                        ),
+                        "outcome_digest": controller_result.get("outcomeDigest"),
                     },
                     occurred_at=now.isoformat(),
                 )
@@ -4396,6 +4902,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
         retry_after_seconds: float,
     ) -> StoredActionIntent:
@@ -4404,29 +4911,23 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             retried = await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
-                    action_reconciliation_outbox.c.action_id
-                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.action_id == claim.intent.idempotency_key,
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claimed_by == claim.owner_id,
-                    action_reconciliation_outbox.c.claim_generation
-                    == claim.generation,
-                    action_reconciliation_outbox.c.attempt_id
-                    == claim.attempt_id,
-                    action_reconciliation_outbox.c.claim_until
-                    > now.isoformat(),
+                    action_reconciliation_outbox.c.claim_generation == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until > now.isoformat(),
                 )
                 .values(
                     status="pending",
                     next_attempt_at=(
-                        now
-                        + timedelta(
-                            seconds=max(0.1, retry_after_seconds)
-                        )
+                        now + timedelta(seconds=max(0.1, retry_after_seconds))
                     ).isoformat(),
                     claimed_by=None,
                     attempt_id=None,
@@ -4436,21 +4937,16 @@ class SqlIncidentStore:
                 )
             )
             if retried.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "Controller 结果对账租约已失效"
-                )
+                raise ActionIntentConflictError("Controller 结果对账租约已失效")
             await connection.execute(
                 update(action_intents)
                 .where(
-                    action_intents.c.idempotency_key
-                    == claim.intent.idempotency_key,
-                    action_intents.c.incident_id
-                    == claim.intent.incident_id,
+                    action_intents.c.idempotency_key == claim.intent.idempotency_key,
+                    action_intents.c.incident_id == claim.intent.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
-                    action_intents.c.executor_generation
-                    == claim.intent.executor_generation,
-                    action_intents.c.attempt_id
-                    == claim.intent.attempt_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
+                    action_intents.c.executor_generation == claim.intent.executor_generation,
+                    action_intents.c.attempt_id == claim.intent.attempt_id,
                     action_intents.c.status.in_(["dispatched", "unknown"]),
                 )
                 .values(
@@ -4464,6 +4960,7 @@ class SqlIncidentStore:
         self,
         claim: ActionReconciliationClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         error: str,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
@@ -4471,21 +4968,18 @@ class SqlIncidentStore:
             await self._fence_action_reconciliation_claim(
                 connection,
                 claim,
+                agent_lease,
                 now=now,
             )
             abandoned = await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
-                    action_reconciliation_outbox.c.action_id
-                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.action_id == claim.intent.idempotency_key,
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claimed_by == claim.owner_id,
-                    action_reconciliation_outbox.c.claim_generation
-                    == claim.generation,
-                    action_reconciliation_outbox.c.attempt_id
-                    == claim.attempt_id,
-                    action_reconciliation_outbox.c.claim_until
-                    > now.isoformat(),
+                    action_reconciliation_outbox.c.claim_generation == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until > now.isoformat(),
                 )
                 .values(
                     status="dead_letter",
@@ -4497,21 +4991,16 @@ class SqlIncidentStore:
                 )
             )
             if abandoned.rowcount != 1:
-                raise ActionIntentConflictError(
-                    "Controller 结果对账租约已失效"
-                )
+                raise ActionIntentConflictError("Controller 结果对账租约已失效")
             transitioned_unknown = await connection.execute(
                 update(action_intents)
                 .where(
-                    action_intents.c.idempotency_key
-                    == claim.intent.idempotency_key,
-                    action_intents.c.incident_id
-                    == claim.intent.incident_id,
+                    action_intents.c.idempotency_key == claim.intent.idempotency_key,
+                    action_intents.c.incident_id == claim.intent.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
-                    action_intents.c.executor_generation
-                    == claim.intent.executor_generation,
-                    action_intents.c.attempt_id
-                    == claim.intent.attempt_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
+                    action_intents.c.executor_generation == claim.intent.executor_generation,
+                    action_intents.c.attempt_id == claim.intent.attempt_id,
                     action_intents.c.status == "dispatched",
                 )
                 .values(
@@ -4525,15 +5014,12 @@ class SqlIncidentStore:
                 preserved_unknown = await connection.execute(
                     update(action_intents)
                     .where(
-                        action_intents.c.idempotency_key
-                        == claim.intent.idempotency_key,
-                        action_intents.c.incident_id
-                        == claim.intent.incident_id,
+                        action_intents.c.idempotency_key == claim.intent.idempotency_key,
+                        action_intents.c.incident_id == claim.intent.incident_id,
                         action_intents.c.cluster_id == claim.cluster_id,
-                        action_intents.c.executor_generation
-                        == claim.intent.executor_generation,
-                        action_intents.c.attempt_id
-                        == claim.intent.attempt_id,
+                        action_intents.c.cluster_generation == claim.cluster_generation,
+                        action_intents.c.executor_generation == claim.intent.executor_generation,
+                        action_intents.c.attempt_id == claim.intent.attempt_id,
                         action_intents.c.status == "unknown",
                     )
                     .values(
@@ -4542,9 +5028,7 @@ class SqlIncidentStore:
                     )
                 )
                 if preserved_unknown.rowcount != 1:
-                    raise ActionIntentConflictError(
-                        "dead letter 无法绑定原始 Action Intent"
-                    )
+                    raise ActionIntentConflictError("dead letter 无法绑定原始 Action Intent")
             else:
                 await self._append_audit_event(
                     connection,
@@ -4561,9 +5045,7 @@ class SqlIncidentStore:
                     subject_type="action_intent",
                     subject_id=claim.intent.idempotency_key,
                     payload={
-                        "executor_generation": (
-                            claim.intent.executor_generation
-                        ),
+                        "executor_generation": (claim.intent.executor_generation),
                         "executor_attempt_id": claim.intent.attempt_id,
                         "reconciliation_generation": claim.generation,
                         "reason_sha256": canonical_payload_hash(error),
@@ -4599,36 +5081,41 @@ class SqlIncidentStore:
     async def _fence_action_reconciliation_claim(
         connection: Any,
         claim: ActionReconciliationClaim,
+        agent_lease: ClusterAgentLeaseToken,
         *,
         now: datetime,
     ) -> None:
+        await SqlIncidentStore._assert_cluster_agent_lease(
+            connection,
+            agent_lease,
+            now=now,
+            required_capability="action.reconcile",
+        )
+        SqlIncidentStore._assert_action_reconciliation_claim_agent_binding(
+            claim,
+            agent_lease,
+        )
         current = (
             await connection.execute(
                 select(action_reconciliation_outbox.c.action_id)
                 .join(
                     action_intents,
-                    action_intents.c.idempotency_key
-                    == action_reconciliation_outbox.c.action_id,
+                    action_intents.c.idempotency_key == action_reconciliation_outbox.c.action_id,
                 )
                 .where(
-                    action_reconciliation_outbox.c.action_id
-                    == claim.intent.idempotency_key,
+                    action_reconciliation_outbox.c.action_id == claim.intent.idempotency_key,
                     action_intents.c.cluster_id == claim.cluster_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claimed_by == claim.owner_id,
-                    action_reconciliation_outbox.c.claim_generation
-                    == claim.generation,
-                    action_reconciliation_outbox.c.attempt_id
-                    == claim.attempt_id,
-                    action_reconciliation_outbox.c.claim_until
-                    > now.isoformat(),
+                    action_reconciliation_outbox.c.claim_generation == claim.generation,
+                    action_reconciliation_outbox.c.attempt_id == claim.attempt_id,
+                    action_reconciliation_outbox.c.claim_until > now.isoformat(),
                 )
             )
         ).scalar_one_or_none()
         if current is None:
-            raise ActionIntentConflictError(
-                "Controller 结果对账领取已过期或被转移"
-            )
+            raise ActionIntentConflictError("Controller 结果对账领取已过期或被转移")
 
     async def cancel_action(
         self,
@@ -4649,19 +5136,33 @@ class SqlIncidentStore:
         self,
         *,
         claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
         reason: str,
     ) -> StoredActionIntent:
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
+            await self._assert_cluster_agent_lease(
+                connection,
+                agent_lease,
+                now=now,
+                required_capability="action.execute",
+            )
+            self._assert_executor_claim_agent_binding(
+                claim,
+                agent_lease,
+            )
             result = await connection.execute(
                 update(action_intents)
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
                     action_intents.c.cluster_id == claim.cluster_id,
+                    action_intents.c.cluster_generation == claim.cluster_generation,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
+                    action_intents.c.executor_session_id == claim.session_id,
+                    action_intents.c.executor_session_generation == claim.session_generation,
                     action_intents.c.status == "dispatched",
                 )
                 .values(
@@ -4676,9 +5177,7 @@ class SqlIncidentStore:
             await self._append_audit_event(
                 connection,
                 incident_id=claim.incident_id,
-                operation_id=(
-                    f"action:{claim.idempotency_key}:unknown:{claim.attempt_id}"
-                ),
+                operation_id=(f"action:{claim.idempotency_key}:unknown:{claim.attempt_id}"),
                 event_type="action.unknown",
                 source_component="executor",
                 actor_type="executor",
@@ -4727,17 +5226,19 @@ class SqlIncidentStore:
                 )
             ).scalar_one_or_none()
             if active is not None:
-                raise LeaseConflictError(
-                    f"incident {incident_id} still has an active worker"
-                )
+                raise LeaseConflictError(f"incident {incident_id} still has an active worker")
             row = (
-                await connection.execute(
-                    select(action_intents)
-                    .where(action_intents.c.incident_id == incident_id)
-                    .order_by(action_intents.c.created_at.desc())
-                    .limit(1)
+                (
+                    await connection.execute(
+                        select(action_intents)
+                        .where(action_intents.c.incident_id == incident_id)
+                        .order_by(action_intents.c.created_at.desc())
+                        .limit(1)
+                    )
                 )
-            ).mappings().one_or_none()
+                .mappings()
+                .one_or_none()
+            )
             if row is None:
                 return None
             if row["status"] in {"claimed", "dispatched"}:
@@ -4747,9 +5248,7 @@ class SqlIncidentStore:
                     else None
                 )
                 if lease_until is not None and lease_until > now:
-                    raise LeaseConflictError(
-                        f"incident {incident_id} still has an active executor"
-                    )
+                    raise LeaseConflictError(f"incident {incident_id} still has an active executor")
             if row["status"] == "claimed":
                 requeued = await connection.execute(
                     update(action_intents)
@@ -4762,6 +5261,8 @@ class SqlIncidentStore:
                         executor_id=None,
                         executor_lease_until=None,
                         attempt_id=None,
+                        executor_session_id=None,
+                        executor_session_generation=None,
                         updated_at=now.isoformat(),
                     )
                 )
@@ -4770,8 +5271,7 @@ class SqlIncidentStore:
                         (
                             await connection.execute(
                                 select(action_intents).where(
-                                    action_intents.c.idempotency_key
-                                    == row["idempotency_key"]
+                                    action_intents.c.idempotency_key == row["idempotency_key"]
                                 )
                             )
                         )
@@ -4785,14 +5285,13 @@ class SqlIncidentStore:
                     "executor_id": None,
                     "executor_lease_until": None,
                     "attempt_id": None,
+                    "executor_session_id": None,
+                    "executor_session_generation": None,
                 }
                 await self._append_audit_event(
                     connection,
                     incident_id=incident_id,
-                    operation_id=(
-                        f"action:{row['idempotency_key']}:requeued:"
-                        f"{now.isoformat()}"
-                    ),
+                    operation_id=(f"action:{row['idempotency_key']}:requeued:{now.isoformat()}"),
                     event_type="action.requeued",
                     source_component="api",
                     actor_type="system",
@@ -4822,8 +5321,7 @@ class SqlIncidentStore:
                         (
                             await connection.execute(
                                 select(action_intents).where(
-                                    action_intents.c.idempotency_key
-                                    == row["idempotency_key"]
+                                    action_intents.c.idempotency_key == row["idempotency_key"]
                                 )
                             )
                         )
@@ -4964,6 +5462,198 @@ class SqlIncidentStore:
         if value.tzinfo is None:
             return value.replace(tzinfo=UTC)
         return value.astimezone(UTC)
+
+    @staticmethod
+    def _validate_cluster_registration_input(
+        *,
+        cluster_id: str,
+        display_name: str,
+        default_namespace: str,
+    ) -> None:
+        if CLUSTER_ID_PATTERN.fullmatch(cluster_id) is None:
+            raise ValueError("cluster_id 必须是有效的 DNS label")
+        if not 1 <= len(display_name) <= 128:
+            raise ValueError("集群显示名称长度必须为 1 到 128")
+        if not 1 <= len(default_namespace) <= 253:
+            raise ValueError("默认 namespace 长度必须为 1 到 253")
+
+    @staticmethod
+    def _validate_cluster_agent_input(
+        *,
+        cluster_id: str,
+        instance_id: str,
+        session_id: str,
+        version: str,
+        ttl_seconds: float,
+    ) -> None:
+        if CLUSTER_ID_PATTERN.fullmatch(cluster_id) is None:
+            raise ValueError("cluster_id 必须是有效的 DNS label")
+        if not 1 <= len(instance_id) <= 200:
+            raise ValueError("instance_id 长度必须为 1 到 200")
+        if not 1 <= len(session_id) <= 64:
+            raise ValueError("session_id 长度必须为 1 到 64")
+        if not 1 <= len(version) <= 128:
+            raise ValueError("Agent version 长度必须为 1 到 128")
+        if ttl_seconds <= 0:
+            raise ValueError("集群 Agent 租约 TTL 必须为正数")
+
+    @staticmethod
+    def _normalize_capabilities(
+        capabilities: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if any(not isinstance(value, str) or not 1 <= len(value) <= 100 for value in capabilities):
+            raise ValueError("Agent capability 必须是 1 到 100 字符的字符串")
+        return tuple(sorted(set(capabilities)))
+
+    async def _get_cluster_registration(
+        self,
+        cluster_id: str,
+    ) -> ClusterRegistration | None:
+        async with self.engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        select(cluster_registrations).where(
+                            cluster_registrations.c.cluster_id == cluster_id
+                        )
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return self._stored_cluster_registration(row) if row else None
+
+    @staticmethod
+    async def _assert_cluster_agent_lease(
+        connection: Any,
+        token: ClusterAgentLeaseToken,
+        *,
+        now: datetime,
+        required_capability: str | None,
+    ) -> None:
+        row = (
+            (
+                await connection.execute(
+                    select(
+                        cluster_agent_leases,
+                        cluster_registrations.c.lifecycle.label("cluster_lifecycle"),
+                        cluster_registrations.c.routing_generation.label(
+                            "cluster_routing_generation"
+                        ),
+                    )
+                    .join(
+                        cluster_registrations,
+                        cluster_registrations.c.cluster_id == cluster_agent_leases.c.cluster_id,
+                    )
+                    .where(
+                        cluster_agent_leases.c.cluster_id == token.cluster_id,
+                        cluster_agent_leases.c.instance_id == token.instance_id,
+                        cluster_agent_leases.c.session_id == token.session_id,
+                        cluster_agent_leases.c.generation == token.generation,
+                        cluster_agent_leases.c.routing_generation == token.routing_generation,
+                        cluster_agent_leases.c.status == "active",
+                        cluster_agent_leases.c.lease_until > now.isoformat(),
+                        cluster_registrations.c.lifecycle == "active",
+                        cluster_registrations.c.routing_generation == token.routing_generation,
+                    )
+                    .with_for_update(read=True)
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise ClusterAgentLeaseConflictError("集群 Agent Session 已过期、关闭或被 fencing")
+        capabilities = tuple(row["capabilities"])
+        if required_capability is not None and required_capability not in capabilities:
+            raise ClusterAgentLeaseConflictError(
+                f"集群 Agent 缺少 {required_capability} capability"
+            )
+        if capabilities != token.capabilities or row["version"] != token.version:
+            raise ClusterAgentLeaseConflictError("集群 Agent Token 元数据与持久化 Session 不一致")
+
+    @staticmethod
+    def _assert_executor_claim_agent_binding(
+        claim: ExecutorClaim,
+        agent_lease: ClusterAgentLeaseToken,
+    ) -> None:
+        if (
+            claim.cluster_id != agent_lease.cluster_id
+            or claim.cluster_generation != agent_lease.routing_generation
+            or claim.session_id != agent_lease.session_id
+            or claim.session_generation != agent_lease.generation
+        ):
+            raise ClusterAgentLeaseConflictError("Executor claim 与集群 Agent Session 不一致")
+
+    @staticmethod
+    def _assert_action_reconciliation_claim_agent_binding(
+        claim: ActionReconciliationClaim,
+        agent_lease: ClusterAgentLeaseToken,
+    ) -> None:
+        if (
+            claim.cluster_id != agent_lease.cluster_id
+            or claim.cluster_generation != agent_lease.routing_generation
+            or claim.session_id != agent_lease.session_id
+            or claim.session_generation != agent_lease.generation
+        ):
+            raise ClusterAgentLeaseConflictError(
+                "Controller 结果对账 claim 与集群 Agent Session 不一致"
+            )
+
+    @staticmethod
+    def _stored_cluster_registration(row: Any) -> ClusterRegistration:
+        return ClusterRegistration(
+            cluster_id=row["cluster_id"],
+            display_name=row["display_name"],
+            default_namespace=row["default_namespace"],
+            routing_generation=int(row["routing_generation"]),
+            lifecycle=row["lifecycle"],
+            metadata_state=row["metadata_state"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _stored_cluster_agent_lease(
+        row: Any,
+        *,
+        now: datetime,
+    ) -> ClusterAgentLease:
+        online = row["status"] == "active" and datetime.fromisoformat(row["lease_until"]) > now
+        return ClusterAgentLease(
+            cluster_id=row["cluster_id"],
+            instance_id=row["instance_id"],
+            session_id=row["session_id"],
+            generation=int(row["generation"]),
+            routing_generation=int(row["routing_generation"]),
+            capabilities=tuple(row["capabilities"]),
+            version=row["version"],
+            registered_at=datetime.fromisoformat(row["registered_at"]),
+            last_seen_at=datetime.fromisoformat(row["last_seen_at"]),
+            lease_until=datetime.fromisoformat(row["lease_until"]),
+            status=row["status"],
+            connection_status="online" if online else "offline",
+        )
+
+    @classmethod
+    def _stored_cluster_connection(
+        cls,
+        registration: Any,
+        leases: list[Any],
+        *,
+        now: datetime,
+    ) -> ClusterConnection:
+        agents = tuple(cls._stored_cluster_agent_lease(row, now=now) for row in leases)
+        online = registration["lifecycle"] == "active" and any(
+            agent.connection_status == "online"
+            and agent.routing_generation == int(registration["routing_generation"])
+            for agent in agents
+        )
+        return ClusterConnection(
+            registration=cls._stored_cluster_registration(registration),
+            status="online" if online else "offline",
+            agents=agents,
+        )
 
     @staticmethod
     async def _bump_anchor_inventory_epoch(
@@ -5180,12 +5870,11 @@ class SqlIncidentStore:
             idempotency_key=row["idempotency_key"],
             incident_id=row["incident_id"],
             cluster_id=row["cluster_id"],
+            cluster_generation=int(row["cluster_generation"]),
             lease_generation=int(row["lease_generation"]),
             approval_id=row["approval_id"],
             approval_version=(
-                int(row["approval_version"])
-                if row["approval_version"] is not None
-                else None
+                int(row["approval_version"]) if row["approval_version"] is not None else None
             ),
             action=RemediationAction.model_validate(row["action"]),
             precondition=row["precondition"],
@@ -5200,6 +5889,12 @@ class SqlIncidentStore:
                 else None
             ),
             attempt_id=row["attempt_id"],
+            executor_session_id=row["executor_session_id"],
+            executor_session_generation=(
+                int(row["executor_session_generation"])
+                if row["executor_session_generation"] is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -5541,6 +6236,7 @@ class SqlIncidentStore:
             published_at=_stored_time(row["published_at"]),
             receipt=row["receipt"],
         )
+
     async def _append_events(self, connection: Any, record: IncidentRecord) -> None:
         existing = int(
             (

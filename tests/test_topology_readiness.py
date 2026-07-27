@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import stat
@@ -198,8 +199,58 @@ def test_topology_manifests_keep_api_and_executor_separate() -> None:
     assert migration["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
 
     executor_container = executor["spec"]["template"]["spec"]["containers"][0]
+    executor_env = {
+        item["name"]: item for item in executor_container["env"]
+    }
+    assert executor_env["SENTINELOPS_EXECUTOR_INSTANCE_ID"]["valueFrom"][
+        "fieldRef"
+    ]["fieldPath"] == "metadata.uid"
     for probe_name in ("startupProbe", "readinessProbe", "livenessProbe"):
         assert executor_container[probe_name]["timeoutSeconds"] >= 5
+
+
+def test_controller_e2e_intent_carries_registry_fence_identity() -> None:
+    script = (SCRIPTS / "e2e-remediation-controller.py").read_text(encoding="utf-8")
+    tree = ast.parse(script)
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "StoredActionIntent"
+    ]
+    assert len(constructors) == 1
+    keywords = {
+        keyword.arg for keyword in constructors[0].keywords if keyword.arg is not None
+    }
+    assert {
+        "cluster_generation",
+        "executor_session_id",
+        "executor_session_generation",
+    } <= keywords
+
+
+def test_controller_e2e_replacement_uses_authoritative_cluster_identity() -> None:
+    script = (SCRIPTS / "e2e-remediation-controller.py").read_text(encoding="utf-8")
+    tree = ast.parse(script)
+    constructors = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ExecutorWorker"
+    ]
+    assert len(constructors) == 1
+    keywords = {
+        keyword.arg for keyword in constructors[0].keywords if keyword.arg is not None
+    }
+    assert {
+        "cluster_id",
+        "cluster_display_name",
+        "default_namespace",
+        "instance_id",
+        "session_id",
+    } <= keywords
 
 
 def test_topology_rbac_keeps_api_readonly_and_executor_narrowly_writable() -> None:

@@ -149,6 +149,11 @@ spec:
                   key: audit-hmac-key
             - name: SENTINELOPS_EXECUTOR_HEALTH_FILE
               value: /var/run/sentinelops/health/heartbeat
+            - name: SENTINELOPS_EXECUTOR_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.uid
           startupProbe:
             exec:
               command:

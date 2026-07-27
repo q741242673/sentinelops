@@ -84,6 +84,29 @@ describe("endpoint request timeouts", () => {
     expect(fetch).toHaveBeenNthCalledWith(2, "/api/v1/demo/resets/reset-1", expect.any(Object));
   });
 
+  it("loads the center cluster directory from the registry endpoint", async () => {
+    const directory = [{
+      cluster_id: "prod-a",
+      display_name: "生产集群 A",
+      default_namespace: "payments",
+      connection_status: "online",
+      routing_generation: 3,
+      active_executors: 2,
+      last_seen_at: "2026-07-27T08:00:00Z",
+      lease_expires_at: "2026-07-27T08:01:00Z",
+      capabilities: ["investigate", "remediate"],
+      executors: [],
+    }];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(directory), {
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
+
+    await expect(api.listClusters()).resolves.toEqual(directory);
+    expect(fetch).toHaveBeenCalledWith("/api/v1/clusters", expect.any(Object));
+  });
+
   it("explains that a reset submission may already be running when its response times out", async () => {
     vi.stubGlobal("fetch", pendingFetch());
 

@@ -248,6 +248,22 @@ class Settings(BaseSettings):
         ge=0,
         le=600,
     )
+    executor_instance_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9](?:[-A-Za-z0-9._:]{0,126}[A-Za-z0-9])?$",
+    )
+    executor_registry_ttl_seconds: float = Field(
+        default=60.0,
+        ge=10,
+        le=600,
+    )
+    executor_registry_heartbeat_seconds: float = Field(
+        default=15.0,
+        ge=1,
+        le=120,
+    )
     executor_health_file: str | None = None
 
     @model_validator(mode="after")
@@ -263,6 +279,14 @@ class Settings(BaseSettings):
         }:
             raise ValueError(
                 "生产环境必须配置稳定且唯一的 SENTINELOPS_CLUSTER_ID"
+            )
+        if (
+            self.executor_registry_heartbeat_seconds
+            > self.executor_registry_ttl_seconds / 3
+        ):
+            raise ValueError(
+                "SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS "
+                "不能超过 registry TTL 的三分之一"
             )
         return self
 

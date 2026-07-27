@@ -178,6 +178,7 @@ def _intent(
         idempotency_key="a" * 64,
         incident_id="incident-01",
         cluster_id="prod-cluster-a",
+        cluster_generation=1,
         lease_generation=2,
         approval_id="approval-01" if approval else None,
         approval_version=3 if approval else None,
@@ -196,6 +197,8 @@ def _intent(
         executor_generation=1,
         executor_lease_until=datetime(2026, 7, 26, 6, 10, tzinfo=UTC),
         attempt_id="attempt-01",
+        executor_session_id="executor-session-a",
+        executor_session_generation=1,
     )
 
 

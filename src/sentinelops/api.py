@@ -67,6 +67,7 @@ from sentinelops.storage import (
     AuditAnchorUnlockDecision,
     AuditAnchorUnlockRequest,
     ChangeProposalConflictError,
+    ClusterConnection,
     DurableActionJournal,
     IncidentStore,
     LeaseConflictError,
@@ -283,6 +284,30 @@ class RuntimeInfo(BaseModel):
     namespace: str
     approval_mode: str = "human_gated"
     alert_ingestion: str = "alertmanager_webhook"
+
+
+class ClusterExecutorView(BaseModel):
+    instance_id: str
+    session_id: str
+    generation: int
+    version: str
+    capabilities: list[str]
+    connection_status: Literal["online", "offline"]
+    last_seen_at: datetime
+    lease_expires_at: datetime
+
+
+class ClusterConnectionView(BaseModel):
+    cluster_id: str
+    display_name: str
+    default_namespace: str
+    connection_status: Literal["online", "offline"]
+    routing_generation: int
+    active_executors: int
+    last_seen_at: datetime | None
+    lease_expires_at: datetime | None
+    capabilities: list[str]
+    executors: list[ClusterExecutorView]
 
 
 class AlertmanagerAlert(BaseModel):
@@ -706,6 +731,11 @@ async def initialize_persistence(
             await store.setup()
         else:
             await require_current_schema(store)
+        await store.ensure_cluster_registration(
+            cluster_id=settings.cluster_id,
+            display_name=settings.cluster_display_name,
+            default_namespace=settings.kubernetes_namespace,
+        )
         if (
             settings.audit_anchor_enforcement_required
             and await store.audit_anchor_security_state() is None
@@ -790,6 +820,9 @@ async def initialize_persistence(
             ),
             owner_id=f"embedded-executor:{worker_id}",
             cluster_id=settings.cluster_id,
+            cluster_display_name=settings.cluster_display_name,
+            default_namespace=settings.kubernetes_namespace,
+            instance_id=f"embedded-executor:{worker_id}",
             remediation_gateway=(
                 KubernetesRemediationGateway(
                     settings.kubernetes_namespace,
@@ -804,6 +837,10 @@ async def initialize_persistence(
             poll_interval_seconds=settings.executor_poll_interval_seconds,
             missing_contract_grace_seconds=(
                 settings.executor_missing_contract_grace_seconds
+            ),
+            registry_ttl_seconds=settings.executor_registry_ttl_seconds,
+            registry_heartbeat_seconds=(
+                settings.executor_registry_heartbeat_seconds
             ),
         )
         embedded_executor_task = asyncio.create_task(executor.run_forever())
@@ -956,6 +993,7 @@ async def _reconcile_stored_incident(
 async def _reconcile_persistence_once() -> None:
     if incident_store is None:
         return
+    await incident_store.reap_expired_action_claims()
     settings = get_settings()
     for stored in await incident_store.list_recoverable(
         cluster_id=settings.cluster_id
@@ -2112,6 +2150,81 @@ async def get_runtime() -> RuntimeInfo:
         namespace=settings.kubernetes_namespace,
         approval_mode="risk_based",
     )
+
+
+def _cluster_connection_view(
+    connection: ClusterConnection,
+) -> ClusterConnectionView:
+    registration = connection.registration
+    agents = sorted(
+        connection.agents,
+        key=lambda item: (item.instance_id, item.generation),
+    )
+    active = [
+        item for item in agents if item.connection_status == "online"
+    ]
+    all_last_seen = [item.last_seen_at for item in agents]
+    active_lease_expiries = [item.lease_until for item in active]
+    visible_lease_expiries = active_lease_expiries or [
+        item.lease_until for item in agents
+    ]
+    return ClusterConnectionView(
+        cluster_id=registration.cluster_id,
+        display_name=registration.display_name,
+        default_namespace=registration.default_namespace,
+        connection_status=connection.status,
+        routing_generation=registration.routing_generation,
+        active_executors=len(active),
+        last_seen_at=max(all_last_seen) if all_last_seen else None,
+        lease_expires_at=(
+            max(visible_lease_expiries)
+            if visible_lease_expiries
+            else None
+        ),
+        capabilities=sorted(
+            {
+                capability
+                for agent in active
+                for capability in agent.capabilities
+            }
+        ),
+        executors=[
+            ClusterExecutorView(
+                instance_id=agent.instance_id,
+                session_id=agent.session_id,
+                generation=agent.generation,
+                version=agent.version,
+                capabilities=list(agent.capabilities),
+                connection_status=agent.connection_status,
+                last_seen_at=agent.last_seen_at,
+                lease_expires_at=agent.lease_until,
+            )
+            for agent in agents
+        ],
+    )
+
+
+@app.get("/api/v1/clusters", response_model=list[ClusterConnectionView])
+async def list_cluster_connections() -> list[ClusterConnectionView]:
+    if incident_store is None:
+        return []
+    return [
+        _cluster_connection_view(connection)
+        for connection in await incident_store.list_cluster_connections()
+    ]
+
+
+@app.get(
+    "/api/v1/clusters/{cluster_id}",
+    response_model=ClusterConnectionView,
+)
+async def get_cluster_connection(cluster_id: str) -> ClusterConnectionView:
+    if incident_store is None:
+        raise HTTPException(status_code=404, detail="集群尚未注册")
+    connection = await incident_store.get_cluster_connection(cluster_id)
+    if connection is None:
+        raise HTTPException(status_code=404, detail="集群尚未注册")
+    return _cluster_connection_view(connection)
 
 
 @app.get("/api/v1/incidents/events")

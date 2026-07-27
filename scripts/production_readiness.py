@@ -68,6 +68,27 @@ def _store(database_url: str) -> SqlIncidentStore:
     )
 
 
+async def _executor_agent(
+    store: SqlIncidentStore,
+    *,
+    identity: str,
+):
+    await store.ensure_cluster_registration(
+        cluster_id=CLUSTER_ID,
+        display_name="Production readiness cluster",
+        default_namespace="sentinelops-benchmark",
+    )
+    identity_hash = hashlib.sha256(identity.encode()).hexdigest()[:32]
+    return await store.register_cluster_agent(
+        cluster_id=CLUSTER_ID,
+        instance_id=f"benchmark-executor-{identity_hash}",
+        session_id=f"benchmark-{identity_hash}",
+        capabilities=("action.execute", "action.reconcile"),
+        version="production-readiness",
+        ttl_seconds=120,
+    )
+
+
 def _record(run_id: str, scenario: str, trial: int) -> IncidentRecord:
     return IncidentRecord(
         alert=Alert(
@@ -321,6 +342,16 @@ async def _executor_single_claim(
     observations: list[Observation] = []
     try:
         for trial in range(rounds):
+            contenders = [
+                (
+                    stores[index % len(stores)],
+                    await _executor_agent(
+                        stores[index % len(stores)],
+                        identity=f"{run_id}-{trial}-{index}",
+                    ),
+                )
+                for index in range(concurrency)
+            ]
             record, idempotency_key = await _prepare_intent(
                 stores[0],
                 run_id,
@@ -330,15 +361,15 @@ async def _executor_single_claim(
             started = perf_counter()
             claims = await asyncio.gather(
                 *[
-                    stores[index % len(stores)].claim_action_execution(
-                        cluster_id=CLUSTER_ID,
+                    contender_store.claim_action_execution(
+                        agent_lease=agent_lease,
                         owner_id=f"executor-{run_id}-{trial}-{index}",
                         attempt_id=(
                             f"exact-{run_id[:8]}-{trial}-{index}"
                         ),
                         ttl_seconds=60,
                     )
-                    for index in range(concurrency)
+                    for index, (contender_store, agent_lease) in enumerate(contenders)
                 ]
             )
             latency_ms = (perf_counter() - started) * 1_000
@@ -349,9 +380,17 @@ async def _executor_single_claim(
                 and winners[0].incident_id == record.id
             )
             if len(winners) == 1:
-                await stores[0].mark_action_dispatched(winners[0])
-                await stores[0].complete_action(
+                winner_index = next(
+                    index for index, claim in enumerate(claims) if claim is not None
+                )
+                winner_store, winner_agent = contenders[winner_index]
+                await winner_store.mark_action_dispatched(
+                    winners[0],
+                    agent_lease=winner_agent,
+                )
+                await winner_store.complete_action(
                     claim=winners[0],
+                    agent_lease=winner_agent,
                     result=ToolResult(
                         tool_name="restart_deployment",
                         success=True,
@@ -389,6 +428,14 @@ async def _executor_crash_recovery(
     observations: list[Observation] = []
     try:
         for trial in range(rounds):
+            stale_agent = await _executor_agent(
+                first,
+                identity=f"{run_id}-{trial}-stale",
+            )
+            successor_agent = await _executor_agent(
+                second,
+                identity=f"{run_id}-{trial}-successor",
+            )
             _record_value, idempotency_key = await _prepare_intent(
                 first,
                 run_id,
@@ -396,7 +443,7 @@ async def _executor_crash_recovery(
                 trial,
             )
             stale = await first.claim_action_execution(
-                cluster_id=CLUSTER_ID,
+                agent_lease=stale_agent,
                 owner_id=f"executor-a-{run_id}-{trial}",
                 attempt_id=f"crash-a-{run_id[:8]}-{trial}",
                 ttl_seconds=60,
@@ -418,7 +465,7 @@ async def _executor_crash_recovery(
                 )
             started = perf_counter()
             successor = await second.claim_action_execution(
-                cluster_id=CLUSTER_ID,
+                agent_lease=successor_agent,
                 owner_id=f"executor-b-{run_id}-{trial}",
                 attempt_id=f"crash-b-{run_id[:8]}-{trial}",
                 ttl_seconds=60,
@@ -426,13 +473,20 @@ async def _executor_crash_recovery(
             latency_ms = (perf_counter() - started) * 1_000
             stale_blocked = False
             try:
-                await first.mark_action_dispatched(stale)
+                await first.mark_action_dispatched(
+                    stale,
+                    agent_lease=stale_agent,
+                )
             except ActionIntentConflictError:
                 stale_blocked = True
             if successor is not None:
-                await second.mark_action_dispatched(successor)
+                await second.mark_action_dispatched(
+                    successor,
+                    agent_lease=successor_agent,
+                )
                 await second.complete_action(
                     claim=successor,
+                    agent_lease=successor_agent,
                     result=ToolResult(
                         tool_name="restart_deployment",
                         success=True,

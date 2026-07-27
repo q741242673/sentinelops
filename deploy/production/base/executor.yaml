@@ -48,6 +48,11 @@ spec:
             - configMapRef:
                 name: sentinelops-runtime
           env:
+            - name: SENTINELOPS_EXECUTOR_INSTANCE_ID
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.uid
             - name: SENTINELOPS_EXECUTOR_HEALTH_FILE
               value: /var/run/sentinelops/health/heartbeat
           startupProbe:
@@ -55,7 +60,7 @@ spec:
               command:
                 - sentinelops-executor-health
                 - --max-age-seconds
-                - "120"
+                - "60"
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 36
@@ -64,7 +69,7 @@ spec:
               command:
                 - sentinelops-executor-health
                 - --max-age-seconds
-                - "120"
+                - "60"
             periodSeconds: 20
             timeoutSeconds: 3
             failureThreshold: 3
@@ -73,7 +78,7 @@ spec:
               command:
                 - sentinelops-executor-health
                 - --max-age-seconds
-                - "120"
+                - "60"
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 2

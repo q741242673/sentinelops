@@ -154,7 +154,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .console-layout {
   min-height: calc(100vh - 64px);
   display: grid;
-  grid-template-columns: 244px minmax(0, 1fr);
+  grid-template-columns: 286px minmax(0, 1fr);
 }
 .incident-queue { border-right: 1px solid var(--line); background: #0e110f; }
 .queue-heading {
@@ -171,6 +171,83 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   letter-spacing: 0.07em;
 }
 .queue-heading b { min-width: 20px; padding: 3px 6px; border-radius: 9px; color: var(--faint); background: var(--surface-3); font-size: 8px; text-align: center; }
+.cluster-directory { padding: 9px 8px 8px; border-bottom: 1px solid var(--line); }
+.cluster-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.cluster-summary button, .cluster-summary > span {
+  min-width: 0;
+  min-height: 25px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--faint);
+  background: var(--surface);
+  font-size: 7px;
+  white-space: nowrap;
+}
+.cluster-summary button { cursor: pointer; }
+.cluster-summary button:hover, .cluster-summary button.active {
+  border-color: rgba(98, 216, 156, 0.42);
+  color: var(--green);
+  background: var(--green-soft);
+}
+.cluster-summary b { color: #aeb7b2; font-size: 8px; }
+.cluster-summary i {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--red);
+}
+.cluster-summary i.online { background: var(--green); }
+.cluster-directory > p {
+  margin: 7px 3px 6px;
+  color: #59615c;
+  font-size: 7px;
+  line-height: 1.45;
+}
+.cluster-list { max-height: 190px; display: grid; gap: 3px; overflow-y: auto; }
+.cluster-list > button {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 7px minmax(0, 0.75fr) minmax(105px, 1fr);
+  gap: 7px;
+  align-items: center;
+  padding: 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.cluster-list > button:hover { background: rgba(255,255,255,0.018); }
+.cluster-list > button.active { border-color: var(--line-strong); background: var(--surface-2); }
+.cluster-list > button > i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+}
+.cluster-list > button > i.online {
+  background: var(--green);
+  box-shadow: 0 0 7px rgba(98, 216, 156, 0.35);
+}
+.cluster-list > button > span { min-width: 0; }
+.cluster-list strong, .cluster-list small, .cluster-meta b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cluster-list strong { color: #c5cdc8; font-size: 8px; font-weight: 650; }
+.cluster-list small { margin-top: 3px; color: var(--faint); font-size: 7px; }
+.cluster-meta { text-align: right; }
+.cluster-meta b { color: var(--muted); font-size: 7px; font-weight: 600; }
+.cluster-list > button > i.online ~ .cluster-meta b { color: var(--green); }
 .queue-list { padding: 8px; }
 .queue-empty { padding: 16px 7px; color: var(--faint); font-size: 9px; }
 .queue-item {
@@ -353,7 +430,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .mode-switch { grid-template-columns: repeat(3, 1fr); }
   .launcher-action { justify-content: space-between; }
   .launcher-message { text-align: left; }
-  .console-layout { grid-template-columns: 210px minmax(0, 1fr); }
+  .console-layout { grid-template-columns: 250px minmax(0, 1fr); }
   .workspace-grid { grid-template-columns: 1fr; }
   .result-panel { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .audit-details { grid-column: 1 / -1; }
@@ -367,6 +444,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   .mode-switch button { min-height: 44px; }
   .console-layout { display: block; }
   .incident-queue { border-right: 0; border-bottom: 1px solid var(--line); }
+  .cluster-directory { padding-right: 16px; padding-left: 16px; }
+  .cluster-list { max-height: none; display: flex; overflow-x: auto; overflow-y: hidden; }
+  .cluster-list > button { min-width: 245px; }
   .queue-list { display: flex; overflow-x: auto; }
   .queue-item { min-width: 220px; }
   .incident-workspace { padding: 18px 15px 35px; }

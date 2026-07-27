@@ -25,10 +25,34 @@ def _database_url(tmp_path) -> str:
     return f"sqlite+aiosqlite:///{tmp_path / 'sentinelops.db'}"
 
 
-async def _paused_incident():
-    agent = build_agent(
-        Settings(tool_backend="simulator", model_provider="rule_based")
+async def _cluster_agent(
+    store: SqlIncidentStore,
+    *,
+    cluster_id: str = "local",
+    suffix: str = "default",
+):
+    default_settings = Settings()
+    await store.ensure_cluster_registration(
+        cluster_id=cluster_id,
+        display_name=(
+            default_settings.cluster_display_name
+            if cluster_id == default_settings.cluster_id
+            else f"{cluster_id} test cluster"
+        ),
+        default_namespace=default_settings.kubernetes_namespace,
     )
+    return await store.register_cluster_agent(
+        cluster_id=cluster_id,
+        instance_id=f"executor-{suffix}",
+        session_id=f"session-{cluster_id}-{suffix}",
+        capabilities=("action.execute", "action.reconcile"),
+        version="test",
+        ttl_seconds=60,
+    )
+
+
+async def _paused_incident():
+    agent = build_agent(Settings(tool_backend="simulator", model_provider="rule_based"))
     record = await agent.start(
         Alert(
             name="HighOrderServiceErrorRate",
@@ -48,6 +72,11 @@ async def _queued_cluster_intent(
     cluster_id: str,
     key_character: str,
 ):
+    await _cluster_agent(
+        store,
+        cluster_id=cluster_id,
+        suffix=f"route-{key_character}",
+    )
     _, record = await _paused_incident()
     record.alert = record.alert.model_copy(update={"cluster_id": cluster_id})
     assert record.approval is not None
@@ -86,16 +115,23 @@ async def _enqueue_claim_dispatch(
     ttl_seconds: float = 60,
 ):
     await store.enqueue_action(lease, idempotency_key=idempotency_key)
+    agent_lease = await _cluster_agent(
+        store,
+        suffix=owner_id,
+    )
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent_lease,
         owner_id=owner_id,
         attempt_id=f"attempt-{idempotency_key[:16]}",
         ttl_seconds=ttl_seconds,
     )
     assert claim is not None
     assert claim.idempotency_key == idempotency_key
-    await store.mark_action_dispatched(claim)
-    return claim
+    await store.mark_action_dispatched(
+        claim,
+        agent_lease=agent_lease,
+    )
+    return claim, agent_lease
 
 
 @pytest.mark.asyncio
@@ -138,9 +174,7 @@ async def test_store_rejects_stale_snapshot_overwrite(tmp_path) -> None:
     assert stale is not None
 
     current_record = created.record.model_copy(deep=True)
-    current_record.timeline.append(
-        TimelineEvent(type="worker.current", message="newer worker won")
-    )
+    current_record.timeline.append(TimelineEvent(type="worker.current", message="newer worker won"))
     current = await first.save(
         current_record,
         expected_version=created.version,
@@ -186,9 +220,7 @@ async def test_paused_approval_resumes_after_process_restart_once(tmp_path) -> N
     await second_store.setup()
     loaded = await second_store.get(record.id)
     assert loaded is not None and loaded.graph_state is not None
-    restored_agent = build_agent(
-        Settings(tool_backend="simulator", model_provider="rule_based")
-    )
+    restored_agent = build_agent(Settings(tool_backend="simulator", model_provider="rule_based"))
     await restored_agent.restore(loaded.record, loaded.graph_state)
 
     await second_store.claim_approval(
@@ -291,9 +323,7 @@ async def test_expired_approval_is_closed_without_user_interaction(tmp_path) -> 
         assert recovered.timeline[-1].data["execution_outcome"] == "not_dispatched"
         assert api_module.incident_store is not None
         assert (
-            await api_module.incident_store.approval_status(
-                record.approval.approval_id
-            )
+            await api_module.incident_store.approval_status(record.approval.approval_id)
             == "expired"
         )
     finally:
@@ -500,14 +530,18 @@ async def test_action_intent_records_dispatch_and_result_before_incident_termina
     assert prepared.status == "prepared"
 
     await store.enqueue_action(lease, idempotency_key=prepared.idempotency_key)
+    agent_lease = await _cluster_agent(store, suffix="intent-contract")
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent_lease,
         owner_id="executor-a",
         attempt_id="attempt-a",
         ttl_seconds=60,
     )
     assert claim is not None
-    dispatched = await store.mark_action_dispatched(claim)
+    dispatched = await store.mark_action_dispatched(
+        claim,
+        agent_lease=agent_lease,
+    )
     assert dispatched.status == "dispatched"
     result = ToolResult(
         tool_name=record.approval.action.tool_name,
@@ -516,13 +550,17 @@ async def test_action_intent_records_dispatch_and_result_before_incident_termina
     )
     completed = await store.complete_action(
         claim=claim,
+        agent_lease=agent_lease,
         result=result,
     )
 
     assert completed.status == "succeeded"
     assert completed.result == result
     with pytest.raises(ActionIntentConflictError):
-        await store.mark_action_dispatched(claim)
+        await store.mark_action_dispatched(
+            claim,
+            agent_lease=agent_lease,
+        )
     await store.close()
 
 
@@ -573,7 +611,7 @@ async def test_prepared_intent_can_be_fenced_and_reassigned_before_dispatch(
     assert reassigned.lease_generation == second.generation
     with pytest.raises(LeaseConflictError):
         await store.enqueue_action(first, idempotency_key=prepared.idempotency_key)
-    claim = await _enqueue_claim_dispatch(
+    claim, _ = await _enqueue_claim_dispatch(
         store,
         second,
         prepared.idempotency_key,
@@ -627,7 +665,7 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
         action=record.approval.action,
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
-    claim = await _enqueue_claim_dispatch(
+    claim, agent_lease = await _enqueue_claim_dispatch(
         before_crash,
         lease,
         intent.idempotency_key,
@@ -637,6 +675,7 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
     if complete_before_crash:
         await before_crash.complete_action(
             claim=claim,
+            agent_lease=agent_lease,
             result=ToolResult(
                 tool_name=record.approval.action.tool_name,
                 success=True,
@@ -653,13 +692,8 @@ async def test_startup_recovers_durable_action_boundary_without_replaying_write(
         recovered = api_module.incident_records[record.id]
         assert recovered.status == IncidentStatus.ESCALATED
         assert recovered.timeline[-1].data["execution_outcome"] == expected_outcome
-        assert (
-            recovered.timeline[-1].data["action_intent_status"]
-            == expected_intent_status
-        )
-        assert len(recovered.execution_results) == (
-            1 if complete_before_crash else 0
-        )
+        assert recovered.timeline[-1].data["action_intent_status"] == expected_intent_status
+        assert len(recovered.execution_results) == (1 if complete_before_crash else 0)
         assert record.id not in api_module.incident_agents
     finally:
         await api_module.shutdown_persistence()
@@ -713,15 +747,19 @@ async def test_durable_resolved_state_blocks_dispatch_across_replicas(tmp_path) 
         graph_state=None,
     )
 
+    agent_lease = await _cluster_agent(worker, suffix="resolved-race")
     claim = await worker.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent_lease,
         owner_id="executor-a",
         attempt_id="resolved-before-dispatch",
         ttl_seconds=60,
     )
     assert claim is not None
     with pytest.raises(ActionIntentConflictError):
-        await worker.mark_action_dispatched(claim)
+        await worker.mark_action_dispatched(
+            claim,
+            agent_lease=agent_lease,
+        )
     current_intent = await worker.latest_action_intent(record.id)
     assert current_intent is not None
     assert current_intent.status == "claimed"
@@ -868,9 +906,7 @@ async def test_crashed_live_lease_is_reconciled_after_ttl_without_restart(
 
     await api_module.initialize_persistence(SqlIncidentStore(url))
     try:
-        assert api_module.incident_records[record.id].status == (
-            IncidentStatus.AWAITING_APPROVAL
-        )
+        assert api_module.incident_records[record.id].status == (IncidentStatus.AWAITING_APPROVAL)
         assert "killed-worker" in api_module.incident_recovery_errors[record.id]
 
         await asyncio.sleep(2.1)
@@ -918,7 +954,7 @@ async def test_resolved_after_dispatch_preserves_late_durable_result(tmp_path) -
         action=record.approval.action,
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
-    claim = await _enqueue_claim_dispatch(
+    claim, agent_lease = await _enqueue_claim_dispatch(
         store,
         lease,
         intent.idempotency_key,
@@ -941,6 +977,7 @@ async def test_resolved_after_dispatch_preserves_late_durable_result(tmp_path) -
     )
     await store.complete_action(
         claim=claim,
+        agent_lease=agent_lease,
         result=result,
     )
     await store.release_lease(lease)
@@ -1003,9 +1040,7 @@ async def test_recoverable_incidents_are_filtered_by_cluster(tmp_path) -> None:
     record_b = record_a.model_copy(
         update={
             "id": "cluster-b-recoverable",
-            "alert": record_a.alert.model_copy(
-                update={"cluster_id": "cluster-b"}
-            ),
+            "alert": record_a.alert.model_copy(update={"cluster_id": "cluster-b"}),
         },
         deep=True,
     )
@@ -1035,14 +1070,24 @@ async def test_executor_claim_only_selects_its_cluster(tmp_path) -> None:
         key_character="b",
     )
 
-    claim_b = await store.claim_action_execution(
+    agent_b = await _cluster_agent(
+        store,
         cluster_id="cluster-b",
+        suffix="selector-b",
+    )
+    agent_a = await _cluster_agent(
+        store,
+        cluster_id="cluster-a",
+        suffix="selector-a",
+    )
+    claim_b = await store.claim_action_execution(
+        agent_lease=agent_b,
         owner_id="executor-b",
         attempt_id="cluster-b-attempt",
         ttl_seconds=60,
     )
     claim_a = await store.claim_action_execution(
-        cluster_id="cluster-a",
+        agent_lease=agent_a,
         owner_id="executor-a",
         attempt_id="cluster-a-attempt",
         ttl_seconds=60,
@@ -1071,34 +1116,52 @@ async def test_reconciliation_claim_only_selects_its_cluster(tmp_path) -> None:
         cluster_id="cluster-b",
         key_character="d",
     )
-    claim_a = await store.claim_action_execution(
+    agent_a = await _cluster_agent(
+        store,
         cluster_id="cluster-a",
+        suffix="reconcile-a",
+    )
+    agent_b = await _cluster_agent(
+        store,
+        cluster_id="cluster-b",
+        suffix="reconcile-b",
+    )
+    claim_a = await store.claim_action_execution(
+        agent_lease=agent_a,
         owner_id="executor-a",
         attempt_id="cluster-a-dispatch",
         ttl_seconds=2,
     )
     claim_b = await store.claim_action_execution(
-        cluster_id="cluster-b",
+        agent_lease=agent_b,
         owner_id="executor-b",
         attempt_id="cluster-b-dispatch",
         ttl_seconds=2,
     )
     assert claim_a is not None and claim_b is not None
-    await store.mark_action_dispatched(claim_a)
-    await store.mark_action_dispatched(claim_b)
-    await store.mark_action_unknown(claim=claim_a, reason="test reconciliation")
-    await store.mark_action_unknown(claim=claim_b, reason="test reconciliation")
+    await store.mark_action_dispatched(claim_a, agent_lease=agent_a)
+    await store.mark_action_dispatched(claim_b, agent_lease=agent_b)
+    await store.mark_action_unknown(
+        claim=claim_a,
+        agent_lease=agent_a,
+        reason="test reconciliation",
+    )
+    await store.mark_action_unknown(
+        claim=claim_b,
+        agent_lease=agent_b,
+        reason="test reconciliation",
+    )
     # SQLite CURRENT_TIMESTAMP has one-second precision, so cross a full
     # database clock tick before the reconciliation lease becomes eligible.
     await asyncio.sleep(2.1)
 
     reconciliation_b = await store.claim_action_reconciliation(
-        cluster_id="cluster-b",
+        agent_lease=agent_b,
         owner_id="reconciler-b",
         ttl_seconds=60,
     )
     reconciliation_a = await store.claim_action_reconciliation(
-        cluster_id="cluster-a",
+        agent_lease=agent_a,
         owner_id="reconciler-a",
         ttl_seconds=60,
     )

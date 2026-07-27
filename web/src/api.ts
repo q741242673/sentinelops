@@ -1,4 +1,10 @@
-import type { DemoFaultJob, DemoResetJob, Incident, RuntimeInfo } from "./types";
+import type {
+  ClusterDirectoryEntry,
+  DemoFaultJob,
+  DemoResetJob,
+  Incident,
+  RuntimeInfo,
+} from "./types";
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 export const APPROVAL_REQUEST_TIMEOUT_MS = 90_000;
@@ -56,6 +62,7 @@ async function request<T>(path: string, requestOptions: RequestOptions = {}): Pr
 
 export const api = {
   listIncidents: () => request<Incident[]>("/api/v1/incidents"),
+  listClusters: () => request<ClusterDirectoryEntry[]>("/api/v1/clusters"),
   getRuntime: () => request<RuntimeInfo>("/api/v1/runtime"),
   createDemoIncident: () =>
     request<Incident>("/api/v1/demo/incidents", {

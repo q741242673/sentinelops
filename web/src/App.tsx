@@ -9,7 +9,13 @@ import {
   isTerminalIncidentStatus,
 } from "./operationErrors";
 import type { ConsoleError } from "./operationErrors";
-import type { Evidence, ExecutionStep, Incident, RuntimeInfo } from "./types";
+import type {
+  ClusterDirectoryEntry,
+  Evidence,
+  ExecutionStep,
+  Incident,
+  RuntimeInfo,
+} from "./types";
 
 const STATUS_LABELS: Record<Incident["status"], string> = {
   received: "已接收",
@@ -120,6 +126,40 @@ function mergeIncident(items: Incident[], updated: Incident): Incident[] {
   );
 }
 
+export function filterIncidentsByCluster<T extends { alert: { cluster_id: string } }>(
+  incidents: T[],
+  clusterId: string | null,
+): T[] {
+  if (clusterId === null) return incidents;
+  return incidents.filter((incident) => incident.alert.cluster_id === clusterId);
+}
+
+export function clusterConnectionCounts(
+  clusters: Array<Pick<ClusterDirectoryEntry, "connection_status">>,
+): { online: number; offline: number } {
+  return clusters.reduce(
+    (counts, cluster) => {
+      counts[cluster.connection_status] += 1;
+      return counts;
+    },
+    { online: 0, offline: 0 },
+  );
+}
+
+export function relativeLastSeenLabel(value: string | null, now = Date.now()): string {
+  if (value === null) return "尚无心跳";
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) return "心跳时间未知";
+  const elapsedSeconds = Math.max(0, Math.floor((now - timestamp) / 1_000));
+  if (elapsedSeconds < 10) return "刚刚";
+  if (elapsedSeconds < 60) return `${elapsedSeconds} 秒前`;
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60);
+  if (elapsedMinutes < 60) return `${elapsedMinutes} 分钟前`;
+  const elapsedHours = Math.floor(elapsedMinutes / 60);
+  if (elapsedHours < 24) return `${elapsedHours} 小时前`;
+  return `${Math.floor(elapsedHours / 24)} 天前`;
+}
+
 function currentHeadline(incident: Incident, active?: ExecutionStep): string {
   if (active) return active.title;
   if (incident.status === "resolved") return "服务已恢复，验证通过";
@@ -129,7 +169,17 @@ function currentHeadline(incident: Incident, active?: ExecutionStep): string {
   return STATUS_LABELS[incident.status];
 }
 
-function clusterLabel(incident: Incident, runtime: RuntimeInfo | null): string {
+function clusterLabel(
+  incident: Incident,
+  runtime: RuntimeInfo | null,
+  clusters: ClusterDirectoryEntry[],
+): string {
+  const registered = clusters.find(
+    (cluster) => cluster.cluster_id === incident.alert.cluster_id,
+  );
+  if (registered) {
+    return `${registered.display_name}（${registered.cluster_id}）`;
+  }
   if (runtime?.cluster_id === incident.alert.cluster_id) {
     return `${runtime.cluster_display_name}（${runtime.cluster_id}）`;
   }
@@ -141,20 +191,78 @@ function IncidentQueue({
   selectedId,
   onSelect,
   runtime,
+  clusters,
+  selectedClusterId,
+  onClusterSelect,
 }: {
   incidents: Incident[];
   selectedId: string | null;
   onSelect: (id: string) => void;
   runtime: RuntimeInfo | null;
+  clusters: ClusterDirectoryEntry[];
+  selectedClusterId: string | null;
+  onClusterSelect: (clusterId: string | null) => void;
 }) {
+  const counts = clusterConnectionCounts(clusters);
   return (
     <aside className="incident-queue">
       <div className="queue-heading">
         <span>事故中心</span>
         <b>{incidents.length}</b>
       </div>
+      {clusters.length > 0 && (
+        <section className="cluster-directory" aria-label="集群目录">
+          <div className="cluster-summary">
+            <button
+              type="button"
+              className={selectedClusterId === null ? "active" : ""}
+              onClick={() => onClusterSelect(null)}
+            >
+              全部 <b>{clusters.length}</b>
+            </button>
+            <span><i className="online" />已连接 <b>{counts.online}</b></span>
+            <span><i />心跳超时 <b>{counts.offline}</b></span>
+          </div>
+          <p>连接状态只表示 Executor 心跳，不代表业务健康。</p>
+          <div className="cluster-list">
+            {clusters.map((cluster) => (
+              <button
+                type="button"
+                key={cluster.cluster_id}
+                className={selectedClusterId === cluster.cluster_id ? "active" : ""}
+                onClick={() => onClusterSelect(cluster.cluster_id)}
+                title={
+                  cluster.capabilities.length > 0
+                    ? `已注册能力：${cluster.capabilities.join("、")}`
+                    : "未报告可用能力"
+                }
+              >
+                <i className={cluster.connection_status} />
+                <span>
+                  <strong>{cluster.display_name}</strong>
+                  <small>{cluster.cluster_id}</small>
+                </span>
+                <span className="cluster-meta">
+                  <b>
+                    {cluster.connection_status === "online" ? "已连接" : "心跳超时"}
+                    {" · "}
+                    {cluster.active_executors} 个 Executor
+                  </b>
+                  <small title={cluster.last_seen_at ?? undefined}>
+                    最后心跳：{relativeLastSeenLabel(cluster.last_seen_at)}
+                  </small>
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
       <div className="queue-list">
-        {incidents.length === 0 && <p className="queue-empty">等待真实告警进入…</p>}
+        {incidents.length === 0 && (
+          <p className="queue-empty">
+            {selectedClusterId === null ? "等待真实告警进入…" : "该集群暂无事故"}
+          </p>
+        )}
         {incidents.map((incident) => (
           <button
             type="button"
@@ -165,7 +273,9 @@ function IncidentQueue({
             <span className={`severity ${incident.alert.severity}`} />
             <span className="queue-copy">
               <strong>{incident.alert.service}</strong>
-              <small>{clusterLabel(incident, runtime)} · {alertTitle(incident.alert.name)}</small>
+              <small>
+                {clusterLabel(incident, runtime, clusters)} · {alertTitle(incident.alert.name)}
+              </small>
             </span>
             <span className="queue-meta">
               <small>{timeLabel(incident.created_at)}</small>
@@ -412,8 +522,10 @@ function ResultPanel({
 
 function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
+  const [clusters, setClusters] = useState<ClusterDirectoryEntry[]>([]);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedClusterId, setSelectedClusterId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [streamConnected, setStreamConnected] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
@@ -454,6 +566,15 @@ function App() {
 
   useEffect(() => {
     let mounted = true;
+    async function refreshClusters() {
+      try {
+        const directory = await api.listClusters();
+        if (mounted) setClusters(directory);
+      } catch {
+        // Cluster registration is optional for the local/offline console.
+        // Keep the last successful directory and the existing single-cluster UI.
+      }
+    }
     async function bootstrap() {
       try {
         const [runtimeInfo, existing] = await Promise.all([api.getRuntime(), api.listIncidents()]);
@@ -474,17 +595,44 @@ function App() {
       }
     }
     void bootstrap();
+    void refreshClusters();
+    const clusterRefreshInterval = window.setInterval(() => {
+      void refreshClusters();
+    }, 15_000);
     const unsubscribe = api.subscribeIncidents(
       (incident) => mounted && acceptIncident(incident),
-      (connected) => mounted && setStreamConnected(connected),
+      (connected) => {
+        if (!mounted) return;
+        setStreamConnected(connected);
+        if (connected) void refreshClusters();
+      },
     );
     return () => {
       mounted = false;
+      window.clearInterval(clusterRefreshInterval);
       unsubscribe();
     };
   }, [acceptIncident]);
 
-  const selected = incidents.find((item) => item.id === selectedId) ?? incidents[0] ?? null;
+  useEffect(() => {
+    if (
+      selectedClusterId !== null
+      && !clusters.some((cluster) => cluster.cluster_id === selectedClusterId)
+    ) {
+      setSelectedClusterId(null);
+    }
+  }, [clusters, selectedClusterId]);
+
+  const visibleIncidents = useMemo(
+    () => filterIncidentsByCluster(incidents, selectedClusterId),
+    [incidents, selectedClusterId],
+  );
+  const selected = (
+    visibleIncidents.find((item) => item.id === selectedId)
+    ?? visibleIncidents[0]
+    ?? null
+  );
+  const clusterCounts = useMemo(() => clusterConnectionCounts(clusters), [clusters]);
   const liveMode = runtime?.tool_backend === "kubernetes";
   const labAvailable = !["prod", "production"].includes(
     runtime?.environment.trim().toLowerCase() ?? "development",
@@ -607,8 +755,10 @@ function App() {
         <div className="header-status">
           <span><i className={streamConnected ? "connected" : ""} />{streamConnected ? "实时事件已连接" : "正在重连事件流"}</span>
           <span>
-            {runtime
-              ? `${runtime.cluster_display_name}（${runtime.cluster_id}）`
+            {clusters.length > 0
+              ? `${clusterCounts.online} 个集群已连接 · ${clusterCounts.offline} 个心跳超时`
+              : runtime
+                ? `${runtime.cluster_display_name}（${runtime.cluster_id}）`
               : liveMode
                 ? "Kubernetes 已连接"
                 : "本地模拟环境"}
@@ -640,10 +790,13 @@ function App() {
 
       <div className="console-layout">
         <IncidentQueue
-          incidents={incidents}
+          incidents={visibleIncidents}
           selectedId={selected?.id ?? null}
           onSelect={setSelectedId}
           runtime={runtime}
+          clusters={clusters}
+          selectedClusterId={selectedClusterId}
+          onClusterSelect={setSelectedClusterId}
         />
         <main className="incident-workspace">
           {loading ? (
@@ -651,8 +804,14 @@ function App() {
           ) : !selected ? (
             <div className="empty-state">
               <i />
-              <strong>等待 Alertmanager 告警</strong>
-              <span>真实告警进入后，这里会立即展示 Agent 的调查、决策和验证过程。</span>
+              <strong>
+                {selectedClusterId === null ? "等待 Alertmanager 告警" : "当前集群暂无事故"}
+              </strong>
+              <span>
+                {selectedClusterId === null
+                  ? "真实告警进入后，这里会立即展示 Agent 的调查、决策和验证过程。"
+                  : "可以切换到全部集群，或等待该集群产生新的告警。"}
+              </span>
             </div>
           ) : (
             <>
@@ -661,7 +820,7 @@ function App() {
                   <span className={`status-pill ${selected.status}`}>{STATUS_LABELS[selected.status]}</span>
                   <h1>{alertTitle(selected.alert.name)}</h1>
                   <p>
-                    {clusterLabel(selected, runtime)} · {selected.alert.namespace} ·{" "}
+                    {clusterLabel(selected, runtime, clusters)} · {selected.alert.namespace} ·{" "}
                     {selected.alert.service} · {timeLabel(selected.created_at)}
                   </p>
                 </div>

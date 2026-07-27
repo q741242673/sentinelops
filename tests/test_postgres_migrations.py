@@ -64,8 +64,14 @@ async def test_postgres_previous_revision_upgrades_with_data_and_is_idempotent()
     await asyncio.to_thread(upgrade_database, DATABASE_URL)
     current_store = SqlIncidentStore(DATABASE_URL)
     loaded = await current_store.get(record.id)
+    cluster = await current_store.get_cluster_connection(record.alert.cluster_id)
 
     assert await current_store.schema_revisions() == HEAD_REVISIONS
     assert loaded is not None
     assert loaded.graph_state == {"revision": "0002_executor_queue"}
+    assert cluster is not None
+    assert cluster.registration.routing_generation == 1
+    assert cluster.registration.metadata_state == "inferred"
+    assert cluster.status == "offline"
+    assert cluster.agents == ()
     await current_store.close()
