@@ -17,6 +17,28 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+async def _cluster_agent(
+    store: SqlIncidentStore,
+    *,
+    instance_id: str,
+    session_id: str,
+):
+    settings = Settings()
+    await store.ensure_cluster_registration(
+        cluster_id=settings.cluster_id,
+        display_name=settings.cluster_display_name,
+        default_namespace=settings.kubernetes_namespace,
+    )
+    return await store.register_cluster_agent(
+        cluster_id=settings.cluster_id,
+        instance_id=instance_id,
+        session_id=session_id,
+        capabilities=("action.execute", "action.reconcile"),
+        version="postgres-contract",
+        ttl_seconds=60,
+    )
+
+
 @pytest.mark.asyncio
 async def test_postgres_roundtrip_and_compare_and_swap() -> None:
     assert DATABASE_URL is not None
@@ -92,14 +114,19 @@ async def test_postgres_roundtrip_and_compare_and_swap() -> None:
             },
         )
         await first.enqueue_action(lease, idempotency_key=intent.idempotency_key)
+        agent_lease = await _cluster_agent(
+            first,
+            instance_id="postgres-executor-a",
+            session_id="postgres-contract-session",
+        )
         claim = await first.claim_action_execution(
-            cluster_id="local",
+            agent_lease=agent_lease,
             owner_id="postgres-executor-a",
             attempt_id="postgres-contract-attempt",
             ttl_seconds=60,
         )
         assert claim is not None
-        await first.mark_action_dispatched(claim)
+        await first.mark_action_dispatched(claim, agent_lease=agent_lease)
         completed = await first.complete_action(
             claim=claim,
             result=ToolResult(
@@ -159,8 +186,13 @@ async def test_postgres_serializes_resolved_against_action_dispatch(
         precondition={"cluster_id": "local", "resource_version": "race"},
     )
     await worker.enqueue_action(lease, idempotency_key=intent.idempotency_key)
+    agent_lease = await _cluster_agent(
+        worker,
+        instance_id="postgres-race-executor",
+        session_id="postgres-race-session",
+    )
     claim = await worker.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent_lease,
         owner_id="postgres-race-executor",
         attempt_id="postgres-race-attempt",
         ttl_seconds=60,
@@ -177,7 +209,7 @@ async def test_postgres_serializes_resolved_against_action_dispatch(
 
     monkeypatch.setattr(worker, "_assert_dispatch_allowed", gated_guard)
     dispatch_task = asyncio.create_task(
-        worker.mark_action_dispatched(claim)
+        worker.mark_action_dispatched(claim, agent_lease=agent_lease)
     )
     await asyncio.wait_for(incident_locked.wait(), timeout=5)
     resolved_task = asyncio.create_task(
@@ -248,16 +280,26 @@ async def test_postgres_two_executors_can_claim_intent_only_once() -> None:
             },
         )
         await first.enqueue_action(lease, idempotency_key=intent.idempotency_key)
+        first_agent = await _cluster_agent(
+            first,
+            instance_id="postgres-executor-first",
+            session_id="postgres-executor-first-session",
+        )
+        second_agent = await _cluster_agent(
+            second,
+            instance_id="postgres-executor-second",
+            session_id="postgres-executor-second-session",
+        )
 
         claims = await asyncio.gather(
             first.claim_action_execution(
-                cluster_id="local",
+                agent_lease=first_agent,
                 owner_id="executor-a",
                 attempt_id=f"{record.id}-a",
                 ttl_seconds=60,
             ),
             second.claim_action_execution(
-                cluster_id="local",
+                agent_lease=second_agent,
                 owner_id="executor-b",
                 attempt_id=f"{record.id}-b",
                 ttl_seconds=60,
@@ -266,7 +308,12 @@ async def test_postgres_two_executors_can_claim_intent_only_once() -> None:
 
         winners = [claim for claim in claims if claim is not None]
         assert len(winners) == 1
-        dispatched = await first.mark_action_dispatched(winners[0])
+        winning_agent = first_agent if claims[0] is not None else second_agent
+        winning_store = first if claims[0] is not None else second
+        dispatched = await winning_store.mark_action_dispatched(
+            winners[0],
+            agent_lease=winning_agent,
+        )
         assert dispatched.status == "dispatched"
     finally:
         await first.close()
@@ -328,9 +375,14 @@ async def test_postgres_resolved_before_executor_claim_cancels_without_dispatch(
         assert resolution.record.timeline[-1].data["execution_outcome"] == (
             "not_dispatched"
         )
+        agent_lease = await _cluster_agent(
+            store,
+            instance_id="postgres-resolved-executor",
+            session_id="postgres-resolved-session",
+        )
         assert (
             await store.claim_action_execution(
-                cluster_id="local",
+                agent_lease=agent_lease,
                 owner_id="executor-a",
                 attempt_id=f"{record.id}-must-not-claim",
                 ttl_seconds=60,

@@ -46,6 +46,14 @@ class ChangeProposalConflictError(RuntimeError):
     """A change proposal or its GitOps delivery claim is stale or invalid."""
 
 
+class ClusterRegistrationConflictError(RuntimeError):
+    """A cluster registration conflicts with durable routing state."""
+
+
+class ClusterAgentLeaseConflictError(RuntimeError):
+    """A cluster agent session is expired, fenced, or lacks a capability."""
+
+
 @dataclass(frozen=True)
 class StoredIncident:
     record: IncidentRecord
@@ -61,14 +69,71 @@ class LeaseToken:
     expires_at: datetime
 
 
+ClusterLifecycle = Literal["active", "draining", "revoked"]
+ClusterConnectionStatus = Literal["online", "offline"]
+ClusterMetadataState = Literal["configured", "inferred"]
+
+
+@dataclass(frozen=True)
+class ClusterRegistration:
+    cluster_id: str
+    display_name: str
+    default_namespace: str
+    routing_generation: int
+    lifecycle: ClusterLifecycle
+    metadata_state: ClusterMetadataState
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class ClusterAgentLeaseToken:
+    cluster_id: str
+    instance_id: str
+    session_id: str
+    generation: int
+    routing_generation: int
+    capabilities: tuple[str, ...]
+    version: str
+    registered_at: datetime
+    last_seen_at: datetime
+    lease_until: datetime
+
+
+@dataclass(frozen=True)
+class ClusterAgentLease:
+    cluster_id: str
+    instance_id: str
+    session_id: str
+    generation: int
+    routing_generation: int
+    capabilities: tuple[str, ...]
+    version: str
+    registered_at: datetime
+    last_seen_at: datetime
+    lease_until: datetime
+    status: Literal["active", "closed"]
+    connection_status: ClusterConnectionStatus
+
+
+@dataclass(frozen=True)
+class ClusterConnection:
+    registration: ClusterRegistration
+    status: ClusterConnectionStatus
+    agents: tuple[ClusterAgentLease, ...]
+
+
 @dataclass(frozen=True)
 class ExecutorClaim:
     idempotency_key: str
     incident_id: str
     cluster_id: str
+    cluster_generation: int
     owner_id: str
     generation: int
     attempt_id: str
+    session_id: str
+    session_generation: int
     expires_at: datetime
 
 
@@ -76,10 +141,13 @@ class ExecutorClaim:
 class ActionReconciliationClaim:
     intent: StoredActionIntent
     cluster_id: str
+    cluster_generation: int
     owner_id: str
     generation: int
     attempt_id: str
     attempt_count: int
+    session_id: str
+    session_generation: int
     expires_at: datetime
 
 
@@ -109,6 +177,7 @@ class StoredActionIntent:
     idempotency_key: str
     incident_id: str
     cluster_id: str
+    cluster_generation: int
     lease_generation: int
     approval_id: str | None
     approval_version: int | None
@@ -121,6 +190,8 @@ class StoredActionIntent:
     executor_generation: int
     executor_lease_until: datetime | None
     attempt_id: str | None
+    executor_session_id: str | None
+    executor_session_generation: int | None
 
 
 @dataclass(frozen=True)
@@ -170,6 +241,46 @@ class IncidentStore(Protocol):
     async def close(self) -> None: ...
 
     async def schema_revisions(self) -> tuple[str, ...]: ...
+
+    async def ensure_cluster_registration(
+        self,
+        *,
+        cluster_id: str,
+        display_name: str,
+        default_namespace: str,
+    ) -> ClusterRegistration: ...
+
+    async def register_cluster_agent(
+        self,
+        *,
+        cluster_id: str,
+        instance_id: str,
+        session_id: str,
+        capabilities: tuple[str, ...],
+        version: str,
+        ttl_seconds: float,
+    ) -> ClusterAgentLeaseToken: ...
+
+    async def heartbeat_cluster_agent(
+        self,
+        token: ClusterAgentLeaseToken,
+        *,
+        ttl_seconds: float,
+    ) -> ClusterAgentLeaseToken: ...
+
+    async def close_cluster_agent(
+        self,
+        token: ClusterAgentLeaseToken,
+    ) -> None: ...
+
+    async def list_cluster_connections(
+        self,
+    ) -> list[ClusterConnection]: ...
+
+    async def get_cluster_connection(
+        self,
+        cluster_id: str,
+    ) -> ClusterConnection | None: ...
 
     async def list_audit_events(self, incident_id: str) -> list[AuditEvent]: ...
 
@@ -434,7 +545,7 @@ class IncidentStore(Protocol):
     async def claim_action_execution(
         self,
         *,
-        cluster_id: str,
+        agent_lease: ClusterAgentLeaseToken,
         owner_id: str,
         attempt_id: str,
         ttl_seconds: float,
@@ -451,12 +562,15 @@ class IncidentStore(Protocol):
         self,
         claim: ExecutorClaim,
         *,
+        agent_lease: ClusterAgentLeaseToken,
         ttl_seconds: float,
     ) -> ExecutorClaim: ...
 
     async def mark_action_dispatched(
         self,
         claim: ExecutorClaim,
+        *,
+        agent_lease: ClusterAgentLeaseToken,
     ) -> StoredActionIntent: ...
 
     async def complete_action(
@@ -469,10 +583,12 @@ class IncidentStore(Protocol):
     async def claim_action_reconciliation(
         self,
         *,
-        cluster_id: str,
+        agent_lease: ClusterAgentLeaseToken,
         owner_id: str,
         ttl_seconds: float,
     ) -> ActionReconciliationClaim | None: ...
+
+    async def reap_expired_action_claims(self) -> int: ...
 
     async def complete_action_reconciliation(
         self,

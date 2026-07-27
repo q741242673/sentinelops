@@ -69,6 +69,8 @@ flowchart TB
     PREFLIGHT --> CATALOG["Action Plugin 合同"]
     CATALOG --> QUEUE["PostgreSQL Action Intent 队列"]
     QUEUE --> EXECUTOR["独立 Executor"]
+    EXECUTOR -->|"注册 + 短租约心跳"| REGISTRY["PostgreSQL 集群目录"]
+    REGISTRY -->|"在线状态 + 执行代次"| API
     EXECUTOR --> CONTRACT["不可变 SentinelRemediation"]
     CONTRACT --> CONTROLLER["Go Remediation Controller"]
     CONTROLLER --> WRITE["带版本条件的集群操作"]
@@ -85,12 +87,13 @@ flowchart TB
     VERIFY --> API
 ```
 
-项目分成八块：
+项目分成九块：
 
 - **前端控制台**：用 React 和 TypeScript 编写，实时显示 Agent 正在做什么、查了哪些证据、为什么暂停、最终是否恢复。
 - **后端服务**：用 FastAPI 接收告警、管理事故状态、处理审批，并通过 SSE（后端主动推送）把新进度立即发给网页。
 - **Agent 核心**：用 LangGraph 安排调查和修复步骤。配置 PostgreSQL 后，等待审批的生产事故会同时保存事故快照和 Agent 暂停点；后端重启后可以使用原审批继续。Agent 只把批准后的操作放入数据库队列，不直接调用 Kubernetes 写接口。
 - **独立 Executor**：单独进程领取 Action Intent，把批准后的动作和执行快照写成不可修改的 `SentinelRemediation`。生产环境中它只能创建和读取这类请求，不能修改 Deployment。
+- **集群目录和执行租约**：每个 Executor 启动后用稳定实例身份和随机 Session 注册，并按数据库时间续约。领取任务、续租、跨过写入分界和结果对账都会重新检查集群代次、Session 代次和能力声明；过期实例不能继续使用旧任务。控制台里的“已连接”只表示最近收到 Executor 心跳，不代表集群里的业务服务健康。
 - **Remediation Controller**：独立的 Go Controller 是生产链路中唯一能修改目标 Deployment 的组件。它只执行注册动作，写入前重新检查 UID、resourceVersion、generation、当前 ReplicaSet、审批摘要和过期时间；还会绕过本地缓存，直接向 API Server 重新核对准入策略完整性。
 - **集群准入写闸门**：使用 Kubernetes 原生 `ValidatingAdmissionPolicy` 保护明确标记的 namespace。即使某个账号已经拿到 Deployment 写 RBAC，只要不在该 namespace 的允许身份清单中，API Server 仍会拒绝写入；策略可先用 Warn/Audit 灰度观察，再切到 Deny。白名单和正式启用标签也受独立策略保护，不能由普通发布账号自行修改。
 - **独立 GitOps Publisher**：只领取已经过边界检查并保存到数据库的动态提案，再交给公司 GitOps Gateway 创建代码变更请求。API、Agent 和 Executor 都不持有代码仓库写权限。
@@ -251,11 +254,30 @@ SENTINELOPS_CLUSTER_DISPLAY_NAME=生产集群 A
 SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 ```
 
-当前阶段已经把集群身份绑定到事故、审批恢复和执行队列，避免共享 PostgreSQL
-时由错误集群领取操作。但它还不是集中保存多份 kubeconfig 的集群注册中心：
-每个集群仍部署自己的 API、Executor 和 Remediation Controller，三者必须使用
-同一个 `SENTINELOPS_CLUSTER_ID`。动态注册、跨集群权限管理和统一写入路由会在
-后续版本单独实现。
+当前阶段已经把集群身份绑定到事故、审批恢复和执行队列，并增加了持久化集群目录和
+Executor 短租约心跳。Executor 领取任务、续租、标记“即将写入”和领取只读对账任务时，
+数据库都会重新确认它仍属于目标集群、Session 没有过期、路由代次没有变化，并且声明了
+所需能力。某个集群整体离线后，中心侧回收器仍能把“确认尚未写入”的过期任务重新排队；
+已经跨过写入分界的任务只会标成结果未知并进入只读对账，不会猜测重放。
+
+这还不是集中保存多份 kubeconfig 的集群代理。每个集群仍部署自己的 Executor 和
+Remediation Controller，两者必须使用同一个 `SENTINELOPS_CLUSTER_ID`；Kubernetes
+ServiceAccount 凭据始终留在目标集群。当前参考拓扑通过共享 PostgreSQL 交换任务，
+因此数据库凭据仍属于重要信任边界。下一阶段会把 Executor 改为使用集群服务身份访问
+受认证的 Control Gateway，不再让每个集群直接持有控制面数据库凭据。
+
+生产 Executor 还需要稳定的实例身份。仓库清单通过 Downward API 把 Pod UID 注入
+`SENTINELOPS_EXECUTOR_INSTANCE_ID`；每次进程启动都会生成新的 Session。默认租约为
+60 秒、每 15 秒续约：
+
+```dotenv
+SENTINELOPS_EXECUTOR_INSTANCE_ID=由-Pod-UID-注入
+SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS=60
+SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS=15
+```
+
+心跳间隔不能超过租约的三分之一。网页中的集群目录会显示在线 Executor 数量和最后心跳，
+但不会把“有心跳”包装成“业务健康”；事故是否恢复仍由后端的严格验证决定。
 
 示例 RBAC：
 
@@ -544,9 +566,11 @@ Kubernetes 集群管理员的信任边界。namespace 退役前也要先按同�
 可能被写闸门拒绝。
 
 数据库迁移必须先完成，不能把 Job 和 Deployment 一次性无序 `apply`。升级到包含
-`0010_action_reconcile_outbox` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
-执行的 Action Intent；旧 Executor 不会写入新对账表，若让它和迁移并发运行会产生无法自动恢复的
-遗漏。PostgreSQL 迁移还会在回填和孤儿检查期间锁住 Action Intent 表，但这不能代替停止旧进程：
+`0012_cluster_registry_leases` 的版本前，必须先把旧版本 Executor 缩容到 0，并确认没有仍在
+执行的 Action Intent。旧 Executor 不认识集群 Session 租约，若让它和迁移并发运行，可能绕过
+新版本的执行围栏。迁移会把旧的 `prepared/queued/claimed` 操作取消，把已经 `dispatched`
+但没有 Session 身份的操作标成结果未知，避免新 Executor 把旧授权当成自己的任务继续执行。
+PostgreSQL 迁移还会锁住事故和 Action Intent 表，但这不能代替停止旧进程：
 
 ```bash
 kubectl -n sentinelops-system scale deployment/sentinelops-executor --replicas=0
@@ -593,7 +617,7 @@ Controller 还会输出准入完整性是否健康、当前是 Audit 还是 Enfo
 Prometheus 指标代替。准入异常不会让 API 或 Controller readiness 失败，因为系统仍要接收告警、进行
 只读调查并告诉操作员为什么停止写入。
 
-`/ready` 证明 API 已经启动且可以访问事故数据库，不代表模型、监控系统和 Kubernetes 里的目标服务都健康。Executor 和锚定 Publisher 的探针证明各自的领取循环仍在前进；如果进程卡住，心跳过期后 Pod 会退出 Ready 并由 Kubernetes 重启。外部审计服务临时不可用只会让 Outbox 保留待重试记录，不会回滚已经提交的事故处理。
+`/ready` 证明 API 已经启动且可以访问事故数据库，不代表模型、监控系统和 Kubernetes 里的目标服务都健康。Executor 探针只有在集群注册租约成功续期后才刷新；锚定 Publisher 的探针证明领取循环仍在前进。如果进程卡住或数据库租约无法续期，心跳文件过期后 Pod 会退出 Ready 并由 Kubernetes 重启。外部审计服务临时不可用只会让 Outbox 保留待重试记录，不会回滚已经提交的事故处理。
 
 示例 NetworkPolicy 只提交了可以跨环境成立的入站限制。Kubernetes API、PostgreSQL、监控系统、模型网关和外部审计服务的地址在不同公司并不一样，因此没有硬编码一套可能切断生产流量的通用 egress 规则。上线前应根据实际 Service、egress gateway 或 CIDR 再补出口白名单，并在策略启用后分别验证数据库、集群 API、监控、模型和锚定调用。
 
@@ -787,7 +811,10 @@ sentinelops gitops-publisher
 “确认尚未派发”“可能已经派发”和“工具结果已经保存”：尚未派发的旧审批会失效并要求重新确认；
 结果未知时禁止自动重试；结果已经保存时保留真实 ToolResult，并升级人工完成恢复验证。
 
-Agent Lease 只负责授权入队；Executor 有自己的 owner、generation、attempt ID 和领取期限。
+Agent Lease 只负责授权入队；Executor 还有集群注册 Session、路由 generation、实例
+generation，以及每个任务自己的 owner、generation、attempt ID 和领取期限。集群注册租约使用
+数据库时间判断，不能靠某个 Pod 的本地时钟延长；旧 Session 在任务领取、任务续租、写入分界和
+对账领取四处都会被拒绝。
 领取后、合同创建前崩溃可以安全地重新排队；一旦进入 `dispatched`，数据库仍按“外部写可能发生”
 处理，超时后标记 `unknown`，不会交给另一个 Executor 猜测重放。合同创建后，Controller 会按 action ID
 幂等执行；Controller 自身在写入后崩溃，可以从 Deployment 标记恢复执行结果。替代 Executor 会通过
@@ -1296,6 +1323,7 @@ tests/              # 单元测试和安全边界测试
 - React 实时事故控制台；
 - kind、监控系统和 GitHub Actions 端到端测试；
 - PostgreSQL 事故快照、追加式事件、一次性审批和等待审批状态的重启恢复；
+- 持久化集群目录、Executor Pod UID 实例身份、短租约心跳、Session/路由代次 fencing，以及跨集群统一过期任务回收；
 - 带数据库 fencing generation 的 Worker Lease，以及写操作 Action Intent、审批自动过期和崩溃结果判定；
 - 独立 `sentinelops executor`、单独的 Executor generation，以及生产环境 create-only 的修复合同提交权限；
 - 不可变动态提案、事务型 GitOps Outbox、独立 Publisher、摘要绑定回执，以及与 API/Agent 分离的仓库凭据边界；

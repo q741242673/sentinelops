@@ -21,7 +21,10 @@ from sentinelops.migration import (
     alembic_config,
     upgrade_database,
 )
-from sentinelops.storage import SqlIncidentStore
+from sentinelops.storage import (
+    ClusterRegistrationConflictError,
+    SqlIncidentStore,
+)
 from sentinelops.storage.sqlalchemy import action_intents, incidents
 
 
@@ -67,9 +70,7 @@ async def _indexes(
             return await connection.run_sync(
                 lambda sync_connection: {
                     item["name"]: tuple(item.get("column_names") or ())
-                    for item in inspect(sync_connection).get_indexes(
-                        table_name
-                    )
+                    for item in inspect(sync_connection).get_indexes(table_name)
                 }
             )
     finally:
@@ -152,6 +153,8 @@ async def test_empty_database_upgrades_to_single_head_and_is_idempotent(tmp_path
         "sentinelops_incident_events",
         "sentinelops_incidents",
         "sentinelops_change_proposals",
+        "sentinelops_cluster_agent_leases",
+        "sentinelops_cluster_registrations",
         "sentinelops_gitops_proposal_outbox",
         "sentinelops_worker_leases",
     }
@@ -183,9 +186,7 @@ async def test_versioned_durable_store_upgrades_to_executor_queue_without_data_l
     assert loaded.graph_state == {"revision": "0001"}
     assert "sentinelops_action_intents" in await _table_names(database_url)
     audit_events = await current_store.list_audit_events(created.id)
-    assert [event.event_type for event in audit_events] == [
-        "legacy.migration_checkpoint"
-    ]
+    assert [event.event_type for event in audit_events] == ["legacy.migration_checkpoint"]
     assert audit_events[0].payload["historical_transitions_verified"] is False
     assert (await current_store.verify_audit_chain(created.id)).valid is True
     await current_store.close()
@@ -255,15 +256,19 @@ async def test_action_reconciliation_migration_backfills_unknown_intents(
     try:
         async with migrated.connect() as connection:
             row = (
-                await connection.execute(
-                    text(
-                        """
+                (
+                    await connection.execute(
+                        text(
+                            """
                         SELECT action_id, status, next_attempt_at
                         FROM sentinelops_action_reconciliation_outbox
                         """
+                        )
                     )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
         assert row["action_id"] == "a" * 64
         assert row["status"] == "pending"
         assert row["next_attempt_at"] == timestamp
@@ -279,9 +284,7 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
     await _upgrade(database_url, "0009_gitops_proposal_outbox")
     engine = create_async_engine(database_url)
     timestamp = "2026-07-27T08:00:00+00:00"
-    record = _record("legacy-cluster-routing").model_copy(
-        update={"id": "legacy-cluster-routing"}
-    )
+    record = _record("legacy-cluster-routing").model_copy(update={"id": "legacy-cluster-routing"})
     legacy_payload = record.model_dump(mode="json")
     legacy_payload["alert"].pop("cluster_id")
     async with engine.begin() as connection:
@@ -323,14 +326,10 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
                         else None
                     ),
                     executor_generation=(
-                        1
-                        if status in {"claimed", "dispatched", "succeeded"}
-                        else 0
+                        1 if status in {"claimed", "dispatched", "succeeded"} else 0
                     ),
                     executor_lease_until=(
-                        timestamp
-                        if status in {"claimed", "dispatched", "succeeded"}
-                        else None
+                        timestamp if status in {"claimed", "dispatched", "succeeded"} else None
                     ),
                     attempt_id=(
                         f"legacy-attempt-{index}"
@@ -343,15 +342,9 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
                     updated_at=timestamp,
                     queued_at=timestamp if status != "prepared" else None,
                     claimed_at=(
-                        timestamp
-                        if status in {"claimed", "dispatched", "succeeded"}
-                        else None
+                        timestamp if status in {"claimed", "dispatched", "succeeded"} else None
                     ),
-                    dispatched_at=(
-                        timestamp
-                        if status in {"dispatched", "succeeded"}
-                        else None
-                    ),
+                    dispatched_at=(timestamp if status in {"dispatched", "succeeded"} else None),
                     finished_at=timestamp if status == "succeeded" else None,
                 )
             )
@@ -363,27 +356,42 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
     try:
         async with migrated.connect() as connection:
             action_rows = (
-                await connection.execute(
-                    text(
-                        """
-                        SELECT idempotency_key, cluster_id, status, error
+                (
+                    await connection.execute(
+                        text(
+                            """
+                        SELECT
+                          idempotency_key,
+                          cluster_id,
+                          cluster_generation,
+                          executor_session_id,
+                          executor_session_generation,
+                          status,
+                          error
                         FROM sentinelops_action_intents
                         ORDER BY idempotency_key
                         """
+                        )
                     )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
             incident_row = (
-                await connection.execute(
-                    text(
-                        """
+                (
+                    await connection.execute(
+                        text(
+                            """
                         SELECT cluster_id, record
                         FROM sentinelops_incidents
                         WHERE id = 'legacy-cluster-routing'
                         """
+                        )
                     )
                 )
-            ).mappings().one()
+                .mappings()
+                .one()
+            )
         assert [row["status"] for row in action_rows] == [
             "cancelled",
             "cancelled",
@@ -391,9 +399,10 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
             "unknown",
             "succeeded",
         ]
-        assert {row["cluster_id"] for row in action_rows} == {
-            "legacy-unassigned"
-        }
+        assert {row["cluster_id"] for row in action_rows} == {"legacy-unassigned"}
+        assert {row["cluster_generation"] for row in action_rows} == {1}
+        assert {row["executor_session_id"] for row in action_rows} == {None}
+        assert {row["executor_session_generation"] for row in action_rows} == {None}
         assert action_rows[4]["error"] is None
         assert incident_row["cluster_id"] == "legacy-unassigned"
         incident_payload = incident_row["record"]
@@ -402,6 +411,52 @@ async def test_cluster_routing_migration_fences_nonterminal_actions(
         assert incident_payload["alert"]["cluster_id"] == "legacy-unassigned"
     finally:
         await migrated.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cluster_registry_migration_placeholder_is_claimed_once(
+    tmp_path,
+) -> None:
+    database_url = _database_url(tmp_path)
+    await _upgrade(database_url, "0011_cluster_routing_fence")
+    legacy = SqlIncidentStore(database_url)
+    record = _record("configured-after-upgrade")
+    record.alert = record.alert.model_copy(
+        update={
+            "cluster_id": "production-east",
+            "namespace": "payments-production",
+        }
+    )
+    await legacy.save(record, expected_version=None, graph_state=None)
+    await legacy.close()
+
+    await _upgrade(database_url)
+    store = SqlIncidentStore(database_url)
+    before = await store.get_cluster_connection("production-east")
+    assert before is not None
+    assert before.registration.routing_generation == 1
+    assert before.registration.metadata_state == "inferred"
+    assert before.status == "offline"
+
+    configured = await store.ensure_cluster_registration(
+        cluster_id="production-east",
+        display_name="华东生产集群",
+        default_namespace="payments-production",
+    )
+    assert configured.metadata_state == "configured"
+    assert configured.display_name == "华东生产集群"
+    assert configured.default_namespace == "payments-production"
+
+    with pytest.raises(
+        ClusterRegistrationConflictError,
+        match="权威集群元数据",
+    ):
+        await store.ensure_cluster_registration(
+            cluster_id="production-east",
+            display_name="错误集群",
+            default_namespace="other-namespace",
+        )
+    await store.close()
 
 
 @pytest.mark.asyncio
@@ -425,9 +480,7 @@ async def test_action_reconciliation_migration_rejects_drifted_existing_table(
         await _upgrade(database_url)
 
     store = SqlIncidentStore(database_url)
-    assert await store.schema_revisions() == (
-        "0009_gitops_proposal_outbox",
-    )
+    assert await store.schema_revisions() == ("0009_gitops_proposal_outbox",)
     await store.close()
 
 
@@ -516,8 +569,7 @@ async def test_unversioned_schema_with_wrong_contract_is_rejected(tmp_path) -> N
     database_url = _database_url(tmp_path)
     with sqlite3.connect(tmp_path / "sentinelops.db") as connection:
         connection.execute(
-            "CREATE TABLE sentinelops_incidents "
-            "(id INTEGER PRIMARY KEY, unexpected TEXT)"
+            "CREATE TABLE sentinelops_incidents (id INTEGER PRIMARY KEY, unexpected TEXT)"
         )
 
     with pytest.raises(RuntimeError, match="结构不匹配"):
@@ -561,9 +613,7 @@ async def test_production_startup_rejects_old_revision_without_modifying_it(
         executor_backend="controller",
         alertmanager_source_id="migration-production-test",
         alertmanager_webhook_auth_mode="bearer",
-        alertmanager_webhook_bearer_token=(
-            "migration-production-test-token-0001"
-        ),
+        alertmanager_webhook_bearer_token=("migration-production-test-token-0001"),
         audit_hmac_key="migration-audit-test-key-00000001",
         audit_key_id="migration-test-v1",
         operator_auth_mode="oidc",

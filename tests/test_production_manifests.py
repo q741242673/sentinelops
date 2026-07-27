@@ -100,6 +100,14 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
     ) <= 120
     assert runtime["SENTINELOPS_EXECUTOR_MODE"] == "external"
     assert runtime["SENTINELOPS_EXECUTOR_BACKEND"] == "controller"
+    registry_ttl = float(
+        runtime["SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS"]
+    )
+    registry_heartbeat = float(
+        runtime["SENTINELOPS_EXECUTOR_REGISTRY_HEARTBEAT_SECONDS"]
+    )
+    assert 10 <= registry_ttl <= 600
+    assert 1 <= registry_heartbeat <= registry_ttl / 3
     assert runtime["SENTINELOPS_DATABASE_URL_FILE"].startswith("/var/run/secrets/")
     assert runtime["SENTINELOPS_AUDIT_HMAC_KEY_FILE"].startswith(
         "/var/run/secrets/"
@@ -173,6 +181,27 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
         executor["spec"]["template"]["spec"]["serviceAccountName"]
         == "sentinelops-executor"
     )
+    executor_env = {
+        item["name"]: item
+        for item in _container(executor)["env"]
+    }
+    assert executor_env["SENTINELOPS_EXECUTOR_INSTANCE_ID"]["valueFrom"][
+        "fieldRef"
+    ] == {
+        "apiVersion": "v1",
+        "fieldPath": "metadata.uid",
+    }
+    executor_container = _container(executor)
+    for probe_name in ("startupProbe", "readinessProbe", "livenessProbe"):
+        command = executor_container[probe_name]["exec"]["command"]
+        max_age = float(command[command.index("--max-age-seconds") + 1])
+        assert max_age <= float(
+            _resource(
+                "ConfigMap",
+                "sentinelops-runtime",
+                "sentinelops-system",
+            )["data"]["SENTINELOPS_EXECUTOR_REGISTRY_TTL_SECONDS"]
+        )
     assert (
         controller["spec"]["template"]["spec"]["serviceAccountName"]
         == "sentinelops-remediation-controller"

@@ -50,6 +50,23 @@ async def _store(tmp_path) -> SqlIncidentStore:
     return store
 
 
+async def _cluster_agent(store: SqlIncidentStore):
+    settings = Settings()
+    await store.ensure_cluster_registration(
+        cluster_id=settings.cluster_id,
+        display_name=settings.cluster_display_name,
+        default_namespace=settings.kubernetes_namespace,
+    )
+    return await store.register_cluster_agent(
+        cluster_id=settings.cluster_id,
+        instance_id="audit-executor",
+        session_id="audit-executor-session",
+        capabilities=("action.execute", "action.reconcile"),
+        version="test",
+        ttl_seconds=60,
+    )
+
+
 @pytest.mark.asyncio
 async def test_hmac_audit_chain_covers_approval_and_action_boundary(tmp_path) -> None:
     agent, record = await _paused_incident()
@@ -79,14 +96,15 @@ async def test_hmac_audit_chain_covers_approval_and_action_boundary(tmp_path) ->
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
+    agent_lease = await _cluster_agent(store)
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent_lease,
         owner_id="executor-a",
         attempt_id="attempt-a",
         ttl_seconds=60,
     )
     assert claim is not None
-    await store.mark_action_dispatched(claim)
+    await store.mark_action_dispatched(claim, agent_lease=agent_lease)
     await store.complete_action(
         claim=claim,
         result=ToolResult(

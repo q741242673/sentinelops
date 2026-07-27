@@ -6,6 +6,7 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+from sentinelops import __version__
 from sentinelops.agent.execution import (
     ActionExecutionRejected,
     ActionExecutor,
@@ -16,11 +17,12 @@ from sentinelops.remediation_controller import RemediationGateway
 from sentinelops.storage.base import (
     ActionIntentConflictError,
     ActionReconciliationClaim,
+    ClusterAgentLeaseConflictError,
+    ClusterAgentLeaseToken,
     IncidentStore,
     LeaseToken,
 )
 from sentinelops.tools.registry import ToolRegistry
-from sentinelops.worker_health import run_with_health_pulse
 
 
 class DirectActionExecutor(ActionExecutor):
@@ -134,12 +136,19 @@ class ExecutorWorker:
         *,
         owner_id: str,
         cluster_id: str,
+        cluster_display_name: str | None = None,
+        default_namespace: str | None = None,
+        instance_id: str | None = None,
+        session_id: str | None = None,
+        version: str = __version__,
+        capabilities: tuple[str, ...] | None = None,
         remediation_gateway: RemediationGateway | None = None,
         claim_ttl_seconds: float = 60,
         poll_interval_seconds: float = 0.5,
         missing_contract_grace_seconds: float = 30,
+        registry_ttl_seconds: float = 60,
+        registry_heartbeat_seconds: float = 15,
         health_callback: Callable[[], None] | None = None,
-        health_interval_seconds: float = 5,
     ) -> None:
         self.store = store
         self.tools = tools
@@ -151,20 +160,73 @@ class ExecutorWorker:
             raise ValueError("Executor requires a non-empty cluster_id")
         self.owner_id = owner_id
         self.cluster_id = cluster_id
+        self.cluster_display_name = (
+            cluster_display_name or cluster_id
+        ).strip()
+        self.default_namespace = (
+            default_namespace
+            or getattr(remediation_gateway, "namespace", None)
+            or "sentinelops-demo"
+        ).strip()
+        self.instance_id = (instance_id or owner_id).strip()
+        self.session_id = (session_id or str(uuid4())).strip()
+        self.version = version.strip()
+        if capabilities is None:
+            capabilities = (
+                (
+                    "action.execute",
+                    "action.reconcile",
+                    "backend.controller",
+                )
+                if remediation_gateway is not None
+                else ("action.execute", "backend.direct")
+            )
+        self.capabilities = tuple(sorted(set(capabilities)))
+        if not self.cluster_display_name:
+            raise ValueError("Executor requires a non-empty cluster display name")
+        if not self.default_namespace:
+            raise ValueError("Executor requires a non-empty default namespace")
+        if not self.instance_id:
+            raise ValueError("Executor requires a non-empty instance_id")
+        if not self.session_id:
+            raise ValueError("Executor requires a non-empty session_id")
+        if not self.version:
+            raise ValueError("Executor requires a non-empty version")
+        required_capabilities = {"action.execute"}
+        if remediation_gateway is not None:
+            required_capabilities.update(
+                {"action.reconcile", "backend.controller"}
+            )
+        if not required_capabilities.issubset(self.capabilities):
+            raise ValueError("Executor capabilities do not match its backend")
         self.claim_ttl_seconds = claim_ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.missing_contract_grace_seconds = missing_contract_grace_seconds
+        self.registry_ttl_seconds = registry_ttl_seconds
+        self.registry_heartbeat_seconds = registry_heartbeat_seconds
+        if registry_ttl_seconds <= 0:
+            raise ValueError("Executor registry TTL must be positive")
+        if not 0 < registry_heartbeat_seconds <= registry_ttl_seconds / 3:
+            raise ValueError(
+                "Executor registry heartbeat must not exceed one third of TTL"
+            )
         self.health_callback = health_callback
-        self.health_interval_seconds = health_interval_seconds
+        self._agent_lease: ClusterAgentLeaseToken | None = None
+        self._registry_ready = asyncio.Event()
+        self._registration_lock = asyncio.Lock()
 
     async def run_once(self) -> bool:
-        reconciled = await self._reconcile_once()
-        executed = await self._execute_once()
+        agent_lease = await self._refresh_registration_once()
+        reconciled = await self._reconcile_once(agent_lease)
+        executed = await self._execute_once(agent_lease)
         return reconciled or executed
 
-    async def _execute_once(self) -> bool:
+    async def _execute_once(
+        self,
+        agent_lease: ClusterAgentLeaseToken,
+    ) -> bool:
         claim = await self.store.claim_action_execution(
-            cluster_id=self.cluster_id,
+            agent_lease=agent_lease,
             owner_id=self.owner_id,
             attempt_id=str(uuid4()),
             ttl_seconds=self.claim_ttl_seconds,
@@ -181,12 +243,16 @@ class ExecutorWorker:
                 await asyncio.sleep(max(0.1, self.claim_ttl_seconds / 3))
                 await self.store.heartbeat_action_claim(
                     claim,
+                    agent_lease=agent_lease,
                     ttl_seconds=self.claim_ttl_seconds,
                 )
 
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
-            dispatched = await self.store.mark_action_dispatched(claim)
+            dispatched = await self.store.mark_action_dispatched(
+                claim,
+                agent_lease=agent_lease,
+            )
             if (
                 dispatched.cluster_id != self.cluster_id
                 or dispatched.precondition.get("cluster_id") != self.cluster_id
@@ -217,11 +283,14 @@ class ExecutorWorker:
         await self.store.complete_action(claim=claim, result=result)
         return True
 
-    async def _reconcile_once(self) -> bool:
+    async def _reconcile_once(
+        self,
+        agent_lease: ClusterAgentLeaseToken,
+    ) -> bool:
         if self.remediation_gateway is None:
             return False
         claim = await self.store.claim_action_reconciliation(
-            cluster_id=self.cluster_id,
+            agent_lease=agent_lease,
             owner_id=self.owner_id,
             ttl_seconds=self.claim_ttl_seconds,
         )
@@ -310,22 +379,112 @@ class ExecutorWorker:
         return database_now >= deadline
 
     async def run_forever(self) -> None:
-        await run_with_health_pulse(
-            self._run_work_loop(),
-            callback=self.health_callback,
-            interval_seconds=self.health_interval_seconds,
-        )
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self._run_registry_loop())
+                tasks.create_task(self._run_execution_loop())
+                tasks.create_task(self._run_reconciliation_loop())
+        finally:
+            self._registry_ready.clear()
+            lease = self._agent_lease
+            self._agent_lease = None
+            if lease is not None:
+                with suppress(Exception):
+                    await self.store.close_cluster_agent(lease)
 
-    async def _run_work_loop(self) -> None:
-        await asyncio.gather(
-            self._run_execution_loop(),
-            self._run_reconciliation_loop(),
+    async def _ensure_registered(self) -> ClusterAgentLeaseToken:
+        if self._registry_ready.is_set() and self._agent_lease is not None:
+            return self._agent_lease
+        async with self._registration_lock:
+            if self._registry_ready.is_set() and self._agent_lease is not None:
+                return self._agent_lease
+            await self.store.ensure_cluster_registration(
+                cluster_id=self.cluster_id,
+                display_name=self.cluster_display_name,
+                default_namespace=self.default_namespace,
+            )
+            lease = await self.store.register_cluster_agent(
+                cluster_id=self.cluster_id,
+                instance_id=self.instance_id,
+                session_id=self.session_id,
+                capabilities=self.capabilities,
+                version=self.version,
+                ttl_seconds=self.registry_ttl_seconds,
+            )
+            self._agent_lease = lease
+            self._registry_ready.set()
+            self._record_registry_success()
+            return lease
+
+    async def _refresh_registration_once(self) -> ClusterAgentLeaseToken:
+        lease = self._agent_lease if self._registry_ready.is_set() else None
+        if lease is None:
+            return await self._ensure_registered()
+        try:
+            refreshed = await self.store.heartbeat_cluster_agent(
+                lease,
+                ttl_seconds=self.registry_ttl_seconds,
+            )
+        except ClusterAgentLeaseConflictError:
+            self._registry_ready.clear()
+            self._agent_lease = None
+            self.session_id = str(uuid4())
+            return await self._ensure_registered()
+        except Exception:
+            self._registry_ready.clear()
+            self._agent_lease = None
+            return await self._ensure_registered()
+        self._agent_lease = refreshed
+        self._registry_ready.set()
+        self._record_registry_success()
+        return refreshed
+
+    async def _run_registry_loop(self) -> None:
+        retry_seconds = max(
+            self.poll_interval_seconds,
+            min(self.registry_heartbeat_seconds, 5.0),
         )
+        while True:
+            try:
+                lease = await self._ensure_registered()
+                await asyncio.sleep(self.registry_heartbeat_seconds)
+                refreshed = await self.store.heartbeat_cluster_agent(
+                    lease,
+                    ttl_seconds=self.registry_ttl_seconds,
+                )
+                if self._agent_lease == lease:
+                    self._agent_lease = refreshed
+                    self._registry_ready.set()
+                    self._record_registry_success()
+            except asyncio.CancelledError:
+                raise
+            except ClusterAgentLeaseConflictError:
+                self._registry_ready.clear()
+                self._agent_lease = None
+                self.session_id = str(uuid4())
+                await asyncio.sleep(retry_seconds)
+            except Exception:
+                self._registry_ready.clear()
+                self._agent_lease = None
+                await asyncio.sleep(retry_seconds)
+
+    def _record_registry_success(self) -> None:
+        if self.health_callback is not None:
+            self.health_callback()
+
+    async def _ready_agent_lease(self) -> ClusterAgentLeaseToken:
+        while True:
+            await self._registry_ready.wait()
+            lease = self._agent_lease
+            if lease is not None:
+                return lease
+            self._registry_ready.clear()
 
     async def _run_execution_loop(self) -> None:
         while True:
             try:
-                worked = await self._execute_once()
+                agent_lease = await self._ready_agent_lease()
+                worked = await self._execute_once(agent_lease)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -336,7 +495,8 @@ class ExecutorWorker:
     async def _run_reconciliation_loop(self) -> None:
         while True:
             try:
-                worked = await self._reconcile_once()
+                agent_lease = await self._ready_agent_lease()
+                worked = await self._reconcile_once(agent_lease)
             except asyncio.CancelledError:
                 raise
             except Exception:

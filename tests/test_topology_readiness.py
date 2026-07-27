@@ -198,6 +198,12 @@ def test_topology_manifests_keep_api_and_executor_separate() -> None:
     assert migration["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
 
     executor_container = executor["spec"]["template"]["spec"]["containers"][0]
+    executor_env = {
+        item["name"]: item for item in executor_container["env"]
+    }
+    assert executor_env["SENTINELOPS_EXECUTOR_INSTANCE_ID"]["valueFrom"][
+        "fieldRef"
+    ]["fieldPath"] == "metadata.uid"
     for probe_name in ("startupProbe", "readinessProbe", "livenessProbe"):
         assert executor_container[probe_name]["timeoutSeconds"] >= 5
 

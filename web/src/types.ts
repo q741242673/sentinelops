@@ -140,6 +140,30 @@ export interface RuntimeInfo {
   alert_ingestion: string;
 }
 
+export interface ClusterExecutor {
+  instance_id: string;
+  session_id: string;
+  generation: number;
+  version: string;
+  capabilities: string[];
+  connection_status: "online" | "offline";
+  last_seen_at: string;
+  lease_expires_at: string;
+}
+
+export interface ClusterDirectoryEntry {
+  cluster_id: string;
+  display_name: string;
+  default_namespace: string;
+  connection_status: "online" | "offline";
+  routing_generation: number;
+  active_executors: number;
+  last_seen_at: string | null;
+  lease_expires_at: string | null;
+  capabilities: string[];
+  executors: ClusterExecutor[];
+}
+
 export interface DemoFaultResult {
   deployment?: string;
   service?: string;

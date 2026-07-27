@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sentinelops.cli import _touch_executor_health_file
+from sentinelops.cli import _touch_executor_health_file, run_executor
 from sentinelops.config import Settings
 from sentinelops.healthcheck import check_heartbeat
 
@@ -18,6 +18,51 @@ from sentinelops.healthcheck import check_heartbeat
 def test_cluster_id_must_be_a_dns_label(cluster_id: str) -> None:
     with pytest.raises(ValueError, match="cluster_id"):
         Settings(cluster_id=cluster_id)
+
+
+def test_executor_registry_heartbeat_must_fit_inside_lease_ttl() -> None:
+    settings = Settings(
+        executor_registry_ttl_seconds=60,
+        executor_registry_heartbeat_seconds=20,
+    )
+    assert settings.executor_registry_heartbeat_seconds == 20
+
+    with pytest.raises(ValueError, match="三分之一"):
+        Settings(
+            executor_registry_ttl_seconds=60,
+            executor_registry_heartbeat_seconds=20.1,
+        )
+
+
+@pytest.mark.parametrize(
+    "instance_id",
+    (" pod-uid", "pod/uid", "-pod-uid", "pod-uid-", ""),
+)
+def test_executor_instance_id_is_bounded(instance_id: str) -> None:
+    with pytest.raises(ValueError, match="executor_instance_id"):
+        Settings(executor_instance_id=instance_id)
+
+
+@pytest.mark.asyncio
+async def test_production_executor_requires_explicit_instance_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        environment="production",
+        cluster_id="prod-cluster-a",
+        tool_backend="kubernetes",
+        executor_backend="controller",
+        database_url="sqlite+aiosqlite:///:memory:",
+        audit_hmac_key="a" * 32,
+        audit_key_id="prod-audit-v1",
+    )
+    monkeypatch.setattr(
+        "sentinelops.cli.get_settings",
+        lambda: settings,
+    )
+
+    with pytest.raises(SystemExit, match="EXECUTOR_INSTANCE_ID"):
+        await run_executor()
 
 
 def test_secret_files_are_read_without_trailing_newlines(tmp_path: Path) -> None:

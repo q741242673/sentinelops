@@ -153,6 +153,11 @@ async def run_executor() -> None:
         raise SystemExit(
             "Controller Executor backend requires SENTINELOPS_TOOL_BACKEND=kubernetes"
         )
+    if production and not settings.executor_instance_id:
+        raise SystemExit(
+            "Production Executor requires SENTINELOPS_EXECUTOR_INSTANCE_ID "
+            "from the Kubernetes Pod UID"
+        )
     store = SqlIncidentStore(
         database_url,
         audit_hmac_key=audit_hmac_key,
@@ -179,11 +184,20 @@ async def run_executor() -> None:
         ),
         owner_id=owner_id,
         cluster_id=settings.cluster_id,
+        cluster_display_name=settings.cluster_display_name,
+        default_namespace=settings.kubernetes_namespace,
+        instance_id=(
+            settings.executor_instance_id or socket.gethostname()
+        ),
         remediation_gateway=remediation_gateway,
         claim_ttl_seconds=settings.executor_claim_ttl_seconds,
         poll_interval_seconds=settings.executor_poll_interval_seconds,
         missing_contract_grace_seconds=(
             settings.executor_missing_contract_grace_seconds
+        ),
+        registry_ttl_seconds=settings.executor_registry_ttl_seconds,
+        registry_heartbeat_seconds=(
+            settings.executor_registry_heartbeat_seconds
         ),
         health_callback=(
             lambda: _touch_executor_health_file(settings.executor_health_file or "")

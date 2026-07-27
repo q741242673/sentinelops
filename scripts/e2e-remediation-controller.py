@@ -307,15 +307,31 @@ async def main() -> None:
             lease,
             idempotency_key=recovery_action_id,
         )
-        original_claim = await store.claim_action_execution(
+        await store.ensure_cluster_registration(
             cluster_id=CLUSTER_ID,
+            display_name=f"{CLUSTER_ID} E2E cluster",
+            default_namespace=NAMESPACE,
+        )
+        original_agent = await store.register_cluster_agent(
+            cluster_id=CLUSTER_ID,
+            instance_id="kind-executor-before-crash",
+            session_id="kind-controller-crash-session",
+            capabilities=("action.execute", "action.reconcile"),
+            version="controller-e2e",
+            ttl_seconds=60,
+        )
+        original_claim = await store.claim_action_execution(
+            agent_lease=original_agent,
             owner_id="kind-executor-before-crash",
             attempt_id="kind-controller-crash-attempt",
             ttl_seconds=0.2,
         )
         if original_claim is None:
             raise RuntimeError("failed to claim crash-recovery Action Intent")
-        dispatched = await store.mark_action_dispatched(original_claim)
+        dispatched = await store.mark_action_dispatched(
+            original_claim,
+            agent_lease=original_agent,
+        )
         executor_api = executor_custom_objects_api()
         body = build_sentinel_remediation(dispatched)
         await asyncio.to_thread(

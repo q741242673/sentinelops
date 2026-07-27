@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, update
@@ -11,6 +12,7 @@ from sentinelops.executor import ExecutorWorker
 from sentinelops.remediation_controller import RemediationObservation
 from sentinelops.runtime import build_agent
 from sentinelops.storage import ActionIntentConflictError, SqlIncidentStore
+from sentinelops.storage.base import ClusterAgentLeaseToken
 from sentinelops.storage.sqlalchemy import (
     action_intents,
     action_reconciliation_outbox,
@@ -33,6 +35,7 @@ class RecordingWriteBackend:
 
 class RecordingRemediationGateway:
     def __init__(self) -> None:
+        self.namespace = "sentinelops-demo"
         self.intents = []
         self.observed_intents = []
         self.observation = RemediationObservation(
@@ -60,11 +63,50 @@ class RecordingRemediationGateway:
 
 class BlockingExecutorStore:
     def __init__(self) -> None:
-        self.entered = asyncio.Event()
+        self.heartbeat_entered = asyncio.Event()
+        now = datetime.now(UTC)
+        self.token = ClusterAgentLeaseToken(
+            cluster_id="local",
+            instance_id="executor-health-test",
+            session_id="health-session",
+            generation=1,
+            routing_generation=1,
+            capabilities=("action.execute", "backend.direct"),
+            version="test",
+            registered_at=now,
+            last_seen_at=now,
+            lease_until=now + timedelta(seconds=60),
+        )
+
+    async def ensure_cluster_registration(self, **_kwargs):
+        return None
+
+    async def register_cluster_agent(self, **_kwargs):
+        return self.token
+
+    async def heartbeat_cluster_agent(self, *_args, **_kwargs):
+        self.heartbeat_entered.set()
+        await asyncio.Event().wait()
+
+    async def close_cluster_agent(self, _token):
+        return None
 
     async def claim_action_execution(self, **_kwargs):
-        self.entered.set()
-        await asyncio.Event().wait()
+        return None
+
+
+class CloseAgentAfterClaimStore:
+    def __init__(self, store: SqlIncidentStore) -> None:
+        self.store = store
+
+    def __getattr__(self, name):
+        return getattr(self.store, name)
+
+    async def claim_action_execution(self, **kwargs):
+        claim = await self.store.claim_action_execution(**kwargs)
+        if claim is not None:
+            await self.store.close_cluster_agent(kwargs["agent_lease"])
+        return claim
 
 
 def _execution_precondition(
@@ -143,6 +185,31 @@ async def _queued_intent(tmp_path, *, suffix: str = "a"):
     return store, record, lease, intent
 
 
+async def _cluster_agent(
+    store: SqlIncidentStore,
+    *,
+    instance_id: str,
+    cluster_id: str = "local",
+):
+    await store.ensure_cluster_registration(
+        cluster_id=cluster_id,
+        display_name=cluster_id,
+        default_namespace="sentinelops-demo",
+    )
+    return await store.register_cluster_agent(
+        cluster_id=cluster_id,
+        instance_id=instance_id,
+        session_id=f"session-{instance_id}",
+        capabilities=(
+            "action.execute",
+            "action.reconcile",
+            "backend.controller",
+        ),
+        version="test",
+        ttl_seconds=60,
+    )
+
+
 async def _expire_action_for_reconciliation(
     store: SqlIncidentStore,
     action_id: str,
@@ -216,6 +283,16 @@ async def test_executor_is_the_only_component_that_calls_write_backend(tmp_path)
     assert completed.status == "succeeded"
     assert len(backend.calls) == 1
     assert backend.calls[0][0] == record.approval.action.tool_name
+    connection = await store.get_cluster_connection("local")
+    assert connection is not None
+    assert connection.status == "online"
+    assert len(connection.agents) == 1
+    assert connection.agents[0].instance_id == "executor-a"
+    assert connection.agents[0].capabilities == (
+        "action.execute",
+        "backend.direct",
+    )
+    assert completed.executor_session_id == connection.agents[0].session_id
     await store.close()
 
 
@@ -247,7 +324,7 @@ async def test_executor_submits_immutable_contract_without_direct_write_access(
 
 
 @pytest.mark.asyncio
-async def test_executor_health_pulse_continues_while_store_call_is_blocked() -> None:
+async def test_executor_readiness_is_not_refreshed_while_registry_is_blocked() -> None:
     store = BlockingExecutorStore()
     pulses = 0
 
@@ -260,24 +337,121 @@ async def test_executor_health_pulse_continues_while_store_call_is_blocked() -> 
         ToolRegistry(RecordingWriteBackend()),
         owner_id="executor-health-test",
         cluster_id="local",
+        instance_id="executor-health-test",
+        session_id="health-session",
+        registry_ttl_seconds=0.03,
+        registry_heartbeat_seconds=0.01,
         health_callback=health,
-        health_interval_seconds=0.01,
     )
     task = asyncio.create_task(worker.run_forever())
-    await asyncio.wait_for(store.entered.wait(), timeout=1)
+    await asyncio.wait_for(store.heartbeat_entered.wait(), timeout=1)
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert pulses >= 3
+    assert pulses == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_closes_registered_session_on_normal_shutdown(
+    tmp_path,
+) -> None:
+    store = SqlIncidentStore(
+        f"sqlite+aiosqlite:///{tmp_path / 'executor-close.db'}"
+    )
+    await store.setup()
+    worker = ExecutorWorker(
+        store,
+        ToolRegistry(RecordingWriteBackend()),
+        owner_id="executor-close",
+        cluster_id="local",
+        instance_id="executor-close",
+        session_id="executor-close-session",
+        poll_interval_seconds=0.01,
+    )
+    task = asyncio.create_task(worker.run_forever())
+    for _ in range(100):
+        connection = await store.get_cluster_connection("local")
+        if connection is not None and connection.status == "online":
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("Executor did not register")
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    connection = await store.get_cluster_connection("local")
+    assert connection is not None
+    assert connection.status == "offline"
+    assert connection.agents[0].status == "closed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_closed_agent_between_claim_and_dispatch_causes_zero_gateway_calls(
+    tmp_path,
+) -> None:
+    store, record, _, _ = await _queued_intent(tmp_path)
+    gateway = RecordingRemediationGateway()
+    worker = ExecutorWorker(
+        CloseAgentAfterClaimStore(store),  # type: ignore[arg-type]
+        None,
+        owner_id="executor-closed-before-dispatch",
+        cluster_id="local",
+        instance_id="executor-closed-before-dispatch",
+        session_id="closed-before-dispatch-session",
+        remediation_gateway=gateway,
+    )
+
+    with pytest.raises(Exception, match="Session|fencing|关闭"):
+        await worker.run_once()
+
+    assert gateway.intents == []
+    intent = await store.latest_action_intent(record.id)
+    assert intent is not None
+    assert intent.status == "claimed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_once_replaces_a_closed_registry_session(
+    tmp_path,
+) -> None:
+    store = SqlIncidentStore(
+        f"sqlite+aiosqlite:///{tmp_path / 'executor-reregister.db'}"
+    )
+    await store.setup()
+    worker = ExecutorWorker(
+        store,
+        ToolRegistry(RecordingWriteBackend()),
+        owner_id="executor-reregister",
+        cluster_id="local",
+        instance_id="executor-reregister",
+        session_id="first-session",
+    )
+
+    assert await worker.run_once() is False
+    first = worker._agent_lease
+    assert first is not None
+    await store.close_cluster_agent(first)
+
+    assert await worker.run_once() is False
+    second = worker._agent_lease
+    assert second is not None
+    assert second.generation == first.generation + 1
+    assert second.session_id != first.session_id
+    await store.close()
 
 
 @pytest.mark.asyncio
 async def test_resolved_after_claim_before_dispatch_causes_zero_writes(tmp_path) -> None:
     store, record, _, intent = await _queued_intent(tmp_path)
+    agent = await _cluster_agent(store, instance_id="executor-a")
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent,
         owner_id="executor-a",
         attempt_id="claim-before-resolved",
         ttl_seconds=60,
@@ -291,7 +465,7 @@ async def test_resolved_after_claim_before_dispatch_causes_zero_writes(tmp_path)
     assert resolved is not None
     assert resolved.record.timeline[-1].data["execution_outcome"] == "not_dispatched"
     with pytest.raises(ActionIntentConflictError):
-        await store.mark_action_dispatched(claim)
+        await store.mark_action_dispatched(claim, agent_lease=agent)
 
     cancelled = await store.latest_action_intent(record.id)
     assert cancelled is not None
@@ -323,8 +497,9 @@ async def test_executor_rejects_intent_that_does_not_match_approved_action(
         precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await store.enqueue_action(lease, idempotency_key=tampered.idempotency_key)
+    agent = await _cluster_agent(store, instance_id="executor-a")
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent,
         owner_id="executor-a",
         attempt_id="tampered-attempt",
         ttl_seconds=60,
@@ -335,22 +510,35 @@ async def test_executor_rejects_intent_that_does_not_match_approved_action(
         ActionIntentConflictError,
         match="已批准的动作或审批版本不一致",
     ):
-        await store.mark_action_dispatched(claim)
+        await store.mark_action_dispatched(claim, agent_lease=agent)
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_expired_claim_is_requeued_and_stale_attempt_is_fenced(tmp_path) -> None:
     store, record, _, _ = await _queued_intent(tmp_path)
+    stale_agent = await _cluster_agent(store, instance_id="executor-a")
     stale = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=stale_agent,
         owner_id="executor-a",
         attempt_id="stale-attempt",
-        ttl_seconds=-1,
+        ttl_seconds=60,
     )
     assert stale is not None
+    async with store.engine.begin() as connection:
+        await connection.execute(
+            update(action_intents)
+            .where(
+                action_intents.c.idempotency_key
+                == stale.idempotency_key
+            )
+            .values(
+                executor_lease_until="2000-01-01T00:00:00+00:00"
+            )
+        )
+    current_agent = await _cluster_agent(store, instance_id="executor-b")
     current = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=current_agent,
         owner_id="executor-b",
         attempt_id="current-attempt",
         ttl_seconds=60,
@@ -359,8 +547,14 @@ async def test_expired_claim_is_requeued_and_stale_attempt_is_fenced(tmp_path) -
     assert current.generation == stale.generation + 1
 
     with pytest.raises(ActionIntentConflictError):
-        await store.mark_action_dispatched(stale)
-    dispatched = await store.mark_action_dispatched(current)
+        await store.mark_action_dispatched(
+            stale,
+            agent_lease=stale_agent,
+        )
+    dispatched = await store.mark_action_dispatched(
+        current,
+        agent_lease=current_agent,
+    )
     assert dispatched.status == "dispatched"
     assert dispatched.attempt_id == "current-attempt"
     assert dispatched.incident_id == record.id
@@ -372,19 +566,23 @@ async def test_dispatched_crash_becomes_unknown_and_late_result_is_bound_to_atte
     tmp_path,
 ) -> None:
     store, record, _, _ = await _queued_intent(tmp_path)
+    agent = await _cluster_agent(store, instance_id="executor-a")
     claim = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=agent,
         owner_id="executor-a",
         attempt_id="immutable-attempt",
         ttl_seconds=1,
     )
     assert claim is not None
-    await store.mark_action_dispatched(claim)
+    await store.mark_action_dispatched(claim, agent_lease=agent)
     await asyncio.sleep(1.2)
 
     assert (
         await store.claim_action_execution(
-            cluster_id="local",
+            agent_lease=await _cluster_agent(
+                store,
+                instance_id="executor-b",
+            ),
             owner_id="executor-b",
             attempt_id="must-not-replay",
             ttl_seconds=60,
@@ -420,14 +618,21 @@ async def test_replacement_executor_recovers_controller_result_without_replay(
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="e")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-crash",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-crash",
         attempt_id="crashed-after-controller-submit",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="Executor disappeared after submitting the CR",
@@ -487,29 +692,38 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
     tmp_path,
 ) -> None:
     store, _, _, intent = await _queued_intent(tmp_path, suffix="f")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-crash",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-crash",
         attempt_id="expired-controller-attempt",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="controller response was lost",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
 
+    first_agent = await _cluster_agent(store, instance_id="reconciler-a")
     first = await store.claim_action_reconciliation(
-        cluster_id="local",
+        agent_lease=first_agent,
         owner_id="reconciler-a",
         ttl_seconds=1,
     )
     assert first is not None
+    second_agent = await _cluster_agent(store, instance_id="reconciler-b")
     assert (
         await store.claim_action_reconciliation(
-            cluster_id="local",
+            agent_lease=second_agent,
             owner_id="reconciler-b",
             ttl_seconds=1,
         )
@@ -530,7 +744,7 @@ async def test_action_reconciliation_claim_is_fenced_between_executors(
             .values(next_attempt_at="2000-01-01T00:00:00+00:00")
         )
     second = await store.claim_action_reconciliation(
-        cluster_id="local",
+        agent_lease=second_agent,
         owner_id="reconciler-b",
         ttl_seconds=1,
     )
@@ -559,14 +773,21 @@ async def test_missing_controller_contract_dead_letters_only_after_fence_grace(
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="m")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-missing-contract",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-missing-contract",
         attempt_id="missing-contract-attempt",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="Executor disappeared before the Controller result was stored",
@@ -612,14 +833,21 @@ async def test_in_progress_controller_contract_retries_after_fence_expiry(
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="p")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-in-progress-contract",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-in-progress-contract",
         attempt_id="in-progress-contract-attempt",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="Controller is still applying the action",
@@ -663,14 +891,21 @@ async def test_temporary_controller_error_retries_after_fence_expiry(
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="t")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-temporary-error",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-temporary-error",
         attempt_id="temporary-error-attempt",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="Kubernetes API response was lost",
@@ -710,14 +945,21 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="d")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-before-invalid-result",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-before-invalid-result",
         attempt_id="invalid-controller-result-attempt",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
 
     gateway = RecordingRemediationGateway()
@@ -741,9 +983,13 @@ async def test_immutable_invalid_controller_result_is_dead_lettered(
     assert preserved is not None
     assert preserved.status == "unknown"
     assert preserved.error == "Controller outcome digest is invalid"
+    dead_letter_agent = await _cluster_agent(
+        store,
+        instance_id="must-not-retry-dead-letter",
+    )
     assert (
         await store.claim_action_reconciliation(
-            cluster_id="local",
+            agent_lease=dead_letter_agent,
             owner_id="must-not-retry-dead-letter",
             ttl_seconds=60,
         )
@@ -786,21 +1032,32 @@ async def test_late_executor_and_reconciler_cannot_commit_conflicting_duplicates
     tmp_path,
 ) -> None:
     store, record, _, intent = await _queued_intent(tmp_path, suffix="c")
+    original_agent = await _cluster_agent(
+        store,
+        instance_id="executor-original",
+    )
     original = await store.claim_action_execution(
-        cluster_id="local",
+        agent_lease=original_agent,
         owner_id="executor-original",
         attempt_id="original-late-result",
         ttl_seconds=60,
     )
     assert original is not None
-    await store.mark_action_dispatched(original)
+    await store.mark_action_dispatched(
+        original,
+        agent_lease=original_agent,
+    )
     await store.mark_action_unknown(
         claim=original,
         reason="original Executor response was delayed",
     )
     await _expire_action_for_reconciliation(store, intent.idempotency_key)
+    reconciliation_agent = await _cluster_agent(
+        store,
+        instance_id="executor-reconciler",
+    )
     reconciliation = await store.claim_action_reconciliation(
-        cluster_id="local",
+        agent_lease=reconciliation_agent,
         owner_id="executor-reconciler",
         ttl_seconds=60,
     )

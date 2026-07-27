@@ -7,7 +7,7 @@ from alembic.config import Config
 
 from sentinelops.storage.base import IncidentStore
 
-HEAD_REVISIONS = ("0011_cluster_routing_fence",)
+HEAD_REVISIONS = ("0012_cluster_registry_leases",)
 
 
 class SchemaRevisionError(RuntimeError):
