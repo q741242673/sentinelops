@@ -33,6 +33,7 @@ _SAFE_REJECTED_REASONS = {
     "AuthorizationPolicyDigestMismatch",
     "AutomaticAuthorizationInvalid",
     "CatalogDigestMismatch",
+    "ClusterIdentityMismatch",
     "FenceGenerationMismatch",
     "InvalidActionParameters",
     "RollbackProofMissing",
@@ -65,6 +66,7 @@ _ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         "risk": "medium",
         "parameters": ["name"],
         "requiredPreconditions": [
+            "clusterId",
             "resourceVersion",
             "generation",
             "desiredReplicas",
@@ -83,6 +85,7 @@ _ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         "risk": "high",
         "parameters": ["name", "revision"],
         "requiredPreconditions": [
+            "clusterId",
             "resourceVersion",
             "generation",
             "desiredReplicas",
@@ -102,6 +105,7 @@ _ACTION_CONTRACTS: dict[str, dict[str, Any]] = {
         "risk": "high",
         "parameters": ["name", "replicas"],
         "requiredPreconditions": [
+            "clusterId",
             "resourceVersion",
             "generation",
             "desiredReplicas",
@@ -215,6 +219,13 @@ def build_sentinel_remediation(intent: StoredActionIntent) -> dict[str, Any]:
             }
         )
     namespace = _required_string(intent.precondition, "namespace")
+    intent_cluster_id = _required_cluster_id(intent.cluster_id, "intent.cluster_id")
+    precondition_cluster_id = _required_cluster_id(
+        intent.precondition.get("cluster_id"),
+        "precondition.cluster_id",
+    )
+    if precondition_cluster_id != intent_cluster_id:
+        raise ValueError("Action Intent 与执行快照的 cluster_id 不一致")
     target_name = _required_string(intent.precondition, "target")
     if parameters["name"] != target_name:
         raise ValueError("Action 参数与执行快照目标不一致")
@@ -238,6 +249,7 @@ def build_sentinel_remediation(intent: StoredActionIntent) -> dict[str, Any]:
             "target": {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
+                "clusterId": intent_cluster_id,
                 "namespace": namespace,
                 "name": target_name,
                 "uid": _required_string(intent.precondition, "deployment_uid"),
@@ -287,6 +299,10 @@ def _action_parameters(
 
 def _execution_precondition(source: dict[str, object]) -> dict[str, Any]:
     precondition: dict[str, Any] = {
+        "clusterId": _required_cluster_id(
+            source.get("cluster_id"),
+            "precondition.cluster_id",
+        ),
         "resourceVersion": _required_string(source, "resource_version"),
         "generation": _required_positive_int(source, "generation"),
         "desiredReplicas": _required_nonnegative_int(source, "desired_replicas"),
@@ -350,6 +366,16 @@ def _required_string(source: dict[str, Any] | dict[str, object], field: str) -> 
     return value
 
 
+def _required_cluster_id(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", value)
+        is None
+    ):
+        raise ValueError(f"{field} 必须是合法的非空集群标识")
+    return value
+
+
 def _required_positive_int(source: dict[str, Any] | dict[str, object], field: str) -> int:
     value = source.get(field)
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -407,12 +433,14 @@ class KubernetesRemediationGateway:
         self,
         namespace: str,
         *,
+        cluster_id: str,
         custom_objects_api: Any | None = None,
         poll_interval_seconds: float = 0.25,
         result_timeout_seconds: float = 120,
         api_timeout_seconds: float = 5,
     ) -> None:
         self.namespace = namespace
+        self.cluster_id = _required_cluster_id(cluster_id, "cluster_id")
         self.poll_interval_seconds = poll_interval_seconds
         self.result_timeout_seconds = result_timeout_seconds
         self.api_timeout_seconds = api_timeout_seconds
@@ -431,6 +459,9 @@ class KubernetesRemediationGateway:
         return client.CustomObjectsApi(client.ApiClient(configuration))
 
     async def execute(self, intent: StoredActionIntent) -> ToolResult:
+        cluster_error = self._intent_cluster_error(intent)
+        if cluster_error is not None:
+            raise ValueError(cluster_error)
         body = build_sentinel_remediation(intent)
         namespace = body["metadata"]["namespace"]
         if namespace != self.namespace:
@@ -454,6 +485,13 @@ class KubernetesRemediationGateway:
         intent: StoredActionIntent,
     ) -> RemediationObservation:
         """Read an existing contract without ever creating or replaying it."""
+        cluster_error = self._intent_cluster_error(intent)
+        if cluster_error is not None:
+            return RemediationObservation(
+                state="unknown",
+                reason=cluster_error,
+                retryable=False,
+            )
         expected = build_sentinel_remediation(intent)
         if expected["metadata"]["namespace"] != self.namespace:
             return RemediationObservation(
@@ -471,6 +509,27 @@ class KubernetesRemediationGateway:
                 )
             raise
         return self._interpret_resource(intent, resource)
+
+    def _intent_cluster_error(self, intent: StoredActionIntent) -> str | None:
+        try:
+            intent_cluster_id = _required_cluster_id(
+                intent.cluster_id,
+                "intent.cluster_id",
+            )
+            precondition_cluster_id = _required_cluster_id(
+                intent.precondition.get("cluster_id"),
+                "precondition.cluster_id",
+            )
+        except ValueError as exc:
+            return str(exc)
+        if intent_cluster_id != precondition_cluster_id:
+            return "Action Intent 与执行快照的 cluster_id 不一致"
+        if intent_cluster_id != self.cluster_id:
+            return (
+                f"Action Intent 绑定集群 {intent_cluster_id!r}，"
+                f"当前 Executor 只允许集群 {self.cluster_id!r}"
+            )
+        return None
 
     async def _create_or_confirm(
         self,
@@ -821,6 +880,7 @@ class KubernetesRemediationGateway:
             if isinstance(item, dict) and item.get("type") == "Executed"
         )
         content = {
+            "cluster_id": intent.cluster_id,
             "sentinel_remediation": intent.idempotency_key,
             "remediation_uid": metadata["uid"],
             "remediation_generation": metadata["generation"],

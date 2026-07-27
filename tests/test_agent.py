@@ -102,8 +102,8 @@ class ReflectionProvider:
 
 
 class RecordingSimulator(SimulatedKubernetesBackend):
-    def __init__(self) -> None:
-        super().__init__(scenario="bad_rollout")
+    def __init__(self, *, cluster_id: str = "local") -> None:
+        super().__init__(scenario="bad_rollout", cluster_id=cluster_id)
         self.calls: list[str] = []
 
     async def call(self, name, arguments) -> ToolResult:
@@ -933,6 +933,7 @@ async def test_approved_action_runs_fresh_preflight_before_write() -> None:
 
     record = await agent.start(make_alert())
     assert record.approval is not None
+    assert record.approval.preflight_snapshot["cluster_id"] == "local"
     assert record.approval.preflight_snapshot["current_revision"] == 2
 
     record = await agent.resume(
@@ -1009,6 +1010,24 @@ async def test_alert_namespace_mismatch_is_rejected_before_approval_or_write() -
         event for event in record.timeline if event.type == "approval.invalidated"
     )
     assert "namespace" in invalidated.data["reason"]
+
+
+@pytest.mark.asyncio
+async def test_alert_cluster_mismatch_is_rejected_before_approval_or_write() -> None:
+    backend = RecordingSimulator(cluster_id="cluster-b")
+    agent = IncidentAgent(provider=RuleBasedProvider(), tools=ToolRegistry(backend))
+    alert = make_alert().model_copy(update={"cluster_id": "cluster-a"})
+
+    record = await agent.start(alert)
+
+    assert record.status == IncidentStatus.ESCALATED
+    assert record.approval is None
+    assert record.execution_results == []
+    assert "rollback_deployment" not in backend.calls
+    invalidated = next(
+        event for event in record.timeline if event.type == "approval.invalidated"
+    )
+    assert "集群身份" in invalidated.data["reason"]
 
 
 @pytest.mark.asyncio

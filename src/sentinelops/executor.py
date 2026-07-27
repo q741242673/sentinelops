@@ -133,6 +133,7 @@ class ExecutorWorker:
         tools: ToolRegistry | None,
         *,
         owner_id: str,
+        cluster_id: str,
         remediation_gateway: RemediationGateway | None = None,
         claim_ttl_seconds: float = 60,
         poll_interval_seconds: float = 0.5,
@@ -145,7 +146,11 @@ class ExecutorWorker:
         self.remediation_gateway = remediation_gateway
         if self.tools is None and self.remediation_gateway is None:
             raise ValueError("Executor requires a direct tool registry or Controller gateway")
+        cluster_id = cluster_id.strip()
+        if not cluster_id:
+            raise ValueError("Executor requires a non-empty cluster_id")
         self.owner_id = owner_id
+        self.cluster_id = cluster_id
         self.claim_ttl_seconds = claim_ttl_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.missing_contract_grace_seconds = missing_contract_grace_seconds
@@ -159,12 +164,17 @@ class ExecutorWorker:
 
     async def _execute_once(self) -> bool:
         claim = await self.store.claim_action_execution(
+            cluster_id=self.cluster_id,
             owner_id=self.owner_id,
             attempt_id=str(uuid4()),
             ttl_seconds=self.claim_ttl_seconds,
         )
         if claim is None:
             return False
+        if claim.cluster_id != self.cluster_id:
+            raise RuntimeError(
+                "Store returned an action claim for a different cluster"
+            )
 
         async def heartbeat() -> None:
             while True:
@@ -177,6 +187,13 @@ class ExecutorWorker:
         heartbeat_task = asyncio.create_task(heartbeat())
         try:
             dispatched = await self.store.mark_action_dispatched(claim)
+            if (
+                dispatched.cluster_id != self.cluster_id
+                or dispatched.precondition.get("cluster_id") != self.cluster_id
+            ):
+                raise RuntimeError(
+                    "Action Intent cluster identity changed after claim"
+                )
             if self.remediation_gateway is not None:
                 result = await self.remediation_gateway.execute(dispatched)
             else:
@@ -204,11 +221,20 @@ class ExecutorWorker:
         if self.remediation_gateway is None:
             return False
         claim = await self.store.claim_action_reconciliation(
+            cluster_id=self.cluster_id,
             owner_id=self.owner_id,
             ttl_seconds=self.claim_ttl_seconds,
         )
         if claim is None:
             return False
+        if (
+            claim.cluster_id != self.cluster_id
+            or claim.intent.cluster_id != self.cluster_id
+            or claim.intent.precondition.get("cluster_id") != self.cluster_id
+        ):
+            raise RuntimeError(
+                "Store returned a reconciliation claim for a different cluster"
+            )
         retry_after = min(
             30.0,
             max(1.0, float(2 ** min(claim.attempt_count - 1, 5))),

@@ -38,6 +38,12 @@ RISK_ORDER: dict[RiskLevel, int] = {
 
 class Alert(BaseModel):
     name: str
+    cluster_id: str = Field(
+        default="local",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+    )
     namespace: str = "default"
     service: str
     severity: Literal["info", "warning", "critical"] = "warning"

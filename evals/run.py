@@ -133,6 +133,7 @@ class StaticEvidenceBackend:
             }
         else:
             content = {}
+        content.setdefault("cluster_id", "local")
         return ToolResult(
             tool_name=name,
             success=True,

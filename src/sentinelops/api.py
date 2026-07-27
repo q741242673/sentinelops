@@ -167,7 +167,7 @@ operator_authenticator: OIDCAuthenticator | None = None
 embedded_executor_task: asyncio.Task[None] | None = None
 embedded_executor_tools: ToolRegistry | None = None
 worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid4()}"
-alert_fingerprints: dict[str, str] = {}
+alert_fingerprints: dict[tuple[str, str], str] = {}
 resolved_incident_ids: set[str] = set()
 incident_tasks: set[asyncio.Task[None]] = set()
 demo_fault_tasks: set[asyncio.Task[None]] = set()
@@ -278,6 +278,8 @@ class RuntimeInfo(BaseModel):
     tool_backend: str
     model_provider: str
     model_name: str
+    cluster_id: str
+    cluster_display_name: str
     namespace: str
     approval_mode: str = "human_gated"
     alert_ingestion: str = "alertmanager_webhook"
@@ -307,20 +309,27 @@ def _fingerprint(alert: AlertmanagerAlert) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:24]
 
 
+def _alert_binding_key(source_id: str, fingerprint: str) -> tuple[str, str]:
+    return source_id, fingerprint
+
+
 def _alert_from_alertmanager(item: AlertmanagerAlert, fingerprint: str) -> Alert:
-    source_id = get_settings().alertmanager_source_id
+    settings = get_settings()
+    source_id = settings.alertmanager_source_id
     severity = item.labels.get("severity", "warning")
     if severity not in {"info", "warning", "critical"}:
         severity = "warning"
     return Alert(
         name=item.labels.get("alertname", "UnknownAlert"),
-        namespace=item.labels.get("namespace", get_settings().kubernetes_namespace),
+        namespace=item.labels.get("namespace", settings.kubernetes_namespace),
         service=item.labels.get("service", "unknown-service"),
         severity=severity,
         summary=item.annotations.get("summary", "Alertmanager reported a firing alert"),
+        cluster_id=settings.cluster_id,
         starts_at=_alertmanager_time(item.startsAt) or datetime.now(UTC),
         labels={
             **item.labels,
+            "cluster_id": settings.cluster_id,
             "source": "alertmanager",
             "alertmanager_source_id": source_id,
             "alertmanager_fingerprint": fingerprint,
@@ -639,6 +648,14 @@ async def initialize_persistence(
         raise RuntimeError(
             "生产环境必须配置稳定且唯一的 SENTINELOPS_ALERTMANAGER_SOURCE_ID"
         )
+    if production and settings.cluster_id in {
+        "local",
+        "default",
+        "legacy-unassigned",
+    }:
+        raise RuntimeError(
+            "生产环境必须配置稳定且唯一的 SENTINELOPS_CLUSTER_ID"
+        )
     if production and settings.database_auto_create:
         raise RuntimeError(
             "生产环境禁止自动建表；请使用单独的 sentinelops db-init 迁移任务"
@@ -700,7 +717,9 @@ async def initialize_persistence(
                 successful=False,
             )
         stored_incidents = await store.list()
-        recoverable_incidents = await store.list_recoverable()
+        recoverable_incidents = await store.list_recoverable(
+            cluster_id=settings.cluster_id
+        )
     except Exception:
         await store.close()
         incident_store = None
@@ -723,26 +742,38 @@ async def initialize_persistence(
         incident_records[record.id] = record
         incident_versions[record.id] = stored.version
         fingerprint = record.alert.labels.get("alertmanager_fingerprint")
-        if fingerprint and record.status not in {
-            IncidentStatus.RESOLVED,
-            IncidentStatus.REJECTED,
-            IncidentStatus.FAILED,
-            IncidentStatus.ESCALATED,
-        }:
-            alert_fingerprints[fingerprint] = record.id
+        source_id = record.alert.labels.get("alertmanager_source_id")
+        if (
+            fingerprint
+            and source_id
+            and record.alert.cluster_id == settings.cluster_id
+            and record.status not in {
+                IncidentStatus.RESOLVED,
+                IncidentStatus.REJECTED,
+                IncidentStatus.FAILED,
+                IncidentStatus.ESCALATED,
+            }
+        ):
+            alert_fingerprints[_alert_binding_key(source_id, fingerprint)] = record.id
 
     for stored in recoverable_incidents:
         record = stored.record
         incident_records[record.id] = record
         incident_versions[record.id] = stored.version
         fingerprint = record.alert.labels.get("alertmanager_fingerprint")
-        if fingerprint and record.status not in {
-            IncidentStatus.RESOLVED,
-            IncidentStatus.REJECTED,
-            IncidentStatus.FAILED,
-            IncidentStatus.ESCALATED,
-        }:
-            alert_fingerprints[fingerprint] = record.id
+        source_id = record.alert.labels.get("alertmanager_source_id")
+        if (
+            fingerprint
+            and source_id
+            and record.alert.cluster_id == settings.cluster_id
+            and record.status not in {
+                IncidentStatus.RESOLVED,
+                IncidentStatus.REJECTED,
+                IncidentStatus.FAILED,
+                IncidentStatus.ESCALATED,
+            }
+        ):
+            alert_fingerprints[_alert_binding_key(source_id, fingerprint)] = record.id
         await _reconcile_stored_incident(store, stored, settings=settings)
 
     if settings.operator_auth_mode == "oidc":
@@ -758,9 +789,11 @@ async def initialize_persistence(
                 else None
             ),
             owner_id=f"embedded-executor:{worker_id}",
+            cluster_id=settings.cluster_id,
             remediation_gateway=(
                 KubernetesRemediationGateway(
                     settings.kubernetes_namespace,
+                    cluster_id=settings.cluster_id,
                     poll_interval_seconds=settings.executor_poll_interval_seconds,
                     result_timeout_seconds=settings.executor_result_timeout_seconds,
                 )
@@ -783,6 +816,8 @@ async def _reconcile_stored_incident(
     settings: Settings,
 ) -> None:
     record = stored.record
+    if record.alert.cluster_id != settings.cluster_id:
+        return
     nonterminal = record.status in {
         IncidentStatus.RECEIVED,
         IncidentStatus.INVESTIGATING,
@@ -922,7 +957,11 @@ async def _reconcile_persistence_once() -> None:
     if incident_store is None:
         return
     settings = get_settings()
-    for stored in await incident_store.list_recoverable():
+    for stored in await incident_store.list_recoverable(
+        cluster_id=settings.cluster_id
+    ):
+        if stored.record.alert.cluster_id != settings.cluster_id:
+            continue
         incident_records[stored.record.id] = stored.record
         incident_versions[stored.record.id] = stored.version
         try:
@@ -1253,11 +1292,13 @@ async def _investigate_alert(
     alert: Alert,
     profile: LabIncidentProfile | None = None,
 ) -> None:
+    settings = get_settings()
+    if alert.cluster_id != settings.cluster_id:
+        return
     lease_token: LeaseToken | None = None
     try:
         async with _incident_lease(incident_id) as token:
             lease_token = token
-            settings = get_settings()
             fingerprint = alert.labels.get("alertmanager_fingerprint")
             if incident_store is not None and fingerprint:
                 source_id = alert.labels.get(
@@ -1355,6 +1396,8 @@ def _schedule_investigation(
     alert: Alert,
     profile: LabIncidentProfile | None = None,
 ) -> None:
+    if alert.cluster_id != get_settings().cluster_id:
+        return
     task = asyncio.create_task(_investigate_alert(incident_id, alert, profile))
     incident_tasks.add(task)
     task.add_done_callback(incident_tasks.discard)
@@ -1499,6 +1542,15 @@ async def decide_audit_anchor_unlock_request(
 
 @app.post("/api/v1/incidents", response_model=IncidentRecord, status_code=201)
 async def create_incident(alert: Alert) -> IncidentRecord:
+    settings = get_settings()
+    if alert.cluster_id != settings.cluster_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"事故绑定集群 {alert.cluster_id} 与当前控制面集群 "
+                f"{settings.cluster_id} 不一致"
+            ),
+        )
     placeholder = IncidentRecord(alert=alert)
     _publish_incident(placeholder)
     await _persist_incident(placeholder)
@@ -1782,10 +1834,10 @@ def _job_profile_mode(job: DemoFaultJob) -> LabMode:
 async def _release_demo_alert_deduplication() -> None:
     demo_alerts = {"HighInventoryErrorRate", "InventoryTransientRuntimeFault"}
     released_incident_ids: set[str] = set()
-    for fingerprint, incident_id in list(alert_fingerprints.items()):
+    for binding_key, incident_id in list(alert_fingerprints.items()):
         record = incident_records.get(incident_id)
         if record and record.alert.name in demo_alerts:
-            alert_fingerprints.pop(fingerprint, None)
+            alert_fingerprints.pop(binding_key, None)
             released_incident_ids.add(incident_id)
     if incident_store is not None:
         await incident_store.release_alert_bindings(released_incident_ids)
@@ -1821,6 +1873,8 @@ async def receive_alertmanager_webhook(
     accepted: list[dict[str, object]] = []
     for item in payload.alerts:
         fingerprint = _fingerprint(item)
+        source_id = settings.alertmanager_source_id
+        binding_key = _alert_binding_key(source_id, fingerprint)
         if item.status == "resolved":
             incident_id: str | None = None
             durable_resolution: StoredIncident | None = None
@@ -1844,11 +1898,11 @@ async def receive_alertmanager_webhook(
                     "stale" if resolution.outcome == "stale" else "resolved"
                 )
                 if resolution_status == "stale" and incident_id is not None:
-                    alert_fingerprints[fingerprint] = incident_id
+                    alert_fingerprints[binding_key] = incident_id
                 else:
-                    alert_fingerprints.pop(fingerprint, None)
+                    alert_fingerprints.pop(binding_key, None)
             else:
-                incident_id = alert_fingerprints.pop(fingerprint, None)
+                incident_id = alert_fingerprints.pop(binding_key, None)
             if incident_id:
                 if resolution_status != "stale":
                     resolved_incident_ids.add(incident_id)
@@ -1897,7 +1951,7 @@ async def receive_alertmanager_webhook(
         if item.status != "firing":
             continue
         existing_id = (
-            alert_fingerprints.get(fingerprint)
+            alert_fingerprints.get(binding_key)
             if incident_store is None
             else None
         )
@@ -1975,7 +2029,7 @@ async def receive_alertmanager_webhook(
                 incident_versions[claim.incident_id] = claim.incident.version
                 _publish_incident(durable_record)
                 if claim.outcome in {"accepted", "deduplicated"}:
-                    alert_fingerprints[fingerprint] = claim.incident_id
+                    alert_fingerprints[binding_key] = claim.incident_id
                     if (
                         claim.outcome == "accepted"
                         and profile
@@ -2012,7 +2066,7 @@ async def receive_alertmanager_webhook(
             demo_fault_jobs[profile.run_id] = demo_fault_jobs[profile.run_id].model_copy(
                 update={"phase": "incident_started", "incident_id": placeholder.id}
             )
-        alert_fingerprints[fingerprint] = placeholder.id
+        alert_fingerprints[binding_key] = placeholder.id
         _schedule_investigation(placeholder.id, alert, profile)
         accepted.append(
             {
@@ -2026,12 +2080,23 @@ async def receive_alertmanager_webhook(
 
 @app.get("/api/v1/incidents", response_model=list[IncidentRecord])
 async def list_incidents() -> list[IncidentRecord]:
+    cluster_id = get_settings().cluster_id
     if incident_store is not None:
         stored_records = await incident_store.list()
         for stored in stored_records:
+            if stored.record.alert.cluster_id != cluster_id:
+                continue
             incident_records[stored.record.id] = stored.record
             incident_versions[stored.record.id] = stored.version
-    return sorted(incident_records.values(), key=lambda record: record.created_at, reverse=True)
+    return sorted(
+        (
+            record
+            for record in incident_records.values()
+            if record.alert.cluster_id == cluster_id
+        ),
+        key=lambda record: record.created_at,
+        reverse=True,
+    )
 
 
 @app.get("/api/v1/runtime", response_model=RuntimeInfo)
@@ -2042,6 +2107,8 @@ async def get_runtime() -> RuntimeInfo:
         tool_backend=settings.tool_backend,
         model_provider=settings.model_provider,
         model_name=settings.model_name,
+        cluster_id=settings.cluster_id,
+        cluster_display_name=settings.cluster_display_name,
         namespace=settings.kubernetes_namespace,
         approval_mode="risk_based",
     )
@@ -2081,16 +2148,20 @@ async def stream_all_incidents(request: Request) -> StreamingResponse:
 
 @app.get("/api/v1/incidents/{incident_id}", response_model=IncidentRecord)
 async def get_incident(incident_id: str) -> IncidentRecord:
+    cluster_id = get_settings().cluster_id
     if incident_store is not None:
         stored = await incident_store.get(incident_id)
-        if stored is not None:
+        if stored is not None and stored.record.alert.cluster_id == cluster_id:
             incident_records[incident_id] = stored.record
             incident_versions[incident_id] = stored.version
             return stored.record
     try:
-        return incident_records[incident_id]
+        record = incident_records[incident_id]
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Incident not found") from exc
+    if record.alert.cluster_id != cluster_id:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    return record
 
 
 @app.post(
@@ -2115,6 +2186,11 @@ async def _build_incident_change_proposal(
             detail="只有已停止自动写入的事故才能创建动态变更提案",
         )
     settings = get_settings()
+    if record.alert.cluster_id != settings.cluster_id:
+        raise HTTPException(
+            status_code=409,
+            detail="事故不属于当前控制面绑定的集群，禁止读取本集群快照",
+        )
     if record.alert.namespace != settings.kubernetes_namespace:
         raise HTTPException(
             status_code=409,
@@ -2213,7 +2289,8 @@ async def stream_incident(
     incident_id: str,
     request: Request,
 ) -> StreamingResponse:
-    if incident_id not in incident_records:
+    record = incident_records.get(incident_id)
+    if record is None or record.alert.cluster_id != get_settings().cluster_id:
         raise HTTPException(status_code=404, detail="Incident not found")
 
     async def events() -> AsyncIterator[str]:
@@ -2255,6 +2332,16 @@ async def decide_incident(
     decision: ApprovalDecision,
     request: Request,
 ) -> IncidentRecord:
+    current = await get_incident(incident_id)
+    settings = get_settings()
+    if current.alert.cluster_id != settings.cluster_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"事故属于集群 {current.alert.cluster_id}，当前控制面仅执行 "
+                f"{settings.cluster_id} 的操作"
+            ),
+        )
     identity = getattr(
         request.state,
         "operator_identity",

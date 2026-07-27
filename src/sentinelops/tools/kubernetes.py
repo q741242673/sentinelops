@@ -24,8 +24,12 @@ from sentinelops.tools.base import tool_call_fingerprint
 class KubernetesBackend:
     """Kubernetes API backend using kubeconfig locally and ServiceAccount in-cluster."""
 
-    def __init__(self, namespace: str) -> None:
+    def __init__(self, namespace: str, *, cluster_id: str = "local") -> None:
+        cluster_id = cluster_id.strip()
+        if not cluster_id:
+            raise ValueError("Kubernetes backend requires a non-empty cluster_id")
         self.namespace = namespace
+        self.cluster_id = cluster_id
         try:
             config.load_incluster_config()
         except ConfigException:
@@ -53,6 +57,7 @@ class KubernetesBackend:
             return ToolResult(tool_name=name, success=False, error=f"Unknown tool: {name}")
         try:
             content = await asyncio.to_thread(handler, arguments)
+            content.setdefault("cluster_id", self.cluster_id)
             return ToolResult(
                 tool_name=name,
                 success=True,
@@ -440,6 +445,8 @@ class KubernetesBackend:
             raise RuntimeError(
                 "Execution precondition failed: guarded tool or arguments changed"
             )
+        if precondition.get("cluster_id") != self.cluster_id:
+            raise RuntimeError("Execution precondition failed: cluster_id")
         deployment = self.apps.read_namespaced_deployment(
             name,
             self.namespace,
@@ -473,6 +480,7 @@ class KubernetesBackend:
         if current is None:
             raise RuntimeError("Execution precondition failed: current revision is unknown")
         actual = {
+            "cluster_id": self.cluster_id,
             "namespace": self.namespace,
             "target": name,
             "deployment_uid": str(deployment.metadata.uid),

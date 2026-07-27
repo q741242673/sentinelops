@@ -249,9 +249,14 @@ def build_tool_registry(
     allow_guarded_writes: bool = True,
 ) -> ToolRegistry:
     if settings.tool_backend == "simulator":
-        kubernetes: ToolBackend = SimulatedKubernetesBackend()
+        kubernetes: ToolBackend = SimulatedKubernetesBackend(
+            cluster_id=settings.cluster_id,
+        )
     else:
-        kubernetes = KubernetesBackend(namespace=settings.kubernetes_namespace)
+        kubernetes = KubernetesBackend(
+            namespace=settings.kubernetes_namespace,
+            cluster_id=settings.cluster_id,
+        )
     specs = list(KUBERNETES_TOOL_SPECS)
     routes: dict[str, ToolBackend] = {spec.name: kubernetes for spec in KUBERNETES_TOOL_SPECS}
     if settings.tool_backend == "kubernetes" and (

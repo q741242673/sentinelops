@@ -65,6 +65,7 @@ async def test_demo_write_helpers_are_forbidden_in_production(
     monkeypatch.setattr(demo_module.httpx, "AsyncClient", unexpected_client)
     settings = Settings(
         environment="production",
+        cluster_id="prod-cluster",
         tool_backend="kubernetes",
         demo_enabled=True,
         demo_inventory_url="http://inventory.test",

@@ -137,6 +137,8 @@ spec:
           env:
             - name: SENTINELOPS_KUBERNETES_NAMESPACE
               value: sentinelops-demo
+            - name: SENTINELOPS_CLUSTER_ID
+              value: local-kind
           readinessProbe:
             httpGet:
               path: /readyz

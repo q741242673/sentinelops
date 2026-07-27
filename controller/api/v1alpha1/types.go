@@ -31,6 +31,7 @@ type ActionParameters struct {
 type RemediationTarget struct {
 	APIVersion string    `json:"apiVersion"`
 	Kind       string    `json:"kind"`
+	ClusterID  string    `json:"clusterId"`
 	Namespace  string    `json:"namespace"`
 	Name       string    `json:"name"`
 	UID        types.UID `json:"uid"`
@@ -38,6 +39,7 @@ type RemediationTarget struct {
 
 type ExecutionPrecondition struct {
 	SnapshotDigest       string          `json:"snapshotDigest"`
+	ClusterID            string          `json:"clusterId"`
 	ResourceVersion      string          `json:"resourceVersion"`
 	Generation           int64           `json:"generation"`
 	DesiredReplicas      int32           `json:"desiredReplicas"`

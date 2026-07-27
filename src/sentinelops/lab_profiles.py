@@ -33,7 +33,12 @@ def build_simulated_lab_agent(
     """Build the deterministic offline Lab without changing production runtime wiring."""
     return IncidentAgent(
         provider=RuleBasedProvider(),
-        tools=ToolRegistry(SimulatedKubernetesBackend(scenario=scenario)),
+        tools=ToolRegistry(
+            SimulatedKubernetesBackend(
+                scenario=scenario,
+                cluster_id=settings.cluster_id,
+            )
+        ),
         auto_approve_max_risk=(
             auto_approve_max_risk or RiskLevel(settings.auto_approve_max_risk)
         ),

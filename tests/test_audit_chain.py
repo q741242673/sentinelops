@@ -76,10 +76,11 @@ async def test_hmac_audit_chain_covers_approval_and_action_boundary(tmp_path) ->
         lease,
         idempotency_key="a" * 64,
         action=record.approval.action,
-        precondition={"resource_version": "17"},
+        precondition={"cluster_id": "local", "resource_version": "17"},
     )
     await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
     claim = await store.claim_action_execution(
+        cluster_id="local",
         owner_id="executor-a",
         attempt_id="attempt-a",
         ttl_seconds=60,

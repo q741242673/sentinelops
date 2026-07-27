@@ -85,6 +85,7 @@ incidents = Table(
     "sentinelops_incidents",
     metadata,
     Column("id", String(64), primary_key=True),
+    Column("cluster_id", String(128), nullable=False, index=True),
     Column("version", BigInteger, nullable=False),
     Column("status", String(32), nullable=False, index=True),
     Column("execution_profile_id", String(160), nullable=False),
@@ -285,6 +286,7 @@ action_intents = Table(
     metadata,
     Column("idempotency_key", String(64), primary_key=True),
     Column("incident_id", String(64), nullable=False, index=True),
+    Column("cluster_id", String(128), nullable=False, index=True),
     Column("lease_generation", BigInteger, nullable=False),
     Column("approval_id", String(64), nullable=True),
     Column("approval_version", Integer, nullable=True),
@@ -2633,11 +2635,15 @@ class SqlIncidentStore:
         lease_token: LeaseToken | None = None,
     ) -> StoredIncident:
         now = datetime.now(UTC).isoformat()
+        cluster_id = record.alert.cluster_id
+        if not cluster_id.strip():
+            raise StoreConflictError("incident cluster_id 不能为空")
         payload = record.model_dump(mode="json")
         payload["updated_at"] = now
         new_version = 1 if expected_version is None else expected_version + 1
         values = {
             "id": record.id,
+            "cluster_id": cluster_id,
             "version": new_version,
             "status": record.status.value,
             "execution_profile_id": record.execution_profile_id,
@@ -2662,6 +2668,7 @@ class SqlIncidentStore:
                         update(incidents)
                         .where(
                             incidents.c.id == record.id,
+                            incidents.c.cluster_id == cluster_id,
                             incidents.c.version == expected_version,
                         )
                         .values(**{key: value for key, value in values.items() if key != "id"})
@@ -2711,6 +2718,7 @@ class SqlIncidentStore:
                 await connection.execute(
                     select(
                         incidents.c.record,
+                        incidents.c.cluster_id,
                         incidents.c.version,
                         incidents.c.graph_state,
                     ).where(incidents.c.id == incident_id)
@@ -2724,6 +2732,7 @@ class SqlIncidentStore:
                 await connection.execute(
                     select(
                         incidents.c.record,
+                        incidents.c.cluster_id,
                         incidents.c.version,
                         incidents.c.graph_state,
                     )
@@ -2733,16 +2742,24 @@ class SqlIncidentStore:
             ).mappings()
             return [self._stored(row) for row in rows]
 
-    async def list_recoverable(self) -> list[StoredIncident]:
+    async def list_recoverable(
+        self,
+        *,
+        cluster_id: str,
+    ) -> list[StoredIncident]:
+        if not cluster_id.strip():
+            raise ValueError("cluster_id 不能为空")
         async with self.engine.connect() as connection:
             rows = (
                 await connection.execute(
                     select(
                         incidents.c.record,
+                        incidents.c.cluster_id,
                         incidents.c.version,
                         incidents.c.graph_state,
                     )
                     .where(
+                        incidents.c.cluster_id == cluster_id,
                         incidents.c.status.in_(
                             [
                                 "received",
@@ -3501,6 +3518,24 @@ class SqlIncidentStore:
                 now = await self._database_now(connection)
                 await self._assert_active_lease(connection, token, now=now)
                 await self._assert_dispatch_allowed(connection, token.incident_id)
+                incident_cluster_id = (
+                    await connection.execute(
+                        select(incidents.c.cluster_id)
+                        .where(incidents.c.id == token.incident_id)
+                        .with_for_update(read=True)
+                    )
+                ).scalar_one_or_none()
+                if incident_cluster_id is None:
+                    raise ActionIntentConflictError("持久化事故不存在")
+                precondition_cluster_id = precondition.get("cluster_id")
+                if (
+                    not isinstance(precondition_cluster_id, str)
+                    or not precondition_cluster_id.strip()
+                    or precondition_cluster_id != incident_cluster_id
+                ):
+                    raise ActionIntentConflictError(
+                        "Action Intent cluster_id 与事故绑定集群不一致"
+                    )
                 approval_row = (
                     await connection.execute(
                         select(
@@ -3524,6 +3559,7 @@ class SqlIncidentStore:
                     stored = self._stored_action(existing)
                     if (
                         stored.incident_id != token.incident_id
+                        or stored.cluster_id != incident_cluster_id
                         or stored.action.model_dump(mode="json") != action_payload
                         or stored.precondition != precondition
                     ):
@@ -3573,6 +3609,7 @@ class SqlIncidentStore:
                         return StoredActionIntent(
                             idempotency_key=stored.idempotency_key,
                             incident_id=stored.incident_id,
+                            cluster_id=stored.cluster_id,
                             lease_generation=token.generation,
                             approval_id=stored.approval_id,
                             approval_version=stored.approval_version,
@@ -3591,6 +3628,7 @@ class SqlIncidentStore:
                     insert(action_intents).values(
                         idempotency_key=idempotency_key,
                         incident_id=token.incident_id,
+                        cluster_id=incident_cluster_id,
                         lease_generation=token.generation,
                         approval_id=(
                             approval_row["approval_id"] if approval_row is not None else None
@@ -3692,10 +3730,13 @@ class SqlIncidentStore:
     async def claim_action_execution(
         self,
         *,
+        cluster_id: str,
         owner_id: str,
         attempt_id: str,
         ttl_seconds: float,
     ) -> ExecutorClaim | None:
+        if not cluster_id.strip():
+            raise ValueError("cluster_id 不能为空")
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
             expired_claims = list(
@@ -3703,6 +3744,7 @@ class SqlIncidentStore:
                     await connection.execute(
                         select(action_intents)
                         .where(
+                            action_intents.c.cluster_id == cluster_id,
                             action_intents.c.status == "claimed",
                             action_intents.c.executor_lease_until
                             <= now.isoformat(),
@@ -3717,6 +3759,7 @@ class SqlIncidentStore:
                     .where(
                         action_intents.c.idempotency_key
                         == expired["idempotency_key"],
+                        action_intents.c.cluster_id == cluster_id,
                         action_intents.c.status == "claimed",
                     )
                     .values(
@@ -3757,6 +3800,7 @@ class SqlIncidentStore:
                     await connection.execute(
                         select(action_intents)
                         .where(
+                            action_intents.c.cluster_id == cluster_id,
                             action_intents.c.status == "dispatched",
                             action_intents.c.executor_lease_until
                             <= now.isoformat(),
@@ -3771,6 +3815,7 @@ class SqlIncidentStore:
                     .where(
                         action_intents.c.idempotency_key
                         == expired["idempotency_key"],
+                        action_intents.c.cluster_id == cluster_id,
                         action_intents.c.status == "dispatched",
                     )
                     .values(
@@ -3808,7 +3853,10 @@ class SqlIncidentStore:
             row = (
                 await connection.execute(
                     select(action_intents)
-                    .where(action_intents.c.status == "queued")
+                    .where(
+                        action_intents.c.cluster_id == cluster_id,
+                        action_intents.c.status == "queued",
+                    )
                     .order_by(action_intents.c.queued_at.asc())
                     .limit(1)
                     .with_for_update(skip_locked=True)
@@ -3822,6 +3870,7 @@ class SqlIncidentStore:
                 update(action_intents)
                 .where(
                     action_intents.c.idempotency_key == row["idempotency_key"],
+                    action_intents.c.cluster_id == cluster_id,
                     action_intents.c.status == "queued",
                 )
                 .values(
@@ -3862,6 +3911,7 @@ class SqlIncidentStore:
         return ExecutorClaim(
             idempotency_key=row["idempotency_key"],
             incident_id=row["incident_id"],
+            cluster_id=cluster_id,
             owner_id=owner_id,
             generation=generation,
             attempt_id=attempt_id,
@@ -3882,6 +3932,7 @@ class SqlIncidentStore:
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
@@ -3898,6 +3949,7 @@ class SqlIncidentStore:
         return ExecutorClaim(
             idempotency_key=claim.idempotency_key,
             incident_id=claim.incident_id,
+            cluster_id=claim.cluster_id,
             owner_id=claim.owner_id,
             generation=claim.generation,
             attempt_id=claim.attempt_id,
@@ -3920,6 +3972,7 @@ class SqlIncidentStore:
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
@@ -3986,6 +4039,7 @@ class SqlIncidentStore:
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
@@ -4009,6 +4063,7 @@ class SqlIncidentStore:
                 ).mappings().one_or_none()
                 if (
                     existing is None
+                    or existing["cluster_id"] != claim.cluster_id
                     or existing["attempt_id"] != claim.attempt_id
                     or existing["status"] not in {"succeeded", "failed"}
                     or existing["result"] != result.model_dump(mode="json")
@@ -4066,14 +4121,22 @@ class SqlIncidentStore:
     async def claim_action_reconciliation(
         self,
         *,
+        cluster_id: str,
         owner_id: str,
         ttl_seconds: float,
     ) -> ActionReconciliationClaim | None:
+        if not cluster_id.strip():
+            raise ValueError("cluster_id 不能为空")
         async with self.engine.begin() as connection:
             now = await self._database_now(connection)
             await connection.execute(
                 update(action_reconciliation_outbox)
                 .where(
+                    action_reconciliation_outbox.c.action_id.in_(
+                        select(action_intents.c.idempotency_key).where(
+                            action_intents.c.cluster_id == cluster_id
+                        )
+                    ),
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claim_until
                     <= now.isoformat(),
@@ -4104,6 +4167,7 @@ class SqlIncidentStore:
                             == action_intents.c.idempotency_key,
                         )
                         .where(
+                            action_intents.c.cluster_id == cluster_id,
                             action_reconciliation_outbox.c.status == "pending",
                             action_reconciliation_outbox.c.next_attempt_at
                             <= now.isoformat(),
@@ -4156,6 +4220,7 @@ class SqlIncidentStore:
                 )
             return ActionReconciliationClaim(
                 intent=self._stored_action(row),
+                cluster_id=cluster_id,
                 owner_id=owner_id,
                 generation=generation,
                 attempt_id=attempt_id,
@@ -4184,6 +4249,7 @@ class SqlIncidentStore:
                     action_intents.c.idempotency_key
                     == intent.idempotency_key,
                     action_intents.c.incident_id == intent.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_generation
                     == intent.executor_generation,
                     action_intents.c.attempt_id == intent.attempt_id,
@@ -4213,6 +4279,7 @@ class SqlIncidentStore:
                 if (
                     existing is None
                     or existing["incident_id"] != intent.incident_id
+                    or existing["cluster_id"] != claim.cluster_id
                     or existing["executor_generation"]
                     != intent.executor_generation
                     or existing["attempt_id"] != intent.attempt_id
@@ -4379,6 +4446,7 @@ class SqlIncidentStore:
                     == claim.intent.idempotency_key,
                     action_intents.c.incident_id
                     == claim.intent.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_generation
                     == claim.intent.executor_generation,
                     action_intents.c.attempt_id
@@ -4439,6 +4507,7 @@ class SqlIncidentStore:
                     == claim.intent.idempotency_key,
                     action_intents.c.incident_id
                     == claim.intent.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_generation
                     == claim.intent.executor_generation,
                     action_intents.c.attempt_id
@@ -4460,6 +4529,7 @@ class SqlIncidentStore:
                         == claim.intent.idempotency_key,
                         action_intents.c.incident_id
                         == claim.intent.incident_id,
+                        action_intents.c.cluster_id == claim.cluster_id,
                         action_intents.c.executor_generation
                         == claim.intent.executor_generation,
                         action_intents.c.attempt_id
@@ -4534,9 +4604,16 @@ class SqlIncidentStore:
     ) -> None:
         current = (
             await connection.execute(
-                select(action_reconciliation_outbox.c.action_id).where(
+                select(action_reconciliation_outbox.c.action_id)
+                .join(
+                    action_intents,
+                    action_intents.c.idempotency_key
+                    == action_reconciliation_outbox.c.action_id,
+                )
+                .where(
                     action_reconciliation_outbox.c.action_id
                     == claim.intent.idempotency_key,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_reconciliation_outbox.c.status == "claimed",
                     action_reconciliation_outbox.c.claimed_by == claim.owner_id,
                     action_reconciliation_outbox.c.claim_generation
@@ -4581,6 +4658,7 @@ class SqlIncidentStore:
                 .where(
                     action_intents.c.idempotency_key == claim.idempotency_key,
                     action_intents.c.incident_id == claim.incident_id,
+                    action_intents.c.cluster_id == claim.cluster_id,
                     action_intents.c.executor_id == claim.owner_id,
                     action_intents.c.executor_generation == claim.generation,
                     action_intents.c.attempt_id == claim.attempt_id,
@@ -5016,12 +5094,16 @@ class SqlIncidentStore:
         *,
         now: datetime,
     ) -> StoredIncident:
+        cluster_id = record.alert.cluster_id
+        if not cluster_id.strip():
+            raise StoreConflictError("incident cluster_id 不能为空")
         stored_record = record.model_copy(deep=True)
         stored_record.updated_at = now
         record_payload = stored_record.model_dump(mode="json")
         await connection.execute(
             insert(incidents).values(
                 id=record.id,
+                cluster_id=cluster_id,
                 version=1,
                 status=record.status.value,
                 execution_profile_id=record.execution_profile_id,
@@ -5082,6 +5164,7 @@ class SqlIncidentStore:
             await connection.execute(
                 select(
                     incidents.c.record,
+                    incidents.c.cluster_id,
                     incidents.c.version,
                     incidents.c.graph_state,
                 ).where(incidents.c.id == incident_id)
@@ -5096,6 +5179,7 @@ class SqlIncidentStore:
         return StoredActionIntent(
             idempotency_key=row["idempotency_key"],
             incident_id=row["incident_id"],
+            cluster_id=row["cluster_id"],
             lease_generation=int(row["lease_generation"]),
             approval_id=row["approval_id"],
             approval_version=(
@@ -5433,8 +5517,13 @@ class SqlIncidentStore:
 
     @staticmethod
     def _stored(row: Any) -> StoredIncident:
+        record = IncidentRecord.model_validate(row["record"])
+        if record.alert.cluster_id != row["cluster_id"]:
+            raise StoreConflictError(
+                "事故快照 cluster_id 与关系表路由围栏不一致"
+            )
         return StoredIncident(
-            record=IncidentRecord.model_validate(row["record"]),
+            record=record,
             version=int(row["version"]),
             graph_state=row["graph_state"],
         )

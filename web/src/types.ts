@@ -10,6 +10,7 @@ export type IncidentStatus =
 
 export interface Alert {
   name: string;
+  cluster_id: string;
   namespace: string;
   service: string;
   severity: "info" | "warning" | "critical";
@@ -132,6 +133,8 @@ export interface RuntimeInfo {
   tool_backend: string;
   model_provider: string;
   model_name: string;
+  cluster_id: string;
+  cluster_display_name: string;
   namespace: string;
   approval_mode: string;
   alert_ingestion: string;

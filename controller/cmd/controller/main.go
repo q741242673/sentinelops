@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"os"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -20,6 +21,9 @@ import (
 )
 
 var scheme = runtime.NewScheme()
+var clusterIDPattern = regexp.MustCompile(
+	`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`,
+)
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -30,6 +34,7 @@ func main() {
 	var metricsAddress string
 	var healthAddress string
 	var watchNamespace string
+	var clusterID string
 	var leaderElectionNamespace string
 	var maxConcurrent int
 	var enableLeaderElection bool
@@ -41,6 +46,12 @@ func main() {
 		"watch-namespace",
 		os.Getenv("SENTINELOPS_KUBERNETES_NAMESPACE"),
 		"single workload namespace to reconcile",
+	)
+	flag.StringVar(
+		&clusterID,
+		"cluster-id",
+		os.Getenv("SENTINELOPS_CLUSTER_ID"),
+		"stable identity of the only cluster this controller may mutate",
 	)
 	flag.StringVar(
 		&leaderElectionNamespace,
@@ -58,6 +69,10 @@ func main() {
 	setupLog := ctrl.Log.WithName("setup")
 	if watchNamespace == "" {
 		setupLog.Error(nil, "watch namespace is required")
+		os.Exit(1)
+	}
+	if !clusterIDPattern.MatchString(clusterID) {
+		setupLog.Error(nil, "cluster id must be a valid DNS label")
 		os.Exit(1)
 	}
 
@@ -137,9 +152,10 @@ func main() {
 		}
 	}
 	reconciler := &remediation.Reconciler{
-		Client:       manager.GetClient(),
-		Scheme:       manager.GetScheme(),
-		ControllerID: controllerID,
+		Client:            manager.GetClient(),
+		Scheme:            manager.GetScheme(),
+		ControllerID:      controllerID,
+		ExpectedClusterID: clusterID,
 	}
 	if integrityChecker != nil {
 		reconciler.AdmissionIntegrity = integrityChecker.Check
@@ -161,6 +177,8 @@ func main() {
 		"starting remediation controller",
 		"watchNamespace",
 		watchNamespace,
+		"clusterId",
+		clusterID,
 		"leaderElection",
 		enableLeaderElection,
 	)

@@ -166,6 +166,7 @@ async def main() -> None:
             agent = build_agent(settings)
             alert = Alert(
                 name=alert_labels.get("alertname", "HighInventoryErrorRate"),
+                cluster_id=settings.cluster_id,
                 namespace=alert_labels.get("namespace", settings.kubernetes_namespace),
                 service=alert_labels.get("service", "inventory-service"),
                 severity=alert_labels.get("severity", "critical"),

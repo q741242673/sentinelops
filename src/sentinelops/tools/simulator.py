@@ -9,8 +9,23 @@ from sentinelops.domain import ToolResult
 class SimulatedKubernetesBackend:
     """Repeatable fault lab used by local development and CI."""
 
-    def __init__(self, scenario: str = "bad_rollout") -> None:
+    WRITE_TOOLS = {
+        "restart_deployment",
+        "rollback_deployment",
+        "scale_deployment",
+    }
+
+    def __init__(
+        self,
+        scenario: str = "bad_rollout",
+        *,
+        cluster_id: str = "local",
+    ) -> None:
+        cluster_id = cluster_id.strip()
+        if not cluster_id:
+            raise ValueError("Simulator backend requires a non-empty cluster_id")
         self.scenario = scenario
+        self.cluster_id = cluster_id
         self.resolved = False
         self.current_revision = 2 if scenario == "bad_rollout" else 1
 
@@ -20,7 +35,16 @@ class SimulatedKubernetesBackend:
         if handler is None:
             return ToolResult(tool_name=name, success=False, error=f"Unknown tool: {name}")
         try:
+            if name in self.WRITE_TOOLS:
+                precondition = arguments.get("_precondition")
+                if not isinstance(precondition, dict):
+                    raise RuntimeError("Missing host-generated execution precondition")
+                if precondition.get("cluster_id") != self.cluster_id:
+                    raise RuntimeError(
+                        "Execution precondition failed: cluster_id"
+                    )
             content = handler(arguments)
+            content.setdefault("cluster_id", self.cluster_id)
             return ToolResult(
                 tool_name=name,
                 success=True,

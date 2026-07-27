@@ -11,6 +11,8 @@ from typing import Any
 import jwt
 import yaml
 
+from sentinelops.migration import HEAD_REVISIONS
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 SCRIPT_PATH = SCRIPTS / "topology_readiness.py"
@@ -59,7 +61,7 @@ def _trial(**overrides: Any) -> object:
             "strict_recovery_evidence_present": True,
         },
         "database_snapshot": {
-            "schema_revision": "0010_action_reconcile_outbox",
+            "schema_revision": HEAD_REVISIONS[0],
         },
     }
     values.update(overrides)

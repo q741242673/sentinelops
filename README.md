@@ -239,10 +239,23 @@ SENTINELOPS_MODEL_MAX_TOKENS=4096
 
 本地运行时读取当前 kubeconfig；部署到 Pod 中时使用 ServiceAccount。
 
+一套 SentinelOps 运行实例当前只绑定一个 Kubernetes 集群和一个工作负载
+namespace。请为每个集群配置稳定且唯一的 `SENTINELOPS_CLUSTER_ID`，并用
+`SENTINELOPS_CLUSTER_DISPLAY_NAME` 设置控制台展示名称。告警里即使伪造了同名
+label 也不能改变事故所属集群；集群身份由接收告警的 SentinelOps 服务端写入。
+
 ```dotenv
 SENTINELOPS_TOOL_BACKEND=kubernetes
+SENTINELOPS_CLUSTER_ID=prod-cluster-a
+SENTINELOPS_CLUSTER_DISPLAY_NAME=生产集群 A
 SENTINELOPS_KUBERNETES_NAMESPACE=sentinelops-demo
 ```
+
+当前阶段已经把集群身份绑定到事故、审批恢复和执行队列，避免共享 PostgreSQL
+时由错误集群领取操作。但它还不是集中保存多份 kubeconfig 的集群注册中心：
+每个集群仍部署自己的 API、Executor 和 Remediation Controller，三者必须使用
+同一个 `SENTINELOPS_CLUSTER_ID`。动态注册、跨集群权限管理和统一写入路由会在
+后续版本单独实现。
 
 示例 RBAC：
 
@@ -446,7 +459,7 @@ kubectl apply \
 - `ghcr.io/your-org/sentinelops:0.1.0-rc.1`：替换为已经构建并最好固定到 digest 的镜像；
 - `ghcr.io/your-org/sentinelops-remediation-controller:0.1.0-rc.1`：替换为 Controller 镜像并固定到 digest；
 - `sentinelops-workloads`：替换为被管理服务所在的 namespace；
-- `prod-cluster-a`：替换为这一套 Alertmanager 的稳定唯一标识；
+- `prod-cluster-a`：替换为这一套部署绑定的稳定唯一集群标识；API、Executor 和 Controller 的 `SENTINELOPS_CLUSTER_ID` 必须保持一致，Alertmanager source 也必须在所有集群中唯一；
 - `https://replace-with-independent-audit-sink.example/v1/anchors`：替换为独立审计服务的 HTTPS 地址；
 - ConfigMap 中的模型、Prometheus、Loki、Tempo 和主动探针地址。
 

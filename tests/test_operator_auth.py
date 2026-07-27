@@ -186,9 +186,10 @@ async def test_oidc_rejects_duplicate_authorization_headers() -> None:
 
 
 def test_production_operator_auth_fails_closed() -> None:
-    disabled = Settings(environment="production")
+    disabled = Settings(environment="production", cluster_id="prod-cluster")
     insecure = _settings(
         environment="production",
+        cluster_id="prod-cluster",
         oidc_issuer="http://identity.example.test",
         oidc_jwks_url="http://identity.example.test/jwks",
     )

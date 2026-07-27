@@ -553,6 +553,30 @@ func TestRemediationCRDCriticalSchemaWeakeningIsDetected(t *testing.T) {
 			reason: "schema_weakened",
 		},
 		{
+			name: "target cluster identity made optional",
+			mutate: func(object *unstructured.Unstructured) {
+				openAPI := remediationOpenAPI(object)
+				spec := openAPI["properties"].(map[string]any)["spec"].(map[string]any)
+				properties := spec["properties"].(map[string]any)
+				target := properties["target"].(map[string]any)
+				target["required"] = []any{}
+			},
+			reason: "schema_weakened",
+		},
+		{
+			name: "snapshot cluster identity pattern weakened",
+			mutate: func(object *unstructured.Unstructured) {
+				openAPI := remediationOpenAPI(object)
+				spec := openAPI["properties"].(map[string]any)["spec"].(map[string]any)
+				properties := spec["properties"].(map[string]any)
+				precondition := properties["precondition"].(map[string]any)
+				fields := precondition["properties"].(map[string]any)
+				clusterID := fields["clusterId"].(map[string]any)
+				delete(clusterID, "pattern")
+			},
+			reason: "schema_weakened",
+		},
+		{
 			name: "terminal status validation removed",
 			mutate: func(object *unstructured.Unstructured) {
 				openAPI := remediationOpenAPI(object)
@@ -817,6 +841,7 @@ func crd(name string, kind string, statusSubresource bool) *unstructured.Unstruc
 		specSchema["x-kubernetes-validations"] = schemaRules(
 			"self == oldSelf",
 			"self.action.parameters.name == self.target.name",
+			"self.target.clusterId == self.precondition.clusterId",
 			"(self.action.plugin == 'rollback_deployment' && has(self.precondition.rollbackTarget) && self.precondition.rollbackTarget.revision == self.action.parameters.revision) || (self.action.plugin != 'rollback_deployment' && !has(self.precondition.rollbackTarget))",
 		)
 		specSchema["properties"] = map[string]any{
@@ -841,6 +866,8 @@ func crd(name string, kind string, statusSubresource bool) *unstructured.Unstruc
 					},
 				},
 			},
+			"target":       clusterBoundObjectSchema(),
+			"precondition": clusterBoundObjectSchema(),
 		}
 		openAPI["x-kubernetes-validations"] = schemaRules(
 			"self.metadata.name == self.spec.actionId",
@@ -907,6 +934,20 @@ func crd(name string, kind string, statusSubresource bool) *unstructured.Unstruc
 		},
 	}
 	return object
+}
+
+func clusterBoundObjectSchema() map[string]any {
+	return map[string]any{
+		"required": []any{"clusterId"},
+		"properties": map[string]any{
+			"clusterId": map[string]any{
+				"type":      "string",
+				"minLength": int64(1),
+				"maxLength": int64(63),
+				"pattern":   "^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+			},
+		},
+	}
 }
 
 func schemaRules(rules ...string) []any {

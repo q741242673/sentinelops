@@ -185,7 +185,10 @@ async def inject_demo_fault(settings: Settings) -> dict[str, Any]:
             "revision": 2,
             "failure_every": "simulated",
         }
-    backend = KubernetesBackend(namespace=settings.kubernetes_namespace)
+    backend = KubernetesBackend(
+        namespace=settings.kubernetes_namespace,
+        cluster_id=settings.cluster_id,
+    )
     result = await backend.call(
         "inject_demo_fault",
         {
@@ -243,7 +246,10 @@ async def reset_demo_environment(settings: Settings) -> dict[str, Any]:
     _ensure_demo_write_allowed(settings)
     if settings.tool_backend == "simulator":
         return {"deployment": "inventory-service", "baseline_restored": True}
-    backend = KubernetesBackend(namespace=settings.kubernetes_namespace)
+    backend = KubernetesBackend(
+        namespace=settings.kubernetes_namespace,
+        cluster_id=settings.cluster_id,
+    )
     reset = await backend.call(
         "reset_demo_baseline",
         {

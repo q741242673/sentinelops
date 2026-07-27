@@ -39,6 +39,7 @@ from sentinelops.storage.sqlalchemy import (
 
 AUDIT_KEY = "production-readiness-audit-key-000000000001"
 AUDIT_KEY_ID = "production-readiness-v1"
+CLUSTER_ID = "production-readiness"
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ def _record(run_id: str, scenario: str, trial: int) -> IncidentRecord:
     return IncidentRecord(
         alert=Alert(
             name=f"ProductionReadiness{scenario}",
+            cluster_id=CLUSTER_ID,
             namespace="sentinelops-benchmark",
             service="order-service",
             severity="critical",
@@ -90,6 +92,7 @@ def _alert_placeholder(
     return IncidentRecord(
         alert=Alert(
             name="ProductionReadinessAlertDedup",
+            cluster_id=CLUSTER_ID,
             namespace="sentinelops-benchmark",
             service="order-service",
             severity="critical",
@@ -296,7 +299,10 @@ async def _prepare_intent(
         lease,
         idempotency_key=idempotency_key,
         action=_action(run_id, trial),
-        precondition={"resource_version": f"{run_id}-{trial}"},
+        precondition={
+            "cluster_id": CLUSTER_ID,
+            "resource_version": f"{run_id}-{trial}",
+        },
     )
     await store.enqueue_action(
         lease,
@@ -325,6 +331,7 @@ async def _executor_single_claim(
             claims = await asyncio.gather(
                 *[
                     stores[index % len(stores)].claim_action_execution(
+                        cluster_id=CLUSTER_ID,
                         owner_id=f"executor-{run_id}-{trial}-{index}",
                         attempt_id=(
                             f"exact-{run_id[:8]}-{trial}-{index}"
@@ -389,6 +396,7 @@ async def _executor_crash_recovery(
                 trial,
             )
             stale = await first.claim_action_execution(
+                cluster_id=CLUSTER_ID,
                 owner_id=f"executor-a-{run_id}-{trial}",
                 attempt_id=f"crash-a-{run_id[:8]}-{trial}",
                 ttl_seconds=60,
@@ -410,6 +418,7 @@ async def _executor_crash_recovery(
                 )
             started = perf_counter()
             successor = await second.claim_action_execution(
+                cluster_id=CLUSTER_ID,
                 owner_id=f"executor-b-{run_id}-{trial}",
                 attempt_id=f"crash-b-{run_id[:8]}-{trial}",
                 ttl_seconds=60,

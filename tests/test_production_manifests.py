@@ -92,6 +92,8 @@ def test_runtime_configuration_fails_closed_for_production() -> None:
 
     assert runtime["SENTINELOPS_ENVIRONMENT"] == "production"
     assert runtime["SENTINELOPS_TOOL_BACKEND"] == "kubernetes"
+    assert runtime["SENTINELOPS_CLUSTER_ID"] == "prod-cluster-a"
+    assert runtime["SENTINELOPS_CLUSTER_DISPLAY_NAME"] == "生产集群 A"
     assert runtime["SENTINELOPS_DATABASE_AUTO_CREATE"] == "false"
     assert 1 <= int(
         runtime["SENTINELOPS_DATABASE_OPERATION_TIMEOUT_SECONDS"]
@@ -200,6 +202,11 @@ def test_runtime_components_are_separate_hardened_deployments() -> None:
     controller_container = _container(controller)
     publisher_container = _container(publisher)
     gitops_container = _container(gitops_publisher)
+    for container in (api_container, executor_container, controller_container):
+        assert {
+            item["configMapRef"]["name"]
+            for item in container["envFrom"]
+        } >= {"sentinelops-runtime"}
     assert api_container["livenessProbe"]["httpGet"]["path"] == "/health"
     assert api_container["readinessProbe"]["httpGet"]["path"] == "/ready"
     assert api_container["startupProbe"]["httpGet"]["path"] == "/health"

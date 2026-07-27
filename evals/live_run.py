@@ -61,8 +61,14 @@ class LiveEvaluationDataset(BaseModel):
 class StaticReadOnlyBackend:
     """Serve one immutable evidence fixture and record every attempted write."""
 
-    def __init__(self, tool_results: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        tool_results: dict[str, dict[str, Any]],
+        *,
+        cluster_id: str = "local",
+    ) -> None:
         self.tool_results = json.loads(json.dumps(tool_results))
+        self.cluster_id = cluster_id
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -79,10 +85,12 @@ class StaticReadOnlyBackend:
                 success=False,
                 error="The sanitized fixture does not provide this read-only source",
             )
+        content = json.loads(json.dumps(self.tool_results[name]))
+        content.setdefault("cluster_id", self.cluster_id)
         return ToolResult(
             tool_name=name,
             success=True,
-            content=json.loads(json.dumps(self.tool_results[name])),
+            content=content,
         )
 
     @property
@@ -233,7 +241,10 @@ def _metrics(provider: Any) -> list[dict[str, Any]]:
 
 
 async def run_case(provider: Any, case: LiveEvaluationCase) -> LiveCaseResult:
-    backend = StaticReadOnlyBackend(case.tool_results)
+    backend = StaticReadOnlyBackend(
+        case.tool_results,
+        cluster_id=case.alert.cluster_id,
+    )
     evaluated_provider = EvaluationProvider(provider)
     metric_offset = len(_metrics(provider))
     agent = IncidentAgent(

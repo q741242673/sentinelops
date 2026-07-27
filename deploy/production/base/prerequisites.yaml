@@ -78,6 +78,8 @@ metadata:
 data:
   SENTINELOPS_ENVIRONMENT: production
   SENTINELOPS_TOOL_BACKEND: kubernetes
+  SENTINELOPS_CLUSTER_ID: prod-cluster-a
+  SENTINELOPS_CLUSTER_DISPLAY_NAME: 生产集群 A
   SENTINELOPS_KUBERNETES_NAMESPACE: sentinelops-workloads
   SENTINELOPS_DATABASE_AUTO_CREATE: "false"
   SENTINELOPS_DATABASE_URL_FILE: /var/run/secrets/sentinelops/database-url

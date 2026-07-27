@@ -35,6 +35,7 @@ from sentinelops.anchor_crypto import (
     load_ed25519_public_keyring,
     verify_receipt_signature,
 )
+from sentinelops.migration import HEAD_REVISIONS
 
 INCIDENT_ID = re.compile(r"^[0-9a-f-]{36}$")
 
@@ -1238,7 +1239,7 @@ async def _run_trial(args: argparse.Namespace) -> TopologyTrial:
             )
             checks["migration_head_applied"] = (
                 database_snapshot.get("schema_revision")
-                == "0010_action_reconcile_outbox"
+                == HEAD_REVISIONS[0]
             )
             checks["agent_resolved"] = incident_status == "resolved"
             checks["deployment_restored"] = (

@@ -3,9 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     model_api_key_file: str | None = None
     model_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
     model_max_tokens: int = Field(default=4096, ge=256, le=32_768)
+    cluster_id: str = Field(
+        default="local",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$",
+    )
+    cluster_display_name: str = Field(default="本地集群", min_length=1, max_length=128)
     kubernetes_namespace: str = "sentinelops-demo"
     demo_enabled: bool = False
     demo_namespace: str = "sentinelops-demo"
@@ -242,6 +249,22 @@ class Settings(BaseSettings):
         le=600,
     )
     executor_health_file: str | None = None
+
+    @model_validator(mode="after")
+    def validate_production_cluster_identity(self) -> Self:
+        production = self.environment.strip().casefold() in {
+            "prod",
+            "production",
+        }
+        if production and self.cluster_id in {
+            "local",
+            "default",
+            "legacy-unassigned",
+        }:
+            raise ValueError(
+                "生产环境必须配置稳定且唯一的 SENTINELOPS_CLUSTER_ID"
+            )
+        return self
 
     def resolved_model_api_key(self) -> str | None:
         return _secret_value(

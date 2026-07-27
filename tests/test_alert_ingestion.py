@@ -156,6 +156,7 @@ async def test_startup_reschedules_committed_alert_placeholder(
     settings = Settings(
         database_url=_database_url(tmp_path),
         executor_mode="external",
+        cluster_id="cluster-a",
         alertmanager_source_id="recovery-source",
     )
     monkeypatch.setattr(api_module, "get_settings", lambda: settings)
@@ -165,6 +166,7 @@ async def test_startup_reschedules_committed_alert_placeholder(
     placeholder = IncidentRecord(
         alert=Alert(
             name="CommittedBeforeSchedule",
+            cluster_id="cluster-a",
             namespace="payments",
             service="order-service",
             severity="critical",
@@ -190,6 +192,19 @@ async def test_startup_reschedules_committed_alert_placeholder(
         fingerprint=fingerprint,
         starts_at=placeholder.alert.starts_at,
     )
+    foreign = IncidentRecord(
+        alert=Alert(
+            name="ForeignClusterIncident",
+            cluster_id="cluster-b",
+            namespace="payments",
+            service="order-service",
+            severity="critical",
+            summary="must not be recovered by cluster-a",
+            labels={"source": "alertmanager"},
+        ),
+        status=IncidentStatus.INVESTIGATING,
+    )
+    await store.save(foreign, expected_version=None, graph_state=None)
     await store.close()
     scheduled: list[str] = []
     monkeypatch.setattr(
@@ -204,6 +219,7 @@ async def test_startup_reschedules_committed_alert_placeholder(
 
     assert claim.incident_id is not None
     assert scheduled == [claim.incident_id]
+    assert foreign.id not in scheduled
     assert api_module.incident_records[claim.incident_id].status == (
         IncidentStatus.INVESTIGATING
     )

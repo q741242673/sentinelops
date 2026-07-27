@@ -86,10 +86,14 @@ async def test_postgres_roundtrip_and_compare_and_swap() -> None:
             lease,
             idempotency_key=record.id.replace("-", "").ljust(64, "0")[:64],
             action=record.approval.action,
-            precondition={"resource_version": "postgres-contract"},
+            precondition={
+                "cluster_id": "local",
+                "resource_version": "postgres-contract",
+            },
         )
         await first.enqueue_action(lease, idempotency_key=intent.idempotency_key)
         claim = await first.claim_action_execution(
+            cluster_id="local",
             owner_id="postgres-executor-a",
             attempt_id="postgres-contract-attempt",
             ttl_seconds=60,
@@ -152,10 +156,11 @@ async def test_postgres_serializes_resolved_against_action_dispatch(
         lease,
         idempotency_key=record.id.replace("-", "").ljust(64, "9")[:64],
         action=record.approval.action,
-        precondition={"resource_version": "race"},
+        precondition={"cluster_id": "local", "resource_version": "race"},
     )
     await worker.enqueue_action(lease, idempotency_key=intent.idempotency_key)
     claim = await worker.claim_action_execution(
+        cluster_id="local",
         owner_id="postgres-race-executor",
         attempt_id="postgres-race-attempt",
         ttl_seconds=60,
@@ -237,17 +242,22 @@ async def test_postgres_two_executors_can_claim_intent_only_once() -> None:
             lease,
             idempotency_key=record.id.replace("-", "").ljust(64, "7")[:64],
             action=record.approval.action,
-            precondition={"resource_version": "executor-race"},
+            precondition={
+                "cluster_id": "local",
+                "resource_version": "executor-race",
+            },
         )
         await first.enqueue_action(lease, idempotency_key=intent.idempotency_key)
 
         claims = await asyncio.gather(
             first.claim_action_execution(
+                cluster_id="local",
                 owner_id="executor-a",
                 attempt_id=f"{record.id}-a",
                 ttl_seconds=60,
             ),
             second.claim_action_execution(
+                cluster_id="local",
                 owner_id="executor-b",
                 attempt_id=f"{record.id}-b",
                 ttl_seconds=60,
@@ -303,7 +313,10 @@ async def test_postgres_resolved_before_executor_claim_cancels_without_dispatch(
             lease,
             idempotency_key=record.id.replace("-", "").ljust(64, "8")[:64],
             action=record.approval.action,
-            precondition={"resource_version": "resolved-first"},
+            precondition={
+                "cluster_id": "local",
+                "resource_version": "resolved-first",
+            },
         )
         await store.enqueue_action(lease, idempotency_key=intent.idempotency_key)
 
@@ -317,6 +330,7 @@ async def test_postgres_resolved_before_executor_claim_cancels_without_dispatch(
         )
         assert (
             await store.claim_action_execution(
+                cluster_id="local",
                 owner_id="executor-a",
                 attempt_id=f"{record.id}-must-not-claim",
                 ttl_seconds=60,

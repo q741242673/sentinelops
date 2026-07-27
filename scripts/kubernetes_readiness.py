@@ -540,6 +540,7 @@ async def _run_trial(
             record = await agent.start(
                 Alert(
                     name=alert_name,
+                    cluster_id=settings.cluster_id,
                     namespace=labels.get("namespace", namespace),
                     service=labels.get(
                         "service",

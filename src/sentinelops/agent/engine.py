@@ -2492,8 +2492,11 @@ class IncidentAgent:
         self,
         action: RemediationAction,
         rollout: dict[str, Any],
+        *,
+        expected_cluster_id: str,
     ) -> dict[str, Any]:
         required = (
+            "cluster_id",
             "namespace",
             "deployment_uid",
             "generation",
@@ -2504,6 +2507,11 @@ class IncidentAgent:
         missing = [key for key in required if rollout.get(key) in {None, ""}]
         if missing:
             raise ValueError(f"rollout 缺少 {', '.join(missing)}")
+        if str(rollout["cluster_id"]) != expected_cluster_id:
+            raise ValueError(
+                "rollout 集群身份与事故不一致："
+                f"expected={expected_cluster_id}, actual={rollout['cluster_id']}"
+            )
         if int(rollout.get("observed_generation") or 0) != int(rollout["generation"]):
             raise ValueError("Deployment controller 尚未观察到当前 generation")
         plugin = self.tools.action_catalog.require(action.tool_name)
@@ -2519,6 +2527,7 @@ class IncidentAgent:
             "action_fingerprint": self._action_fingerprint(action),
             "tool_name": action.tool_name,
             "target": action.arguments.get(plugin.target_argument),
+            "cluster_id": expected_cluster_id,
             "namespace": str(rollout["namespace"]),
             "deployment_uid": str(rollout["deployment_uid"]),
             "generation": int(rollout["generation"]),
@@ -2570,6 +2579,7 @@ class IncidentAgent:
                 "action_fingerprint",
                 "tool_name",
                 "target",
+                "cluster_id",
                 "namespace",
                 "deployment_uid",
                 "generation",
@@ -2641,7 +2651,11 @@ class IncidentAgent:
         if feedback is not None:
             return self._preflight_rejected(f"进入审批前修复方案已过期：{feedback}")
         try:
-            snapshot = self._build_preflight_snapshot(action, rollout.content)
+            snapshot = self._build_preflight_snapshot(
+                action,
+                rollout.content,
+                expected_cluster_id=str(state["alert"]["cluster_id"]),
+            )
         except (TypeError, ValueError) as exc:
             return self._preflight_rejected(f"进入审批前无法建立可信快照：{exc}")
         plugin = self.tools.action_catalog.require(action.tool_name)
@@ -2756,7 +2770,11 @@ class IncidentAgent:
         if namespace_feedback is not None:
             return self._preflight_rejected(f"执行前命名空间校验失败：{namespace_feedback}")
         try:
-            current = self._build_preflight_snapshot(action, result.content)
+            current = self._build_preflight_snapshot(
+                action,
+                result.content,
+                expected_cluster_id=str(state["alert"]["cluster_id"]),
+            )
         except (TypeError, ValueError) as exc:
             return self._preflight_rejected(f"最新 rollout 无法通过安全校验：{exc}")
         expected_semantics = self._snapshot_semantics(expected)

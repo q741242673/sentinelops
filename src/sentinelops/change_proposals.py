@@ -87,6 +87,7 @@ class DeploymentSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
+    cluster_id: str
     namespace: str
     uid: str
     resource_version: str
@@ -165,9 +166,13 @@ def build_change_proposal(
     snapshot: DeploymentSnapshot,
     ttl_minutes: int = 10,
 ) -> ChangeProposalPreview:
-    if snapshot.name != alert.service or snapshot.namespace != alert.namespace:
+    if (
+        snapshot.name != alert.service
+        or snapshot.cluster_id != alert.cluster_id
+        or snapshot.namespace != alert.namespace
+    ):
         raise ChangeProposalRejected(
-            "Deployment 快照与事故 service/namespace 不一致"
+            "Deployment 快照与事故 cluster/service/namespace 不一致"
         )
     if not snapshot.uid or not snapshot.resource_version:
         raise ChangeProposalRejected("Deployment 快照缺少 UID 或 resourceVersion")
@@ -270,6 +275,7 @@ def build_change_proposal(
         "incident_id": incident_id,
         "target": {
             "name": snapshot.name,
+            "cluster_id": snapshot.cluster_id,
             "namespace": snapshot.namespace,
             "uid": snapshot.uid,
             "resource_version": snapshot.resource_version,
